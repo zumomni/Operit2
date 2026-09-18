@@ -1,3 +1,19 @@
+# =============================================================================
+# Operit2 · Android Flutter Build（免 secret 补丁版）
+# -----------------------------------------------------------------------------
+# 来源：官方 .github/workflows/android-flutter-build.yml
+# 改动：**只改了一处** —— 把 “Restore Android signing material”（依赖 4 个 GitHub
+#       Secrets）替换为“在 runner 内用 keytool 现生成自签名证书”。
+#       其余 job / step / 版本号 / 产物路径全部保持官方原样。
+#
+# 用法：
+#   1) fork https://github.com/AAswordman/Operit2
+#   2) 用本文件覆盖 fork 里的 .github/workflows/android-flutter-build.yml
+#   3) Actions → Android Flutter Build → Run workflow
+#   4) 跑完下载 artifact：operit2-android-<sha>（内含 3 个 ABI 的 APK）
+#
+# 产物应用 ID = app.operit（与官方 v1 的 com.ai.assistance.operit 不冲突，可并存）
+# =============================================================================
 name: Android Flutter Build
 
 on:
@@ -139,34 +155,41 @@ jobs:
             throw "Android bindgen libclang was not prepared at $libclang"
           }
 
-      - name: Restore Android signing material
+      # =======================================================================
+      # ↓↓↓ 唯一改动：官方这里依赖 4 个 Secrets，这里改为现场生成自签证书 ↓↓↓
+      # 产出的 android-signing.properties 字段与
+      # tools/build_scripts/build_flutter_android.py 的期望完全一致：
+      #   RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
+      # RELEASE_STORE_FILE 为相对路径，脚本会按 secrets 目录解析。
+      # =======================================================================
+      - name: Prepare self-signed Android signing material
         shell: pwsh
-        env:
-          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
-          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
-          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
         run: |
-          $required = @(
-            "ANDROID_RELEASE_KEYSTORE_BASE64",
-            "ANDROID_RELEASE_STORE_PASSWORD",
-            "ANDROID_RELEASE_KEY_ALIAS",
-            "ANDROID_RELEASE_KEY_PASSWORD"
-          )
-          $missing = $required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
-          if ($missing.Count -gt 0) {
-            throw "Missing required GitHub Actions secrets: $($missing -join ', ')"
-          }
           $secretsDir = "tools/release/secrets"
           New-Item -ItemType Directory -Force -Path $secretsDir | Out-Null
           $keystore = Join-Path $secretsDir "operit2-release.keystore"
-          [System.IO.File]::WriteAllBytes($keystore, [System.Convert]::FromBase64String($env:ANDROID_RELEASE_KEYSTORE_BASE64))
+          if (Test-Path -LiteralPath $keystore) {
+            Remove-Item -LiteralPath $keystore -Force
+          }
+          & "$env:JAVA_HOME\bin\keytool.exe" -genkeypair -v `
+            -keystore $keystore `
+            -alias operit2 `
+            -keyalg RSA -keysize 2048 -validity 10000 `
+            -storepass operit2release -keypass operit2release `
+            -dname "CN=Operit2, OU=Dev, O=Operit2, L=NA, ST=NA, C=CN"
+          if (-not (Test-Path -LiteralPath $keystore)) {
+            throw "Failed to generate self-signed release keystore at $keystore"
+          }
           @"
           RELEASE_STORE_FILE=operit2-release.keystore
-          RELEASE_STORE_PASSWORD=$env:ANDROID_RELEASE_STORE_PASSWORD
-          RELEASE_KEY_ALIAS=$env:ANDROID_RELEASE_KEY_ALIAS
-          RELEASE_KEY_PASSWORD=$env:ANDROID_RELEASE_KEY_PASSWORD
+          RELEASE_STORE_PASSWORD=operit2release
+          RELEASE_KEY_ALIAS=operit2
+          RELEASE_KEY_PASSWORD=operit2release
           "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
+          Write-Host "Self-signed keystore ready: $keystore"
+      # =======================================================================
+      # ↑↑↑ 改动结束，以下与官方原样一致 ↑↑↑
+      # =======================================================================
 
       - name: Check build environment
         shell: pwsh
