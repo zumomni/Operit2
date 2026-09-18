@@ -1,0 +1,54 @@
+name: Publish APK to Release
+
+# 目的：把上一次 CI run 里的 736MB artifact（内含 3 个 ABI 的 APK）
+# 在 GitHub 内部搬到 Release 资产里（runner 内网传输，快），
+# 之后外部就能通过 github.com/releases/download（可走 ghfast 等镜像）高速下载。
+#
+# 触发：workflow_dispatch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SRC_RUN: "35347825506"
+      SRC_ARTIFACT: "operit2-android-5d0af5549ad4b503323da04efa38aa1915c2732f"
+      RELEASE_TAG: "v2.0.0-preview.3-arm64"
+    steps:
+      - name: Download artifact from previous run (inside GitHub network)
+        run: |
+          set -e
+          gh run download "$SRC_RUN" -n "$SRC_ARTIFACT" -D out -R "$GITHUB_REPOSITORY"
+          find out -name '*.apk' -exec ls -la {} \;
+
+      - name: Pick arm64 APK
+        id: pick
+        run: |
+          set -e
+          A64=$(find out -name '*arm64*v8a*.apk' | head -1)
+          if [ -z "$A64" ]; then echo "no arm64 apk found"; ls -laR out | head -50; exit 1; fi
+          echo "apk=$A64" >> "$GITHUB_OUTPUT"
+          echo "picked: $A64 ($(du -h "$A64" | cut -f1))"
+
+      - name: Create release and upload arm64 APK
+        run: |
+          set -e
+          APK='${{ steps.pick.outputs.apk }}'
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release exists, uploading asset"
+            gh release upload "$RELEASE_TAG" "$APK" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$APK" \
+              -R "$GITHUB_REPOSITORY" \
+              --title "Operit2 2.0.0-preview.3 (arm64-v8a)" \
+              --notes "arm64-v8a APK built from AAswordman/Operit2 (main) via android-flutter-build workflow. App ID: app.operit"
+          fi
+          gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY"
