@@ -6,9 +6,11 @@ import 'package:flutter/material.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../common/components/M3LoadingIndicator.dart';
+import '../../../common/markdown/StreamMarkdownRenderer.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../components/EmptyState.dart';
 import '../components/PackageGrid.dart';
+import '../components/ExtensionScopeControls.dart';
 import '../components/PackageListItem.dart';
 
 class SkillConfigScreen extends StatefulWidget {
@@ -31,6 +33,8 @@ class SkillConfigScreen extends StatefulWidget {
 
 class _SkillConfigScreenState extends State<SkillConfigScreen> {
   bool _loading = true;
+  Map<String, String> _scopes = {};
+  int _loadGeneration = 0;
   String? _errorMessage;
   String _skillsDirectory = '';
   Map<String, core_proxy.SkillPackage> _skills =
@@ -61,6 +65,8 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
 
   /// Loads installed and bundled skills from the repository.
   Future<void> _loadSkills() async {
+    if (!mounted) return;
+    final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
       _errorMessage = null;
@@ -77,6 +83,9 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
       final loadErrors = baseResults[2] as Map<String, String>;
       final moreSkills =
           baseResults[3] as List<core_proxy.BundledExternalSkillCandidate>;
+      final scopes = await widget.clients.application.getExtensionScopes(
+        kind: 'skill',
+      );
       final visibilityResults = await Future.wait<bool>(
         skills.keys.map(
           (skillName) => _repository.isSkillVisibleToAi(skillName: skillName),
@@ -90,10 +99,11 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
         }
         index += 1;
       }
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
+        _scopes = scopes;
         _skillsDirectory = skillsDirectory;
         _skills = skills;
         _loadErrors = loadErrors;
@@ -103,13 +113,33 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
       });
     } catch (error, stackTrace) {
       debugPrint('Failed to load skills: $error\n$stackTrace');
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
         _errorMessage = error.toString();
         _loading = false;
       });
+    }
+  }
+
+  /// Transfers an existing extension and reloads its scope-owned settings.
+  Future<void> _moveScope(String id) async {
+    try {
+      final moved = await changeExtensionScope(
+        context: context,
+        clients: widget.clients,
+        kind: 'skill',
+        id: id,
+        currentScope: _scopes[id]!,
+      );
+      if (moved) await _loadSkills();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      await _loadSkills();
     }
   }
 
@@ -182,6 +212,10 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
         return _SkillDetailsDialog(
           skill: skill,
           content: content,
+          splitMarkdownContent: (content) => widget
+              .clients
+              .chatRuntimeHolderMain
+              .splitMarkdownContent(content: content),
           onDelete: () async {
             Navigator.of(context).pop();
             final scaffoldMessenger = ScaffoldMessenger.of(this.context);
@@ -263,12 +297,6 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
                   ),
                 )
               else ...<Widget>[
-                SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                  sliver: const SliverToBoxAdapter(
-                    child: _SkillSectionHeader(title: '当前技能'),
-                  ),
-                ),
                 if (displayedSkills.isEmpty)
                   SliverPadding(
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
@@ -281,10 +309,11 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
                 else
                   SliverPadding(
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                    sliver: PackageSliverList(
-                      itemCount: displayedSkills.length,
-                      itemBuilder: (context, index) {
-                        final skill = displayedSkills[index];
+                    sliver: ScopedExtensionSliver<core_proxy.SkillPackage>(
+                      items: displayedSkills,
+                      scopes: _scopes,
+                      identity: (skill) => skill.name,
+                      itemBuilder: (context, skill) {
                         final visible = _visibleSkillNames.contains(skill.name);
                         return PackageListItem(
                           key: ValueKey<String>('skill:${skill.name}'),
@@ -294,6 +323,12 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
                           metadata: <String>[visible ? 'AI 可见' : 'AI 隐藏'],
                           enabled: visible,
                           onDetails: () => _showSkillDetails(skill),
+                          trailingActions: <Widget>[
+                            ExtensionScopeAction(
+                              scope: _scopes[skill.name]!,
+                              onMove: () => _moveScope(skill.name),
+                            ),
+                          ],
                           onEnabledChanged: (value) =>
                               _setSkillVisible(skill.name, value),
                         );
@@ -394,8 +429,15 @@ class _SkillConfigScreenState extends State<SkillConfigScreen> {
   Future<void> _loadBundledSkill(
     core_proxy.BundledExternalSkillCandidate skill,
   ) async {
+    final scope = await chooseExtensionScope(context);
+    if (scope == null) return;
     try {
       await _repository.importBundledExternalSkill(skillName: skill.name);
+      await widget.clients.application.setExtensionScope(
+        kind: 'skill',
+        id: skill.name,
+        scope: scope,
+      );
       await _loadSkills();
     } catch (error, stackTrace) {
       debugPrint('Failed to load bundled skill: $error\n$stackTrace');
@@ -583,11 +625,13 @@ class _SkillDetailsDialog extends StatelessWidget {
   const _SkillDetailsDialog({
     required this.skill,
     required this.content,
+    required this.splitMarkdownContent,
     required this.onDelete,
   });
 
   final core_proxy.SkillPackage skill;
   final String? content;
+  final MarkdownContentSplitter splitMarkdownContent;
   final AsyncCallback onDelete;
 
   @override
@@ -595,8 +639,9 @@ class _SkillDetailsDialog extends StatelessWidget {
     return AlertDialog(
       icon: const Icon(Icons.build_outlined),
       title: Text(skill.name),
-      content: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 620, maxHeight: 520),
+      content: SizedBox(
+        width: 620,
+        height: 520,
         child: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -608,7 +653,13 @@ class _SkillDetailsDialog extends StatelessWidget {
               Text('入口: ${skill.skillFile}'),
               if (content != null) ...<Widget>[
                 const SizedBox(height: 12),
-                SelectableText(content!),
+                StreamMarkdownRenderer(
+                  content: content!,
+                  isStreaming: false,
+                  textColor: Theme.of(context).colorScheme.onSurface,
+                  backgroundColor: Theme.of(context).colorScheme.surface,
+                  splitMarkdownContent: splitMarkdownContent,
+                ),
               ],
             ],
           ),

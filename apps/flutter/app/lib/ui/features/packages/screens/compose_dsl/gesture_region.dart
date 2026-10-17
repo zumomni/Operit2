@@ -10,6 +10,7 @@ class _ComposeGestureRegion extends StatefulWidget {
     required this.options,
     required this.onAction,
     required this.child,
+    this.borderRadius = BorderRadius.zero,
   });
 
   final String kind;
@@ -18,6 +19,7 @@ class _ComposeGestureRegion extends StatefulWidget {
   /// Resolves function for the Compose DSL renderer.
   final Future<Object?> Function(String, [Object?]) onAction;
   final Widget child;
+  final BorderRadius borderRadius;
 
   /// Creates persistent gesture delta tracking.
   @override
@@ -28,6 +30,15 @@ class _ComposeGestureRegionState extends State<_ComposeGestureRegion> {
   Offset _doubleTapPosition = Offset.zero;
   double _scale = 1;
   double _rotation = 0;
+  bool _dragging = false;
+  bool _transforming = false;
+  final Set<int> _pointers = <int>{};
+
+  /// Ends a drag as cancellation before a second pointer starts transforming.
+  void _cancelDrag() {
+    if (_dragging) _emit('onDragCancel');
+    _dragging = false;
+  }
 
   /// Checks whether the plugin supplied a callback for this gesture.
   bool _has(String name) => _actionId(widget.options[name]) != null;
@@ -50,15 +61,81 @@ class _ComposeGestureRegionState extends State<_ComposeGestureRegion> {
   @override
   Widget build(BuildContext context) {
     switch (widget.kind) {
+      case 'motiongestures':
+        return Listener(
+          onPointerDown: (event) {
+            _pointers.add(event.pointer);
+            if (_pointers.length > 1) {
+              _cancelDrag();
+              _transforming = true;
+            }
+          },
+          onPointerUp: (event) => _pointers.remove(event.pointer),
+          onPointerCancel: (event) {
+            _pointers.remove(event.pointer);
+            _cancelDrag();
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onScaleStart: (details) {
+              _scale = 1;
+              _rotation = 0;
+              _transforming = _transforming || details.pointerCount != 1;
+              _dragging = !_transforming;
+              if (_dragging) {
+                _emit('onDragStart', _position(details.localFocalPoint));
+              }
+            },
+            onScaleUpdate: (details) {
+              if (details.pointerCount > 1 && !_transforming) {
+                _cancelDrag();
+                _transforming = true;
+              }
+              if (_transforming) {
+                _emit('onGesture', <String, Object?>{
+                  'centroidX': details.localFocalPoint.dx,
+                  'centroidY': details.localFocalPoint.dy,
+                  'panX': details.focalPointDelta.dx,
+                  'panY': details.focalPointDelta.dy,
+                  'zoom': details.scale / _scale,
+                  'rotation': (details.rotation - _rotation) * 180 / math.pi,
+                });
+              } else if (_dragging) {
+                _emit('onDrag', <String, Object?>{
+                  ..._position(details.localFocalPoint),
+                  'deltaX': details.focalPointDelta.dx,
+                  'deltaY': details.focalPointDelta.dy,
+                });
+              }
+              _scale = details.scale;
+              _rotation = details.rotation;
+            },
+            onScaleEnd: (_) {
+              if (_dragging) _emit('onDragEnd');
+              _dragging = false;
+              _transforming = _transforming && _pointers.isNotEmpty;
+            },
+            child: widget.child,
+          ),
+        );
       case 'combinedclickable':
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: _has('onClick') ? () => _emit('onClick') : null,
-          onDoubleTap: _has('onDoubleClick')
-              ? () => _emit('onDoubleClick')
-              : null,
-          onLongPress: _has('onLongClick') ? () => _emit('onLongClick') : null,
-          child: widget.child,
+        // Own the ink surface so feedback moves with the row during a swipe,
+        // rather than being painted on a distant ancestor Material.
+        return Material(
+          type: MaterialType.transparency,
+          borderRadius: widget.borderRadius,
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            borderRadius: widget.borderRadius,
+            onTap: _has('onClick') ? () => _emit('onClick') : null,
+            onDoubleTap: _has('onDoubleClick')
+                ? () => _emit('onDoubleClick')
+                : null,
+            onLongPress: _has('onLongClick')
+                ? () => _emit('onLongClick')
+                : null,
+            child: widget.child,
+          ),
         );
       case 'tapgestures':
         return GestureDetector(

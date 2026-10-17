@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:operit_ui/operit_ui.dart';
 
 /// Whether the new-chat intro currently owns the empty-chat stage.
 ///
@@ -43,7 +44,6 @@ class NewChatIntroOverlay extends StatefulWidget {
 class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     with TickerProviderStateMixin {
   static const Duration _introDuration = Duration(milliseconds: 4600);
-  static const Duration _ambientPeriod = Duration(milliseconds: 1100);
   static const int _assembleMs = 1500;
   static const int _holdMs = 700;
   static const int _dissolveMs = 700;
@@ -54,12 +54,11 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
   static const String _greeting = '有什么可以帮你？';
   static const String _subtitle = '新对话已就绪，随时开始';
 
-  // Constructed eagerly in initState: a `late final` field would first
-  // initialize inside dispose() when the overlay never played, and creating
-  // an AnimationController on a defunct element crashes the ticker's
-  // TickerMode ancestor lookup.
+  // Constructed eagerly, not lazily during disposal of an unused overlay.
+  // One finite timeline drives both particles and the typing caret. A repeating
+  // ambient controller would keep rebuilding this full-screen canvas forever
+  // after the greeting has finished.
   late final AnimationController _intro;
-  late final AnimationController _ambient;
 
   bool _awaitingSettle = false;
   bool _playing = false;
@@ -72,12 +71,11 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
   final List<Offset> _markTargets = <Offset>[];
   Size _markSize = Size.zero;
 
-  /// Creates both controllers while the element is still active.
+  /// Creates the finite timeline while the element is still active.
   @override
   void initState() {
     super.initState();
     _intro = AnimationController(vsync: this, duration: _introDuration);
-    _ambient = AnimationController(vsync: this, duration: _ambientPeriod);
     _precomputeMarkTargets();
   }
 
@@ -86,18 +84,17 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     const word = 'Operit';
     const markFontSize = 60.0;
     const sampleStep = 2;
-    final builder = ui.ParagraphBuilder(
-      ui.ParagraphStyle(textDirection: TextDirection.ltr),
-    )
-      ..pushStyle(
-        ui.TextStyle(
-          color: const Color(0xFFFFFFFF),
-          fontSize: markFontSize,
-          fontWeight: ui.FontWeight.w800,
-          letterSpacing: 2,
-        ),
-      )
-      ..addText(word);
+    final builder =
+        ui.ParagraphBuilder(ui.ParagraphStyle(textDirection: TextDirection.ltr))
+          ..pushStyle(
+            ui.TextStyle(
+              color: const Color(0xFFFFFFFF),
+              fontSize: markFontSize,
+              fontWeight: ui.FontWeight.w800,
+              letterSpacing: 2,
+            ),
+          )
+          ..addText(word);
     final paragraph = builder.build()
       ..layout(const ui.ParagraphConstraints(width: 1000));
     final markWidth = paragraph.maxIntrinsicWidth.ceil() + 8;
@@ -108,6 +105,11 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     final image = picture.toImageSync(markWidth, markHeight);
     picture.dispose();
     paragraph.dispose();
+    // Keep the dimensions before disposing the image. CanvasKit invalidates
+    // image getters after dispose, which made the Web frontend throw a
+    // null-check error while sampling the intro wordmark.
+    final imageWidth = image.width;
+    final imageHeight = image.height;
     final bytes = await image.toByteData();
     image.dispose();
     if (bytes == null || !mounted) {
@@ -115,9 +117,9 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     }
     final pixels = bytes.buffer.asUint8List();
     final targets = <Offset>[];
-    for (var y = 0; y < image.height; y += sampleStep) {
-      for (var x = 0; x < image.width; x += sampleStep) {
-        if (pixels[(y * image.width + x) * 4 + 3] > 128) {
+    for (var y = 0; y < imageHeight; y += sampleStep) {
+      for (var x = 0; x < imageWidth; x += sampleStep) {
+        if (pixels[(y * imageWidth + x) * 4 + 3] > 128) {
           targets.add(Offset(x.toDouble(), y.toDouble()));
         }
       }
@@ -126,7 +128,7 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
       return;
     }
     setState(() {
-      _markSize = Size(image.width.toDouble(), image.height.toDouble());
+      _markSize = Size(imageWidth.toDouble(), imageHeight.toDouble());
       _markTargets
         ..clear()
         ..addAll(targets);
@@ -191,7 +193,6 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
       newChatIntroActive.value = false;
     });
     _intro.dispose();
-    _ambient.dispose();
     super.dispose();
   }
 
@@ -199,7 +200,6 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     _dismissed = false;
     _playing = true;
     newChatIntroActive.value = true;
-    _ambient.repeat();
     _intro
       ..reset()
       ..forward();
@@ -213,7 +213,6 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
     _playing = false;
     _dismissed = true;
     _intro.stop();
-    _ambient.stop();
     // A chat switch that is still settling owns the stage claim already;
     // releasing here would flash the static wordmark before the incoming
     // chat's intro (or its non-empty content) takes over.
@@ -230,9 +229,8 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
       return const SizedBox.shrink();
     }
     final colorScheme = Theme.of(context).colorScheme;
-    final textTheme = Theme.of(context).textTheme;
     return AnimatedBuilder(
-      animation: Listenable.merge(<Listenable>[_intro, _ambient]),
+      animation: _intro,
       builder: (context, _) {
         // Driven by controller value rather than lastElapsedDuration: value
         // is defined on every frame (never null) and matches the mockup
@@ -245,8 +243,11 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
                 _greeting.length,
                 ((t - _typeStartMs) / _typeStepMs).floor(),
               );
-        final subtitleVisible = t >= _typeStartMs + _greeting.length * _typeStepMs + 250;
-        final caretOn = _ambient.value < 0.55;
+        final subtitleVisible =
+            t >= _typeStartMs + _greeting.length * _typeStepMs + 250;
+        // Blink only while the finite intro is running; the settled greeting
+        // stays visible without requesting another frame.
+        final caretOn = _intro.isCompleted || t % 1100 < 605;
         return Stack(
           fit: StackFit.expand,
           children: <Widget>[
@@ -263,42 +264,11 @@ class _NewChatIntroOverlayState extends State<NewChatIntroOverlay>
             Center(
               child: Opacity(
                 opacity: greetingVisible ? 1 : 0,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        Text(
-                          _greeting.substring(0, typedCount),
-                          style: textTheme.headlineSmall!.copyWith(
-                            color: colorScheme.primary,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 2,
-                          ),
-                        ),
-                        const SizedBox(width: 3),
-                        Opacity(
-                          opacity: caretOn ? 1 : 0,
-                          child: Container(
-                            width: 2,
-                            height: 26,
-                            color: colorScheme.primary,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Opacity(
-                      opacity: subtitleVisible ? 1 : 0,
-                      child: Text(
-                        _subtitle,
-                        style: textTheme.bodySmall!.copyWith(
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
-                  ],
+                child: ThemeNewChatGreeting(
+                  greeting: _greeting.substring(0, typedCount),
+                  subtitle: _subtitle,
+                  caretVisible: caretOn,
+                  subtitleVisible: subtitleVisible,
                 ),
               ),
             ),
@@ -360,7 +330,8 @@ class _ParticleWordPainter extends CustomPainter {
     );
     final stageCenter = Offset(size.width / 2, size.height / 2);
     final stageOrigin = stageCenter - Offset(stage.width / 2, stage.height / 2);
-    final markTopLeft = stageOrigin +
+    final markTopLeft =
+        stageOrigin +
         Offset(
           (stage.width - markSize.width) / 2,
           (stage.height - markSize.height) / 2,
@@ -376,14 +347,13 @@ class _ParticleWordPainter extends CustomPainter {
       final radius = ringRadius * (0.55 + _random.nextDouble() * 0.25);
       _particles.add(
         _Particle(
-          target: markTopLeft +
+          target:
+              markTopLeft +
               local +
               Offset(_random.nextDouble(), _random.nextDouble()),
-          start: stageCenter +
-              Offset(
-                math.cos(angle) * radius,
-                math.sin(angle) * radius,
-              ),
+          start:
+              stageCenter +
+              Offset(math.cos(angle) * radius, math.sin(angle) * radius),
           delay: 0.4 + _random.nextDouble() * 0.6,
           size: 1.2 + _random.nextDouble() * 1.4,
         ),
@@ -400,11 +370,7 @@ class _ParticleWordPainter extends CustomPainter {
     for (final particle in _particles) {
       final local = (progress / particle.delay).clamp(0.0, 1.0);
       final eased = 1 - math.pow(1 - local, 3).toDouble();
-      final position = Offset.lerp(
-        particle.start,
-        particle.target,
-        eased,
-      )!;
+      final position = Offset.lerp(particle.start, particle.target, eased)!;
       paint.color = color.withValues(
         alpha: (0.55 + 0.45 * eased) * (1 - dissolve),
       );

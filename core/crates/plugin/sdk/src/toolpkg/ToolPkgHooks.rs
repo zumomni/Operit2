@@ -25,7 +25,7 @@ pub struct ToolPkgMessageProcessingHookRegistration {
 }
 
 /// Registration for one XML render plugin.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(non_snake_case)]
 pub struct ToolPkgXmlRenderHookRegistration {
     pub containerPackageName: String,
@@ -71,6 +71,16 @@ pub struct ToolPkgChatViewHookRegistration {
 pub struct ToolPkgChatMessageHookRegistration {
     pub containerPackageName: String,
     pub hookId: String,
+    pub functionName: String,
+    pub functionSource: Option<String>,
+}
+
+/// Registration for one manifest extension handler owned by a ToolPkg.
+#[derive(Clone, Debug)]
+#[allow(non_snake_case)]
+pub struct ToolPkgManifestExtensionRegistration {
+    pub containerPackageName: String,
+    pub extensionKey: String,
     pub functionName: String,
     pub functionSource: Option<String>,
 }
@@ -146,6 +156,20 @@ pub struct ToolPkgAiProviderRegistration {
     pub calculateInputTokensFunctionSource: Option<String>,
 }
 
+/// Registers a single creation initializer owned by one authenticated ToolPkg container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct ToolPkgChatLifecycleHookRegistration {
+    /// Identifies the actual registered and enabled package, never a plugin-returned owner.
+    pub containerPackageName: String,
+    /// Identifies the single package registration selected for this draft.
+    pub hookId: String,
+    /// Identifies the real exported or durable module-backed main hook function.
+    pub functionName: String,
+    /// Preserves the existing serialized module handler when supplied by SDK capture.
+    pub functionSource: Option<String>,
+}
+
 /// Registration for one host-originated event hook.
 #[derive(Clone, Debug, serde::Serialize)]
 #[allow(non_snake_case)]
@@ -187,7 +211,7 @@ pub trait ToolPkgHookDispatcher: Send + Sync {
         &self,
         enabledPackageNames: &[String],
         invocation: ToolPkgHookInvocation,
-    ) -> Result<Option<String>, String>;
+    ) -> crate::javascript::JsExecutionCompletion<Result<Option<String>, String>>;
 }
 
 /// Decodes a hook output as JSON when the output contains valid JSON.

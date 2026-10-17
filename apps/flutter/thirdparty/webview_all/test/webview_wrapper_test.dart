@@ -46,7 +46,7 @@ void main() {
     await controller.clearCache();
     await controller.clearLocalStorage();
     await controller.runJavaScript('window.value = 1');
-    final Object result = await controller.runJavaScriptReturningResult(
+    final Object? result = await controller.runJavaScriptReturningResult(
       'window.value',
     );
     await controller.addJavaScriptChannel(

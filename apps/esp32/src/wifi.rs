@@ -6,6 +6,7 @@ use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiDriver,
 };
@@ -26,46 +27,20 @@ pub enum Esp32WifiMode {
 }
 
 impl Esp32Wifi {
-    /// Connects to the compile-time station network and waits for IPv4.
-    #[allow(dead_code)]
-    pub fn connect(
-        modem: Modem<'static>,
-        config: &Esp32FirmwareConfig,
-        nvs: EspDefaultNvsPartition,
-    ) -> HostResult<Self> {
-        let sysLoop = EspSystemEventLoop::take()
-            .map_err(|error| HostError::new(format!("event loop: {error}")))?;
-        let mut wifi = BlockingWifi::wrap(
-            EspWifi::new(modem, sysLoop.clone(), Some(nvs))
-                .map_err(|error| HostError::new(format!("wifi driver: {error}")))?,
-            sysLoop,
-        )
-        .map_err(|error| HostError::new(format!("wifi wrap: {error}")))?;
-        let mut client = ClientConfiguration::default();
-        client.ssid.clear();
-        client
-            .ssid
-            .push_str(&config.wifiSsid)
-            .map_err(|_| HostError::new("Wi-Fi SSID exceeds the ESP-IDF station field"))?;
-        client.password.clear();
-        client
-            .password
-            .push_str(&config.wifiPassword)
-            .map_err(|_| HostError::new("Wi-Fi password exceeds the ESP-IDF station field"))?;
-        client.auth_method = if config.wifiPassword.is_empty() {
-            AuthMethod::None
-        } else {
-            AuthMethod::WPA2Personal
-        };
-        wifi.set_configuration(&Configuration::Client(client))
-            .map_err(|error| HostError::new(format!("wifi config: {error}")))?;
-        wifi.start()
-            .map_err(|error| HostError::new(format!("wifi start: {error}")))?;
-        wifi.connect()
-            .map_err(|error| HostError::new(format!("wifi connect: {error}")))?;
-        wifi.wait_netif_up()
-            .map_err(|error| HostError::new(format!("wifi netif: {error}")))?;
-        Ok(Self { wifi })
+    /// Starts SNTP after station networking is ready and configures local time.
+    pub fn startTimeSync() -> HostResult<EspSntp<'static>> {
+        let timezone = option_env!("OPERIT_TIMEZONE").unwrap_or("CST-8");
+        std::env::set_var("TZ", timezone);
+        unsafe {
+            tzset();
+        }
+        EspSntp::new_default().map_err(|error| HostError::new(format!("SNTP init: {error}")))
+    }
+
+    /// Read live station state, independently of whether the setup AP exists.
+    pub fn stationConnected(&self) -> bool {
+        self.wifi.is_connected().unwrap_or(false)
+            && self.ipv4().is_ok_and(|ip| !ip.is_unspecified())
     }
 
     /// Returns the station IPv4 address after association.
@@ -116,34 +91,7 @@ impl Esp32Wifi {
         Ok((Self { wifi }, Esp32WifiMode::SetupAccessPoint))
     }
 
-    /// Starts the open setup access point when station credentials are absent or failed.
-    #[allow(dead_code)]
-    pub fn startSetupAccessPoint(
-        modem: Modem<'static>,
-        nvs: EspDefaultNvsPartition,
-    ) -> HostResult<Self> {
-        let sysLoop = EspSystemEventLoop::take()
-            .map_err(|error| HostError::new(format!("event loop: {error}")))?;
-        let mut wifi = BlockingWifi::wrap(
-            EspWifi::new(modem, sysLoop.clone(), Some(nvs))
-                .map_err(|error| HostError::new(format!("wifi driver: {error}")))?,
-            sysLoop,
-        )
-        .map_err(|error| HostError::new(format!("wifi wrap: {error}")))?;
-        let mut accessPoint = esp_idf_svc::wifi::AccessPointConfiguration::default();
-        accessPoint.ssid.clear();
-        accessPoint
-            .ssid
-            .push_str("Operit-ESP32-Setup")
-            .map_err(|_| HostError::new("setup AP SSID exceeds the Wi-Fi field"))?;
-        accessPoint.auth_method = AuthMethod::None;
-        accessPoint.max_connections = 4;
-        wifi.set_configuration(&Configuration::AccessPoint(accessPoint))
-            .map_err(|error| HostError::new(format!("setup AP config: {error}")))?;
-        wifi.start()
-            .map_err(|error| HostError::new(format!("setup AP start: {error}")))?;
-        Ok(Self { wifi })
-    }
+
 }
 
 fn tryStation(
@@ -212,4 +160,8 @@ fn setupAccessPointNetif() -> HostResult<EspNetif> {
     }
     EspNetif::new_with_conf(&configuration)
         .map_err(|error| HostError::new(format!("setup AP netif: {error}")))
+}
+
+unsafe extern "C" {
+    fn tzset();
 }

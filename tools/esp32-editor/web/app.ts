@@ -1,5 +1,9 @@
-import {setupEditor} from './editor.js';
+import type {DeviceState} from './device-state.js';
+import {ScenePreview} from './scene-renderer.js';
+import {DeviceView} from './device-view.js';
+import {DeviceSpeech} from './device-speech.js';
 import {request} from './transport.js';
+import {performDeviceAction} from './device-actions.js';
 import {point, pixel} from './model.js';
 import {errorMessage, query} from './types.js';
 import type {BoardInfo, BuildManifest, BuildStatus, RuntimeFactory, RuntimeModule} from './types.js';
@@ -41,6 +45,66 @@ let generation = -1;
 let lastFrame = 0;
 let pressed = false;
 let sourceHash = '';
+let miniStaticBytes = 0;
+const scenePreview = new ScenePreview();
+let deviceView: DeviceView | null = null;
+let pendingReview: string | undefined;
+let pendingSend: string | undefined;
+let latestDeviceState: DeviceState | null = null;
+const composer = document.createElement('form');
+composer.className = 'host-composer';
+composer.innerHTML = '<label><input name="message" aria-label="消息" maxlength="120" autocomplete="off" placeholder="输入后发送到屏幕中的当前对话"></label><button type="submit">发送</button><label class="image-picker">发送图片（PNG/JPEG，≤512 KiB）<input id="host-image" type="file" accept="image/png,image/jpeg"></label><output aria-live="polite"></output>';
+stage.after(composer);
+const hostInput = composer.querySelector<HTMLInputElement>('input')!;
+const hostStatus = composer.querySelector<HTMLOutputElement>('output')!;
+const hostImage = composer.querySelector<HTMLInputElement>('#host-image')!;
+const speech = new DeviceSpeech(message => {hostStatus.textContent=message;});
+const speakButton = document.createElement('button');speakButton.type='button';speakButton.textContent='朗读最新回复';
+composer.append(speakButton);
+speakButton.addEventListener('click', () => {
+  const message = latestDeviceState?.chat?.messages?.filter(item=>item.sender!=='user'&&item.text?.trim()).at(-1);
+  if(message) void speech.speak(message.text);else hostStatus.textContent='没有可朗读的回复';
+});
+hostImage.addEventListener('change', async () => {
+  const file = hostImage.files?.[0];
+  if (!file) return;
+  if (file.size === 0 || file.size > 512 * 1024 || !['image/png', 'image/jpeg'].includes(file.type)) {
+    hostStatus.textContent = '只支持非空、大小不超过 512 KiB 的 PNG/JPEG 图片'; hostImage.value = ''; return;
+  }
+  if (pendingSend) { hostStatus.textContent = '请等待当前消息发送完成'; hostImage.value = ''; return; }
+  const sendId = crypto.randomUUID();
+  hostStatus.textContent = '正在传输图片…'; hostImage.disabled = true; pendingSend = sendId;
+  try {
+    const response = await fetch('/api/simulator/send-image', {method:'POST', headers:{'Content-Type':file.type, 'X-Operit-Send-Id':sendId}, body:file});
+    const result = await response.json() as {error?:string};
+    if (!response.ok) throw new Error(result.error ?? `上传失败 (${response.status})`);
+    window.dispatchEvent(new Event('operit-simulator-refresh'));
+    // Acceptance only queues the Link call; the state poll confirms delivery.
+    if (hostStatus.textContent === '正在传输图片…') hostStatus.textContent = '等待 Core 确认图片发送…';
+  } catch (error) { pendingSend = undefined; hostStatus.textContent = errorMessage(error); }
+  finally { hostImage.disabled = false; hostImage.value = ''; }
+});
+let submittedHostText = '';
+composer.addEventListener('submit', event => {
+  event.preventDefault();
+  if (!runtime || pendingSend || window.operitEditor?.isEditing()) return;
+  submittedHostText = hostInput.value;
+  runtime.ccall('operit_ui_set_chat_draft', null, ['string'], [hostInput.value]);
+  runtime.ccall('operit_ui_submit_chat', null, [], []);
+});
+window.addEventListener('operit-simulator-state', event => {
+  const state = (event as CustomEvent<DeviceState>).detail;
+  latestDeviceState = state;
+  speech.update(state);
+  wifiInput.disabled = !!state.running;
+  edgeInput.disabled = !!state.running;
+  wifiInput.checked = !!state.running;
+  edgeInput.checked = !!state.connected;
+  if (runtime) applyControls();
+  if (pendingReview && pendingReview === state.spaceJoinRequestId) state.spaceJoinBusy = true;
+  deviceView?.update(state);
+  if (!state.running && pendingSend) finishSend(false, '模拟设备已停止，草稿已保留');
+});
 
 /** Adds a timestamped message to the bounded event log. */
 function log(message: string): void {
@@ -56,7 +120,7 @@ function log(message: string): void {
 
 /** Returns the initialized WebAssembly runtime. */
 function activeRuntime(): RuntimeModule {
-  if (!runtime) throw new Error('LVGL WebAssembly 尚未初始化');
+  if (!runtime) throw new Error('自绘 UI WebAssembly 尚未初始化');
   return runtime;
 }
 
@@ -74,26 +138,34 @@ function validManifest(manifest: BuildManifest): Required<Pick<BuildManifest, 's
   return manifest as Required<Pick<BuildManifest, 'sourceHash'>> & BuildManifest;
 }
 
-/** Updates the visible board theme and color swatches from LVGL state. */
+/** Updates the visible board theme and color swatches from 自绘 UI state. */
 function syncTheme(): void {
   const currentRuntime = activeRuntime();
   const currentBoard = activeBoard();
-  const index = currentRuntime._operit_lvgl_theme_index();
+  const index = currentRuntime._operit_ui_theme_index();
   const theme = currentBoard.themes[index];
-  if (!theme) throw new Error('LVGL 返回了不存在的主题索引');
+  if (!theme) throw new Error('自绘 UI 返回了不存在的主题索引');
   themeSelect.value = String(index);
-  shapeSelect.value = currentRuntime._operit_lvgl_round_icons() ? 'circle' : 'square';
+  shapeSelect.value = currentRuntime._operit_ui_round_icons() ? 'circle' : 'square';
   for (const key of ['bg', 'surface', 'accent', 'muted'] as const) {
     const swatch = query<HTMLElement>('#swatches').querySelector<HTMLElement>(`[data-color="${key}"]`);
     if (swatch) swatch.style.backgroundColor = theme[key];
   }
 }
 
-/** Applies the debug panel state to the shared LVGL runtime. */
+/** Applies the debug panel state to the shared 自绘 UI runtime. */
 function applyControls(): void {
   const currentRuntime = activeRuntime();
-  currentRuntime._operit_lvgl_set_connection(wifiInput.checked, edgeInput.checked);
-  currentRuntime.ccall('operit_lvgl_set_expression', null, ['string'], [expressionSelect.value]);
+  currentRuntime._operit_ui_set_connection(wifiInput.checked, edgeInput.checked);
+  currentRuntime.ccall('operit_ui_set_expression', null, ['string'], [expressionSelect.value]);
+}
+
+function finishSend(ok: boolean, error = ''): void {
+  if (!pendingSend) return;
+  pendingSend = undefined;
+  runtime?.ccall('operit_ui_chat_send_result', null, ['number', 'string'], [ok ? 1 : 0, error]);
+  hostStatus.textContent = ok ? '已发送' : error;
+  if (ok && hostInput.value === submittedHostText) hostInput.value = '';
 }
 
 /** Converts the Wasm RGB565 framebuffer into the visible Canvas image. */
@@ -103,7 +175,8 @@ function renderFrame(now: number): void {
   if (currentRuntime && now - lastFrame >= interval) {
     lastFrame = now;
     const started = performance.now();
-    currentRuntime._operit_lvgl_pump(0);
+    scenePreview.tick();
+    currentRuntime._operit_ui_pump(0);
     const nextGeneration = currentRuntime._simulator_generation();
     if (nextGeneration !== generation) {
       generation = nextGeneration;
@@ -121,14 +194,17 @@ function renderFrame(now: number): void {
       renderContext.putImageData(image, 0, 0);
     }
     syncTheme();
-    pageLabel.textContent = currentRuntime.ccall('operit_lvgl_current_page', 'string', [], []);
-    renderTimeLabel.textContent =
-      `${(performance.now() - started).toFixed(1)} ms · LVGL ${Math.round(currentRuntime._simulator_heap_used() / 1024)} KiB`;
+    pageLabel.textContent = currentRuntime.ccall('operit_ui_current_page', 'string', [], []);
+    const kib = (bytes: number): string => (bytes / 1024).toFixed(1);
+    let resources = `C UI 静态 RAM ${kib(miniStaticBytes)} KiB · C UI 动态分配 0`;
+    if (currentRuntime._simulator_stack_size && currentRuntime._simulator_stack_free)
+      resources += ` · C 栈剩余 ${kib(currentRuntime._simulator_stack_free())} / ${kib(currentRuntime._simulator_stack_size())} KiB`;
+    renderTimeLabel.textContent = `${(performance.now() - started).toFixed(1)} ms · ${resources}`;
   }
   requestAnimationFrame(renderFrame);
 }
 
-/** Sends a logical touch event to the shared LVGL runtime. */
+/** Sends a logical touch event to the shared 自绘 UI runtime. */
 function touch(clientX: number, clientY: number, down: boolean): void {
   if (!runtime) return;
   const position = point(clientX, clientY, canvas.getBoundingClientRect());
@@ -141,11 +217,11 @@ function navigate(page: 'home' | 'apps'): void {
   window.dispatchEvent(new Event('operit-runtime-navigation'));
   const currentRuntime = activeRuntime();
   if (page === 'home') {
-    currentRuntime._operit_lvgl_navigate_home();
+    currentRuntime._operit_ui_navigate_home();
     pageLabel.textContent = 'Home';
     return;
   }
-  currentRuntime._operit_lvgl_navigate_apps();
+  currentRuntime._operit_ui_navigate_apps();
   pageLabel.textContent = 'Apps';
 }
 
@@ -157,7 +233,7 @@ function handleCanvasKeydown(event: KeyboardEvent): void {
   navigate(event.key === 'ArrowRight' ? 'apps' : 'home');
 }
 
-/** Handles action callbacks emitted by the shared LVGL runtime. */
+/** Handles action callbacks emitted by the shared 自绘 UI runtime. */
 function handleRuntimeAction(value: string): void {
   if (value.startsWith('navigate:')) {
     window.setTimeout(() => {
@@ -165,7 +241,45 @@ function handleRuntimeAction(value: string): void {
     }, 0);
     return;
   }
-  log('LVGL action: ' + value);
+  log('自绘 UI action: ' + value);
+  if (value === 'edge_voice') { void speech.action(); return; }
+  if (value === 'edge_send') {
+    const text = activeRuntime().ccall('operit_ui_chat_draft', 'string', [], []);
+    hostStatus.textContent = '发送中';
+    const sendId = crypto.randomUUID();
+    pendingSend = sendId;
+    void fetch('/api/simulator/send', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text, sendId}),
+    }).then(async response => {
+      if (!response.ok) {
+        const result = await response.json() as {error?: string};
+        throw new Error(result.error ?? `发送失败 (${response.status})`);
+      }
+      window.dispatchEvent(new Event('operit-simulator-refresh'));
+      // The state poll acknowledges completion of the remote call.
+    }).catch(error => finishSend(false, errorMessage(error)));
+    return;
+  }
+  if (value.startsWith('edge_')) {
+    const reviewAction = value === 'edge_space_approve' || value === 'edge_space_reject';
+    if (reviewAction) pendingReview = latestDeviceState?.spaceJoinRequestId;
+    void performDeviceAction(runtime, value, async request => {
+      const response = await fetch('/api/simulator/action', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(request),
+      });
+      if (!response.ok) {
+        const detail = await response.json() as {error?: string};
+        throw new Error(detail.error ?? `操作失败 (${response.status})`);
+      }
+    }, {requestId: latestDeviceState?.spaceJoinRequestId,
+      assignmentVersion: latestDeviceState?.spaceJoinAssignmentVersion})
+      .catch(error => log('设备 action 错误: ' + errorMessage(error)))
+      .finally(() => {
+        if (reviewAction) pendingReview = undefined;
+        window.dispatchEvent(new Event('operit-simulator-refresh'));
+      });
+  }
   pageLabel.textContent = value;
   if (value === 'face_online' || value === 'run_node') {
     expressionSelect.value = value === 'run_node' ? 'listening' : 'online';
@@ -176,7 +290,14 @@ function handleRuntimeAction(value: string): void {
 /** Reads a generated manifest from the local server. */
 async function loadManifest(): Promise<Required<Pick<BuildManifest, 'sourceHash'>> & BuildManifest> {
   const response = await fetch('./generated/manifest.json', {cache: 'no-store'});
-  if (!response.ok) throw new Error(`读取构建清单失败 (${response.status})`);
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const build = await request<BuildStatus>('/api/build');
+      detail = build.error ?? (build.running ? '构建正在进行，请刷新页面' : '请先运行 npm run build --prefix tools/esp32-editor');
+    } catch { /* Preserve the primary missing-artifact error. */ }
+    throw new Error(`读取构建清单失败 (${response.status})。${detail}`);
+  }
   return validManifest(await response.json() as BuildManifest);
 }
 
@@ -186,13 +307,13 @@ async function updateBuildStatus(): Promise<void> {
     const status = await request<BuildStatus>('/api/build');
     const manifest = status.manifest;
     buildStatus.textContent = status.running
-      ? '正在构建 WebAssembly + ESP32…'
+      ? '正在构建，请查看开发者日志…'
       : status.error
         ? '构建失败：' + status.error
         : status.stale
           ? '底层运行时源码已变化，需要开发者构建'
           : manifest?.firmwareBuilt
-            ? `基础运行时 ${manifest.sourceHash?.slice(0, 12) ?? ''}`
+            ? `固件构建完成 ${manifest.sourceHash?.slice(0, 12) ?? ''} · 烧录需另行执行`
             : '预览已构建；固件未验证';
     if (
       sourceHash &&
@@ -210,7 +331,7 @@ async function updateBuildStatus(): Promise<void> {
   }
 }
 
-/** Connects the editor panel to the generated shared LVGL runtime. */
+/** Connects the editor panel to the generated shared 自绘 UI runtime. */
 async function initialize(): Promise<void> {
   board = await request<BoardInfo>('/api/board');
   const currentBoard = activeBoard();
@@ -218,16 +339,29 @@ async function initialize(): Promise<void> {
 
   const manifest = await loadManifest();
   sourceHash = manifest.sourceHash;
+  if (manifest.renderer !== 'mini') throw new Error('旧 UI 产物已失效，请重新构建自绘 UI');
   const module = await import('./generated/ui.mjs?v=' + encodeURIComponent(sourceHash)) as {default: RuntimeFactory};
   if (typeof module.default !== 'function') throw new Error('构建产物缺少 Wasm 工厂函数');
   runtime = await module.default();
   runtime.onAction = handleRuntimeAction;
-  if (!runtime._simulator_init()) throw new Error('LVGL 初始化失败');
+  if (!runtime._simulator_init()) throw new Error('自绘 UI 初始化失败');
   applyControls();
+  deviceView = new DeviceView(runtime, scenePreview, (ok, error, sendId) => {
+    if (sendId === pendingSend) finishSend(ok, error);
+  });
+  deviceView.update(latestDeviceState ?? {});
   syncTheme();
-  sourceLabel.textContent = `共用源码：${manifest.source ?? 'apps/esp32/lvgl_port/operit_lvgl.c'} / LVGL ${manifest.lvgl ?? '未知'}`;
-  log('真实 LVGL WebAssembly 已启动');
-  await setupEditor(runtime, log);
+  sourceLabel.textContent = `共用源码：${manifest.source ?? 'apps/esp32/ui_port/operit_mini_ui.c'} / 自绘 UI`;
+  miniStaticBytes = (JSON.parse(runtime.ccall('operit_ui_debug_snapshot', 'string', [], []) as string) as {staticBytes: number}).staticBytes;
+  log('自绘 UI WebAssembly 已启动；触摸/状态检查可用，布局编辑暂不可用');
+  editorStatus.textContent = '自绘 UI：固定页面，布局编辑已停用';
+  const toggle = document.querySelector<HTMLInputElement>('#edit-mode');
+  if (toggle) { toggle.checked = false; toggle.disabled = true; }
+  // The retired layout overlay must never intercept the live canvas touches.
+  query<HTMLElement>('#edit-layer').hidden = true;
+  themeSelect.disabled = true;
+  shapeSelect.disabled = true;
+  expressionSelect.disabled = true;
   requestAnimationFrame(renderFrame);
 }
 
@@ -257,7 +391,7 @@ function bindControls(): void {
   query<HTMLButtonElement>('#apps').addEventListener('click', () => navigate('apps'));
   const changeTheme = (): void => {
     window.dispatchEvent(new Event('operit-runtime-navigation'));
-    activeRuntime()._operit_lvgl_set_theme(Number(themeSelect.value), shapeSelect.value === 'circle');
+    activeRuntime()._operit_ui_set_theme(Number(themeSelect.value), shapeSelect.value === 'circle');
   };
   themeSelect.addEventListener('change', changeTheme);
   shapeSelect.addEventListener('change', changeTheme);
@@ -276,7 +410,7 @@ function bindControls(): void {
   query<HTMLButtonElement>('#reset').addEventListener('click', () => location.reload());
   query<HTMLButtonElement>('#capture').addEventListener('click', () => {
     const link = document.createElement('a');
-    link.download = 'operit-lvgl-320x240.png';
+    link.download = 'operit-ui-320x240.png';
     link.href = canvas.toDataURL();
     link.click();
   });
@@ -290,3 +424,32 @@ initialize().catch((error: unknown) => {
 });
 void updateBuildStatus();
 window.setInterval(() => void updateBuildStatus(), 2000);
+
+
+// Developer automation reads and operates the actual shared renderer.
+let debugPolling = false;
+window.setInterval(async () => {
+  if (!runtime || debugPolling || window.operitEditor?.isEditing()) return;
+  debugPolling = true;
+  try {
+    const response = await fetch('/api/simulator/debug/commands');
+    if (!response.ok) return;
+    const commands = await response.json() as {id: number; command: string; input: {id?: string; direction?: string}}[];
+    for (const command of commands) {
+      let error: string | undefined;
+      let value: unknown;
+      try {
+        if (command.command === 'tap' || command.command === 'swipe') {
+          const argument = command.command === 'tap' ? command.input.id : command.input.direction;
+          const accepted = runtime.ccall('operit_ui_debug_' + command.command, 'number', ['string'], [argument ?? '']);
+          if (!accepted) throw new Error('控件不可操作或手势无效');
+          await new Promise(resolve => window.setTimeout(resolve, 160));
+        }
+        value = JSON.parse(runtime.ccall('operit_ui_debug_' + (command.command === 'tree' ? 'tree' : 'snapshot'), 'string', [], []) as string);
+      } catch (cause) { error = errorMessage(cause); }
+      await fetch('/api/simulator/debug/result', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: command.id, value, error})});
+    }
+  } catch { /* The editor server can restart while this page stays open. */ }
+  finally { debugPolling = false; }
+}, 1000);

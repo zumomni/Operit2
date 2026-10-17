@@ -1,15 +1,12 @@
 package app.operit
 
-import android.graphics.Color
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Display
-import android.view.View
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
-import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     companion object {
@@ -27,18 +24,18 @@ class MainActivity : FlutterActivity() {
     private var pendingNotificationActivation: Map<String, String>? = null
     private var notificationActivationReceiverReady = false
 
+    /** Initializes the runtime host while Flutter owns the system bar layout. */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         activeActivity = this
         recordNotificationActivation(intent)
-        configureSystemBars()
         requestHighestRefreshRate()
     }
 
+    /** Refreshes host activity state without overriding Flutter system bars. */
     override fun onResume() {
         super.onResume()
         activeActivity = this
-        configureSystemBars()
         requestHighestRefreshRate()
     }
 
@@ -138,19 +135,23 @@ class MainActivity : FlutterActivity() {
     /** Parses and records the notification activation embedded in one launch intent. */
     private fun recordNotificationActivation(intent: Intent?) {
         val encodedActivation = intent?.getStringExtra(NOTIFICATION_ACTIVATION_EXTRA) ?: return
-        val json = JSONObject(encodedActivation)
-        val type = json.getString("type")
-        val activation =
-            when (type) {
-                "open_application" -> mapOf("type" to type)
-                "open_chat" -> mapOf("type" to type, "chatId" to json.getString("chatId"))
-                else -> throw IllegalArgumentException("unsupported notification activation type: $type")
+        when (
+            val decoded = NotificationActivationCodec.decode(encodedActivation) { message, error ->
+                Log.w(TAG, message, error)
             }
-        if (notificationActivationReceiverReady && ::runtimeRouter.isInitialized) {
-            runtimeRouter.emitNotificationActivation(activation)
-            return
+        ) {
+            is NotificationActivationDecode.Accepted -> {
+                if (notificationActivationReceiverReady && ::runtimeRouter.isInitialized) {
+                    runtimeRouter.emitNotificationActivation(decoded.activation)
+                    return
+                }
+                pendingNotificationActivation = decoded.activation
+            }
+            is NotificationActivationDecode.Rejected ->
+                // The activation is discarded (WARN already logged by the codec);
+                // the launch itself still proceeds.
+                Unit
         }
-        pendingNotificationActivation = activation
     }
 
     private fun requestHighestRefreshRate() {
@@ -193,25 +194,4 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun configureSystemBars() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            window.statusBarColor = Color.TRANSPARENT
-            window.navigationBarColor = Color.TRANSPARENT
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            window.isStatusBarContrastEnforced = false
-            window.isNavigationBarContrastEnforced = false
-        }
-
-        val flags =
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-                } else {
-                    0
-                }
-        window.decorView.systemUiVisibility = flags
-    }
 }

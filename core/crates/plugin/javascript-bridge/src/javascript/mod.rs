@@ -1,5 +1,11 @@
+#[path = "JsComposeCompiler.rs"]
+mod JsComposeCompiler;
+
 #[path = "JsEngine.rs"]
 pub mod JsEngine;
+
+#[path = "PreparedEnginePool.rs"]
+mod PreparedEnginePool;
 
 #[path = "JsExecutionProvider.rs"]
 pub mod JsExecutionProvider;
@@ -19,8 +25,8 @@ pub mod JsExternalJavaCodeLoader;
 #[path = "JsInitRuntimeScriptBuilder.rs"]
 pub mod JsInitRuntimeScriptBuilder;
 
-#[path = "JsNativeInterfaceDelegates.rs"]
-pub mod JsNativeInterfaceDelegates;
+#[path = "JsHostOperations.rs"]
+pub mod JsHostOperations;
 
 #[path = "JsJavaBridge.rs"]
 pub mod JsJavaBridge;

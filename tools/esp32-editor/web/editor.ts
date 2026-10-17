@@ -115,7 +115,7 @@ const numericProperties = new Set<NumericNodeProperty>([
   'fontSize',
 ]);
 
-/** Installs the visual editor and connects it to the shared LVGL runtime. */
+/** Installs the visual editor and connects it to the shared 自绘 UI runtime. */
 export async function setupEditor(ui: EditorRuntime, log: (message: string) => void): Promise<void> {
   const initial = await request<LayoutResponse>('/api/layout');
   const initialErrors = validate(initial.document);
@@ -125,7 +125,8 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
   let revision = initial.revision;
   let selected: string | null = null;
   let activePageId = layout.entryPage ?? 'home';
-  let editing = true;
+  // Open the developer tool in device runtime mode; layout editing remains opt-in.
+  let editing = false;
   let holdTimer: number | null = null;
   let holdPointer: {x: number; y: number} | null = null;
   let saved = JSON.stringify(layout);
@@ -311,7 +312,7 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
     return {x, y};
   }
 
-  /** Renders the active page through the shared LVGL WebAssembly runtime. */
+  /** Renders the active page through the shared 自绘 UI WebAssembly runtime. */
   function preview(): void {
     const page = currentPage();
     const errors = validate(layout);
@@ -319,10 +320,10 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
       notify(errors.join('; '));
       return;
     }
-    ui._operit_lvgl_layout_clear(parseInt(page.background.slice(1), 16));
-    if (ui._operit_lvgl_layout_page_meta) {
+    ui._operit_ui_layout_clear(parseInt(page.background.slice(1), 16));
+    if (ui._operit_ui_layout_page_meta) {
       ui.ccall(
-        'operit_lvgl_layout_page_meta',
+        'operit_ui_layout_page_meta',
         null,
         ['string', 'string', 'string'],
         [activePageId, page.swipeLeft ?? '', page.swipeRight ?? ''],
@@ -333,7 +334,7 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
       const parent = node.parent ? page.nodes.findIndex((candidate) => candidate.id === node.parent) : -1;
       if (node.parent && parent < 0) throw new Error('组件父容器不存在：' + node.parent);
       const result = ui.ccall(
-        'operit_lvgl_layout_add',
+        'operit_ui_layout_add',
         'number',
         ['number', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'string', 'string'],
         [
@@ -351,17 +352,17 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
         ],
       );
       if (result < 0) {
-        notify('LVGL 组件创建失败：' + node.id);
-      } else if (ui._operit_lvgl_layout_bind) {
+        notify('自绘 UI 组件创建失败：' + node.id);
+      } else if (ui._operit_ui_layout_bind) {
         ui.ccall(
-          'operit_lvgl_layout_bind',
+          'operit_ui_layout_bind',
           null,
           ['number', 'string', 'string'],
           [result, node.action, node.longAction ?? ''],
         );
-        if (ui._operit_lvgl_layout_style) {
+        if (ui._operit_ui_layout_style) {
           ui.ccall(
-            'operit_lvgl_layout_style',
+            'operit_ui_layout_style',
             null,
             ['number', 'string', 'number'],
             [result, node.binding ?? '', node.fontSize ?? 14],
@@ -455,7 +456,7 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
       } else if (isIconText) {
         options = ['face', 'wifi', 'settings', 'home', 'play', 'folder'];
       } else if (key === 'binding') {
-        options = ['', 'clock', 'connection', 'expression'];
+        options = ['', 'clock', 'connection', 'expression', 'theme', 'pairing', 'space', 'chat'];
       } else if (key === 'fontSize') {
         options = ['14', '48'];
       } else {
@@ -746,7 +747,7 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
       node.x = Math.max(0, Math.min(width - node.w, drag.node.x + dx));
       node.y = Math.max(0, Math.min(height - node.h, drag.node.y + dy));
     }
-    ui._operit_lvgl_layout_geometry(currentPage().nodes.indexOf(node), node.x, node.y, node.w, node.h);
+    ui._operit_ui_layout_geometry(currentPage().nodes.indexOf(node), node.x, node.y, node.w, node.h);
     renderOverlays();
     updateChangeStatus();
   }
@@ -1110,8 +1111,8 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
     if (!(input instanceof HTMLInputElement)) throw new Error('编辑模式控件类型错误');
     editing = input.checked;
     editLayer.hidden = !editing;
-    preview();
-    notify(editing ? '编辑模式 · 拖动组件，四角调整尺寸' : '运行模式 · 点击或滑动体验 LVGL 控件');
+    if (editing) preview(); else ui._operit_ui_navigate_home();
+    notify(editing ? '编辑模式 · 拖动组件，四角调整尺寸' : '运行模式 · 点击或滑动体验 自绘 UI 控件');
   });
   query<HTMLInputElement>('#layout-enabled').addEventListener('change', (event: Event) => {
     const input = event.currentTarget;
@@ -1136,7 +1137,9 @@ export async function setupEditor(ui: EditorRuntime, log: (message: string) => v
   window.operitEditor = bridge;
   window.setInterval(() => void pollExternalLayout(), 2000);
 
-  preview();
+  editLayer.hidden = !editing;
+  query<HTMLInputElement>('#edit-mode').checked = editing;
+  ui._operit_ui_navigate_home();
   render();
-  notify('正在编辑实际首页 · 保存项目后可下发到设备，无需编译');
+  notify('运行实际首页 · 开启编辑布局可修改草稿');
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// Runs package management commands.
-pub fn run_package_command(
+pub async fn run_package_command(
     application: &OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -76,6 +76,7 @@ pub fn run_package_command(
                 .get(1)
                 .ok_or_else(|| "usage: operit2 package use <name>".to_string())?;
             let package_manager = package_manager(&tool_handler);
+            operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager::prepareMcpPackage(&package_manager, name).await?;
             let mut guard = package_manager
                 .lock()
                 .expect("package manager mutex poisoned");
@@ -102,12 +103,13 @@ pub fn run_package_command(
                 .ok_or_else(|| "package exec tool name must use package:tool format".to_string())?;
             {
                 let package_manager = package_manager(&tool_handler);
+                operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager::prepareMcpPackage(&package_manager, &package_name).await?;
                 let mut guard = package_manager
                     .lock()
                     .expect("package manager mutex poisoned");
                 guard.usePackage(&package_name);
             }
-            tool::exec_tool(tool_handler, tool_name, params_json, output)
+            tool::exec_tool(tool_handler, tool_name, params_json, output).await
         }
         _ => {
             print_package_usage(output);

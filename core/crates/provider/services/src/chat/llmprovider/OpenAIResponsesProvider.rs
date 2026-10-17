@@ -16,7 +16,8 @@ use operit_model::ModelConfigData::{BuiltinToolRequestFormat, ModelBuiltinTool};
 use operit_model::PromptTurn::PromptTurn;
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::stream::RevisableTextStream::{
-    with_event_channel, RevisableTextStreamLike, TextStreamEventCarrier,
+    with_event_channel_and_failure, RevisableTextStream, RevisableTextStreamLike,
+    TerminalFailureState, TextStreamEventCarrier,
 };
 use operit_util::stream::Stream::{FnStream, Stream};
 use operit_util::ChatMarkupRegex::{attr_value, tag_body, tag_ranges};
@@ -160,7 +161,8 @@ impl OpenAIResponsesProvider {
             self.supportsAudio,
             self.supportsVideo,
             self.enableToolCall,
-        );
+        )
+        .with_responses_api(true);
         let request_history = if request.enable_thinking {
             request.chat_history.clone()
         } else {
@@ -198,7 +200,34 @@ impl OpenAIResponsesProvider {
             &messagesArray,
             toolsJson.as_deref(),
         );
+        if self.responsesProviderType == "OPENAI_CODEX" {
+            normalize_codex_responses_body(&mut requestObject);
+        }
         Ok(requestObject)
+    }
+
+    /// Loads a fresh Codex access token before a Codex Responses request.
+    async fn apply_codex_access(&mut self) -> Result<(), AiServiceError> {
+        if self.responsesProviderType != "OPENAI_CODEX" {
+            return Ok(());
+        }
+        let tokens = self
+            .runtimeContext
+            .support()
+            .loadCodexTokens()
+            .map_err(AiServiceError::RequestFailed)?;
+        let tokens = crate::chat::llmprovider::CodexOAuth::ensure_fresh_tokens(tokens).await?;
+        self.runtimeContext
+            .support()
+            .saveCodexTokens(tokens.clone())
+            .map_err(AiServiceError::RequestFailed)?;
+        let account_id = crate::chat::llmprovider::CodexOAuth::account_id_from_tokens(&tokens)?;
+        self.api_key = tokens.accessToken;
+        self.customHeaders
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("ChatGPT-Account-Id"));
+        self.customHeaders
+            .push(("ChatGPT-Account-Id".to_string(), account_id));
+        Ok(())
     }
 
     /// Returns whether the model configuration enables Responses web search.
@@ -390,6 +419,9 @@ impl OpenAIResponsesProvider {
                     .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
             );
         }
+        if self.responsesProviderType == "OPENAI_CODEX" {
+            apply_codex_headers(&mut headers, &self.customHeaders)?;
+        }
         for (name, value) in &self.customHeaders {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
@@ -399,6 +431,104 @@ impl OpenAIResponsesProvider {
             );
         }
         Ok(headers)
+    }
+}
+
+/// Adds the ChatGPT account header required by the Codex responses endpoint.
+pub(crate) fn apply_codex_headers(
+    headers: &mut HeaderMap,
+    custom_headers: &[(String, String)],
+) -> Result<(), AiServiceError> {
+    let account_id = custom_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("ChatGPT-Account-Id"))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AiServiceError::RequestFailed(
+                "Codex authorization is missing the ChatGPT account id".to_string(),
+            )
+        })?;
+    headers.insert(
+        HeaderName::from_static("chatgpt-account-id"),
+        HeaderValue::from_str(&account_id)
+            .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
+    );
+    headers.insert(
+        HeaderName::from_static("originator"),
+        HeaderValue::from_static("operit"),
+    );
+    headers.insert(
+        HeaderName::from_static("user-agent"),
+        HeaderValue::from_static("operit"),
+    );
+    Ok(())
+}
+
+/// Rewrites a Responses body into the shape accepted by the ChatGPT Codex endpoint.
+fn normalize_codex_responses_body(request: &mut Value) {
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    object.insert("store".to_string(), json!(false));
+    object.insert("stream".to_string(), json!(true));
+    object.remove("max_output_tokens");
+    object.remove("max_completion_tokens");
+    object.remove("max_tokens");
+    object.remove("temperature");
+    object.remove("top_p");
+    object.remove("user");
+    object.remove("truncation");
+    object.remove("prompt_cache_key");
+    object.remove("prompt_cache_options");
+    object.remove("prompt_cache_retention");
+    if object
+        .get("instructions")
+        .is_none_or(|value| value.is_null())
+    {
+        object.insert("instructions".to_string(), json!(""));
+    }
+    match object.get_mut("include") {
+        Some(Value::Array(include)) => {
+            let present = include.iter().any(|value| value.as_str() == Some("reasoning.encrypted_content"));
+            if !present {
+                include.push(json!("reasoning.encrypted_content"));
+            }
+        }
+        _ => {
+            object.insert(
+                "include".to_string(),
+                json!(["reasoning.encrypted_content"]),
+            );
+        }
+    }
+    if object.contains_key("tools") {
+        object.insert("parallel_tool_calls".to_string(), json!(true));
+    }
+    let is_fast = if let Some(Value::String(model)) = object.get_mut("model") {
+        if model.ends_with("-fast") {
+            *model = model.trim_end_matches("-fast").to_string();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if is_fast {
+        object.insert("service_tier".to_string(), json!("priority"));
+    } else if let Some(tier) = object.get("service_tier").and_then(Value::as_str) {
+        match tier.to_ascii_lowercase().as_str() {
+            "priority" | "fast" => {
+                object.insert("service_tier".to_string(), json!("priority"));
+            }
+            "ultrafast" => {}
+            _ => {
+                object.remove("service_tier");
+            }
+        }
+    } else {
+        object.remove("service_tier");
     }
 }
 
@@ -807,6 +937,22 @@ impl OpenAIResponsesPayloadAdapter {
                                 );
                             }
                         }
+                        "video_url" | "input_video" => {
+                            let videoUrl = if partType == "input_video" {
+                                part.get("video_url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                            } else {
+                                part.pointer("/video_url/url")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| part.get("video_url").and_then(Value::as_str))
+                                    .unwrap_or_default()
+                            };
+                            if !videoUrl.is_empty() {
+                                convertedParts
+                                    .push(json!({"type": "input_video", "video_url": videoUrl}));
+                            }
+                        }
                         _ => {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
@@ -1188,10 +1334,12 @@ impl AIService for OpenAIResponsesProvider {
             self.supportsAudio,
             self.supportsVideo,
             self.enableToolCall,
-        );
+        )
+        .with_responses_api(true);
         AIService::calculate_input_tokens(&parent, chat_history, available_tools).await
     }
 
+    /// Sends an OpenAI Responses request through a failure-aware cold stream.
     async fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -1200,6 +1348,11 @@ impl AIService for OpenAIResponsesProvider {
             state.cancelled = false;
         }
         self.reset_token_counts();
+        self.apply_codex_access().await?;
+        let mut request = request;
+        if self.responsesProviderType == "OPENAI_CODEX" {
+            request.stream = true;
+        }
         let requestBody = self.create_request_body(&request)?;
         if request.stream {
             let mut parent = OpenAIProvider::new_with_capabilities(
@@ -1212,9 +1365,12 @@ impl AIService for OpenAIResponsesProvider {
                 self.supportsAudio,
                 self.supportsVideo,
                 self.enableToolCall,
-            );
+            )
+            .with_responses_api(true);
             let mut parent_stream = parent.send_prepared_request(request, requestBody).await?;
             let event_channel = parent_stream.event_channel().clone();
+            let terminalFailure = TerminalFailureState::new();
+            let producerTerminalFailure = terminalFailure.clone();
             let mut provider = self.clone();
             let activeParentGeneration = provider.setActiveParent(parent.clone());
             if provider.isCancelled() {
@@ -1233,8 +1389,12 @@ impl AIService for OpenAIResponsesProvider {
                 let mut provider = ownedProvider
                     .take()
                     .expect("OpenAI Responses parent stream must only be collected once");
+                let producerTerminalFailure = producerTerminalFailure.clone();
                 Box::pin(async move {
                     parentStream.collect(emit).await;
+                    if let Some(error) = parentStream.terminal_failure() {
+                        producerTerminalFailure.set(error);
+                    }
                     provider.apply_usage_counts(&UsageCounts {
                         totalInputTokens: parent.input_token_count()
                             + parent.cached_input_token_count(),
@@ -1245,7 +1405,11 @@ impl AIService for OpenAIResponsesProvider {
                     provider.clearActiveParent(activeParentGeneration);
                 })
             });
-            return Ok(Box::new(with_event_channel(cold_stream, event_channel)));
+            return Ok(Box::new(with_event_channel_and_failure(
+                cold_stream,
+                event_channel,
+                terminalFailure,
+            )));
         }
 
         let response = reqwest::Client::new()
@@ -1550,64 +1714,9 @@ fn escape_xml_attribute(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        build_responses_web_search_chunks, extract_responses_metadata,
-        strip_responses_protocol_markup, OpenAIResponsesPayloadAdapter, UsageCounts,
-        RESPONSES_OUTPUT_ITEM_META_PROVIDER,
-    };
-    use serde_json::json;
+#[path = "../../../../tests/OpenAIResponsesProviderTests.rs"]
+mod tests;
 
-    /// Renders search queries, citations, and replay metadata together.
-    #[test]
-    fn renders_responses_web_search_output() {
-        let item = json!({
-            "type": "web_search_call",
-            "id": "search_1",
-            "status": "completed",
-            "action": {
-                "type": "search",
-                "queries": ["DeepSeek V4"],
-                "sources": [{"title": "DeepSeek", "url": "https://deepseek.com"}]
-            }
-        });
-        let chunks = build_responses_web_search_chunks(&[item.clone()], &json!({}));
-        assert!(chunks[0].contains("<query>DeepSeek V4</query>"));
-        assert!(chunks[0].contains("url=\"https://deepseek.com\""));
-        assert_eq!(chunks.len(), 1);
-        let metadata = OpenAIResponsesPayloadAdapter::create_output_item_metadata_tag(&item)
-            .expect("web search item metadata");
-        assert_eq!(
-            extract_responses_metadata(&metadata, RESPONSES_OUTPUT_ITEM_META_PROVIDER),
-            vec![item]
-        );
-    }
-
-    /// Removes search presentation and hidden replay metadata from model text.
-    #[test]
-    fn strips_responses_search_protocol_markup() {
-        let chunks = build_responses_web_search_chunks(
-            &[json!({"type": "web_search_call", "id": "search_1"})],
-            &json!({}),
-        );
-        let content = format!("before{}after", chunks.join(""));
-        assert_eq!(strip_responses_protocol_markup(&content), "beforeafter");
-    }
-
-    /// Preserves an explicitly reported all-zero usage payload.
-    #[test]
-    fn parses_zero_usage_payload() {
-        assert_eq!(
-            OpenAIResponsesPayloadAdapter::parse_usage_counts(Some(&json!({
-                "input_tokens": 0,
-                "output_tokens": 0
-            }))),
-            Some(UsageCounts {
-                totalInputTokens: 0,
-                actualInputTokens: 0,
-                cachedInputTokens: 0,
-                outputTokens: 0,
-            })
-        );
-    }
-}
+#[cfg(test)]
+#[path = "../../../../tests/OpenAIResponsesProviderMediaRoleTests.rs"]
+mod media_role_tests;

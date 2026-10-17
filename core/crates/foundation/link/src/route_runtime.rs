@@ -3,7 +3,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::{CoreCallRequest, CoreCallResponse, CoreEventStream, CoreLinkError, CoreWatchRequest};
+use crate::{
+    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventStream, CoreLinkError, CoreWatchRequest,
+};
 
 tokio::task_local! {
     static CORE_FORCE_LOCAL: bool;
@@ -44,6 +46,12 @@ pub trait CoreRouteRuntime: Send + Sync {
         request: CoreWatchRequest,
     ) -> Pin<Box<dyn Future<Output = Result<CoreEventStream, CoreLinkError>>>>;
 
+    /// Opens an annotation-addressed input stream using the same Binding and permission rules.
+    #[allow(non_snake_case)]
+    fn openPush(&self, _request: crate::CorePushRequest) -> Pin<Box<dyn Future<Output = Result<Box<dyn crate::CoreLinkPushSession>, CoreLinkError>>>> {
+        Box::pin(async { Err(CoreLinkError::new("ROUTE_PUSH_UNAVAILABLE", "This route runtime does not expose Push")) })
+    }
+
     /// Routes one annotated StateFlow watch while carrying a local source opened by the wrapper.
     #[allow(non_snake_case)]
     fn watchWithLocalSource(
@@ -53,6 +61,20 @@ pub trait CoreRouteRuntime: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<CoreEventStream, CoreLinkError>>>> {
         self.watch(request)
     }
+}
+
+/// Reads the first event from one route-owned watch stream.
+pub async fn coreRouteWatchSnapshot(
+    runtime: Arc<dyn CoreRouteRuntime>,
+    request: CoreWatchRequest,
+) -> Result<CoreEvent, CoreLinkError> {
+    let mut stream = runtime.watch(request).await?;
+    stream.recv().await.ok_or_else(|| {
+        CoreLinkError::new(
+            "WATCH_STREAM_EMPTY",
+            "Core watch stream completed before its snapshot",
+        )
+    })
 }
 
 static CORE_ROUTE_RUNTIME: OnceLock<RwLock<Option<Arc<dyn CoreRouteRuntime>>>> = OnceLock::new();

@@ -1039,6 +1039,30 @@ impl MarketStatsApiService {
         }
     }
 
+    /// Streams a marketplace asset to a caller-owned file without buffering it in the UI.
+    pub fn download_asset_to_file(&self, asset_id: &str, target_path: &str) -> Result<u64, String> {
+        let asset_id = asset_id.trim();
+        if asset_id.is_empty() {
+            return Err("asset id is empty".to_string());
+        }
+        let url = self.v2_url(&["assets", asset_id, "download"])?;
+        let result = self.http_host.downloadToFile(HttpRequestData {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+            body: Vec::new(),
+            formFields: Vec::new(),
+            fileParts: Vec::new(),
+            connectTimeoutSeconds: TIMEOUT_SECONDS,
+            readTimeoutSeconds: TIMEOUT_SECONDS,
+            followRedirects: true,
+            ignoreSsl: false,
+            proxyHost: String::new(),
+            proxyPort: 0,
+        }, target_path.to_string()).map_err(|error| error.to_string())?;
+        Ok(result.downloadedBytes)
+    }
+
     // ── Internal: HTTP helpers ─────────────────────────────
 
     fn request_v2_json<T: for<'de> Deserialize<'de>>(
@@ -1265,25 +1289,29 @@ fn now_iso() -> String {
         .to_string()
 }
 
+/// Client version recorded as the minimum for all marketplace publications.
+pub const MARKET_MIN_APP_VERSION: &str = "2.0.0";
+/// Client version recorded as the maximum for all marketplace publications.
+pub const MARKET_MAX_APP_VERSION: &str = "2.99.99";
+
 fn entry_downloads(entry: &MarketEntrySummary) -> i32 {
     entry.download_count.max(entry.downloads)
 }
 
+/// Builds published marketplace version metadata with the fixed client range.
 fn market_base_version_json(
     version: &str,
     format_ver: &str,
-    min_app_ver: &str,
-    max_app_ver: Option<String>,
+    _min_app_ver: &str,
+    _max_app_ver: Option<String>,
     changelog: Option<String>,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
         "version": version,
         "formatVer": format_ver,
-        "minAppVer": min_app_ver,
+        "minAppVer": MARKET_MIN_APP_VERSION,
+        "maxAppVer": MARKET_MAX_APP_VERSION,
     });
-    if let Some(max) = max_app_ver.filter(|value| !value.trim().is_empty()) {
-        json["maxAppVer"] = serde_json::Value::String(max);
-    }
     if let Some(text) = changelog.filter(|value| !value.trim().is_empty()) {
         json["changelog"] = serde_json::Value::String(text);
     }
@@ -1431,6 +1459,11 @@ mod tests {
     }
 
     impl HttpHost for ReqwestTestHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Executes one test HTTP request through reqwest.
         fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
             let method = reqwest::Method::from_bytes(request.method.as_bytes())

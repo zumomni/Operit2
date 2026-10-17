@@ -9,10 +9,9 @@ class RuntimeMethodChannelRouter(
     ownerSystem: OwnerSystemCapabilityChannel,
 ) {
     private val coreLinkChannel = RuntimeCoreLinkChannel(runtimeHost)
-    private val linkHostChannel = RuntimeLinkHostChannel(runtimeHost)
     private val ownerSystemChannel = ownerSystem
     private val androidPlatformChannel = AndroidPlatformChannel(activity, runtimeHost)
-    private val snapshotImportInputChannel = SnapshotImportInputChannel(activity)
+    private val documentInputChannel = DocumentInputChannel(activity)
     private var runtimeChannel: MethodChannel? = null
 
     fun configure(messenger: BinaryMessenger) {
@@ -26,18 +25,17 @@ class RuntimeMethodChannelRouter(
                         result.success(null)
                     }
                     coreLinkChannel.handle(call, result) -> Unit
-                    linkHostChannel.handle(call, result) -> Unit
                     ownerSystemChannel.handle(call, result) -> Unit
                     androidPlatformChannel.handle(call, result) -> Unit
                     else -> result.notImplemented()
                 }
             }
         }
-        snapshotImportInputChannel.attach(messenger)
+        documentInputChannel.attach(messenger)
     }
 
     fun clear() {
-        snapshotImportInputChannel.clear()
+        documentInputChannel.clear()
         runtimeChannel?.setMethodCallHandler(null)
         runtimeChannel = null
     }
@@ -47,16 +45,18 @@ class RuntimeMethodChannelRouter(
         runtimeChannel?.invokeMethod("notificationActivation", activation)
     }
 
+    /** Routes Android permission results to the channel that owns the request. */
     fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
         grantResults: IntArray,
     ): Boolean {
+        if (ownerSystemChannel.onRequestPermissionsResult(requestCode)) return true
         return androidPlatformChannel.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
-    /** Delivers one Android document picker result to the snapshot input channel. */
+    /** Delivers one Android document picker result to the document input channel. */
     fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?): Boolean {
-        return snapshotImportInputChannel.onActivityResult(requestCode, resultCode, data)
+        return documentInputChannel.onActivityResult(requestCode, resultCode, data)
     }
 }

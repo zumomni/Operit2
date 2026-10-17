@@ -324,6 +324,15 @@ fn normalizePackageName(packageName: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Asserts that an immediate mock completion is ready on its first poll.
+    fn pollReadyCompletion<T>(mut completion: crate::javascript::JsExecutionCompletion<T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::future::Future::poll(completion.as_mut(), &mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("immediate mock completion must be ready"),
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::Arc;
@@ -479,11 +488,14 @@ mod tests {
             _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _dispatchIntermediateOnMain: bool,
             _timeoutSec: u64,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(params
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_string))
+        ) -> crate::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+            let result = (|| {
+                Ok(params
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .map(str::to_string))
+            })();
+            Box::pin(std::future::ready(result))
         }
 
         /// Returns the dispatched event name for exact-deadline hook tests.
@@ -497,11 +509,14 @@ mod tests {
             _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _dispatchIntermediateOnMain: bool,
             _timeoutMillis: u64,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(params
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_string))
+        ) -> crate::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+            let result = (|| {
+                Ok(params
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .map(str::to_string))
+            })();
+            Box::pin(std::future::ready(result))
         }
 
         /// Returns the dispatched event asynchronously for package manager tests.
@@ -535,52 +550,25 @@ mod tests {
             Ok(ToolPkgMainRegistrationCapture::default())
         }
 
-        /// Returns the supplied Compose DSL script.
-        #[allow(non_snake_case)]
-        fn execute_compose_dsl_script(
-            &self,
-            script: &str,
-            _runtimeOptions: &BTreeMap<String, Value>,
-            _envOverrides: &BTreeMap<String, String>,
-            _textResources: Arc<BTreeMap<String, String>>,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(Some(script.to_string()))
-        }
-
-        /// Returns the supplied Compose DSL script asynchronously for tests.
-        fn execute_compose_dsl_script_async(
-            &self,
-            script: String,
-            _runtime_options: BTreeMap<String, Value>,
-            _env_overrides: BTreeMap<String, String>,
-            _text_resources: Arc<BTreeMap<String, String>>,
-        ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-            Box::pin(async move { Ok(Some(script)) })
-        }
-
-        /// Returns the dispatched action id.
-        #[allow(non_snake_case)]
-        fn dispatch_compose_dsl_action(
-            &self,
-            actionId: &str,
-            _payload: Option<Value>,
-            _runtimeOptions: &BTreeMap<String, Value>,
-            _envOverrides: &BTreeMap<String, String>,
-            _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(Some(actionId.to_string()))
+        /// Rejects live-session rendering in this recording-only engine.
+        fn execute_compose_dsl_script_stream_async(
+            &self, _script: String, _runtime_options: BTreeMap<String, Value>,
+            _env_overrides: BTreeMap<String, String>, _text_resources: Arc<BTreeMap<String, String>>,
+            _on_response: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> crate::javascript::JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+            Box::pin(async { Err(crate::execution_result::JsExecutionError::invalid_request("This recording engine does not execute live Compose sessions")) })
         }
 
         /// Returns the dispatched action id asynchronously for tests.
-        fn dispatch_compose_dsl_action_result_async(
+        fn dispatch_compose_dsl_action_stream_async(
             &self,
             actionId: String,
             _payload: Option<Value>,
             _runtimeOptions: BTreeMap<String, Value>,
             _envOverrides: BTreeMap<String, String>,
-            _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-            Box::pin(async move { Ok(Some(actionId)) })
+            _on_intermediate_result: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+            Box::pin(async move { Ok(Some(Value::String(actionId))) })
         }
 
         /// Releases no resources for the test engine.
@@ -593,8 +581,8 @@ mod tests {
     impl ToolPkgExecutionEngineFactory for TestExecutionEngineFactory {
         /// Creates one generic test JavaScript engine.
         #[allow(non_snake_case)]
-        fn createExecutionEngine(&self) -> Arc<dyn JsExecutionEngine> {
-            Arc::new(TestExecutionEngine)
+        fn createExecutionEngine(&self) -> Result<Arc<dyn JsExecutionEngine>, String> {
+            Ok(Arc::new(TestExecutionEngine))
         }
 
         /// Creates one ToolPkg test JavaScript engine.
@@ -602,8 +590,17 @@ mod tests {
         fn createToolPkgExecutionEngine(
             &self,
             _context: ToolPkgExecutionContext,
-        ) -> Arc<dyn JsExecutionEngine> {
-            Arc::new(TestExecutionEngine)
+        ) -> Result<Arc<dyn JsExecutionEngine>, String> {
+            Ok(Arc::new(TestExecutionEngine))
+        }
+
+        /// Completes the asynchronous factory contract with this consumer's explicit engine implementation.
+        #[allow(non_snake_case)]
+        fn acquireToolPkgExecutionEngine(
+            &self, context: ToolPkgExecutionContext,
+        ) -> crate::javascript::JsExecutionFuture<Result<Arc<dyn JsExecutionEngine>, String>> {
+            let result = self.createToolPkgExecutionEngine(context);
+            Box::pin(async move { result })
         }
     }
 
@@ -710,28 +707,26 @@ mod tests {
         assert!(registered);
         manager.setEnabledPackageNames(&["container".to_string()]);
 
-        let output = manager
-            .toolPkgManager()
-            .dispatchToolPkgHook(
-                &manager.enabledPackageNames(),
-                ToolPkgHookInvocation {
-                    containerPackageName: "container".to_string(),
-                    functionName: "onEvent".to_string(),
-                    event: "host_event".to_string(),
-                    eventName: None,
-                    pluginId: None,
-                    inlineFunctionSource: None,
-                    eventPayload: Value::Object(Default::default()),
-                    executionContextKey: None,
-                    runtimeKind: None,
-                    envOverrides: BTreeMap::new(),
-                    timestampMs: 1,
-                    timeoutMillis: 10_000,
-                    dispatchIntermediateOnMain: true,
-                    onIntermediateResult: None,
-                },
-            )
-            .expect("ToolPkg hook dispatch must succeed");
+        let output = pollReadyCompletion(manager.toolPkgManager().dispatchToolPkgHook(
+            &manager.enabledPackageNames(),
+            ToolPkgHookInvocation {
+                containerPackageName: "container".to_string(),
+                functionName: "onEvent".to_string(),
+                event: "host_event".to_string(),
+                eventName: None,
+                pluginId: None,
+                inlineFunctionSource: None,
+                eventPayload: Value::Object(Default::default()),
+                executionContextKey: None,
+                runtimeKind: None,
+                envOverrides: BTreeMap::new(),
+                timestampMs: 1,
+                timeoutMillis: 10_000,
+                dispatchIntermediateOnMain: true,
+                onIntermediateResult: None,
+            },
+        ))
+        .expect("ToolPkg hook dispatch must succeed");
 
         assert_eq!(output.as_deref(), Some("host_event"));
     }

@@ -1,23 +1,25 @@
 import Flutter
 import UIKit
 import UserNotifications
+import file_selector_ios
 
 @main
-@objc class AppDelegate: FlutterAppDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
-    if let controller = window?.rootViewController as? FlutterViewController {
-      AppleRuntimeChannel.register(binaryMessenger: controller.binaryMessenger)
-      AppleSnapshotImportInputChannel.register(
-        binaryMessenger: controller.binaryMessenger,
-        presenter: controller
-      )
-    }
     UNUserNotificationCenter.current().delegate = self
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    if AppleRuntimeChannel.dataRescueRequested || ProcessInfo.processInfo.arguments.contains("--data-rescue") {
+      FileSelectorPlugin.register(with: engineBridge.pluginRegistry.registrar(forPlugin: "FileSelectorPlugin"))
+    } else {
+      GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    }
+    AppleRuntimeChannel.register(binaryMessenger: engineBridge.applicationRegistrar.messenger())
   }
 
   /// Forwards a local-notification click to the Flutter notification activation receiver.

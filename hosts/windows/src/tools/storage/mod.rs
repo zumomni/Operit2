@@ -104,11 +104,21 @@ impl RuntimeStorageHost for WindowsRuntimeStorageHost {
     }
 
     fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).readBytes(path);
+        }
         Ok(fs::read(self.resolve(path)?)?)
     }
 
     /// Reads one bounded byte range from Windows runtime storage.
     fn readBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).readBytesRange(path, offset, length);
+        }
         let mut file = fs::File::open(self.resolve(path)?)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0; length];
@@ -118,6 +128,11 @@ impl RuntimeStorageHost for WindowsRuntimeStorageHost {
     }
 
     fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).writeBytes(path, content);
+        }
         let path = self.resolve(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -126,8 +141,19 @@ impl RuntimeStorageHost for WindowsRuntimeStorageHost {
         Ok(())
     }
 
+    fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        operit_host_native_common::NativeRuntimeStorageHost::new(
+            self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+        ).writeBytesAtomically(path, content)
+    }
+
     /// Appends bytes to a Windows runtime storage file.
     fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).appendBytes(path, content);
+        }
         let path = self.resolve(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -141,6 +167,11 @@ impl RuntimeStorageHost for WindowsRuntimeStorageHost {
     }
 
     fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).delete(path, recursive);
+        }
         let path = self.resolve(path)?;
         if !path.exists() {
             return Ok(());
@@ -158,10 +189,22 @@ impl RuntimeStorageHost for WindowsRuntimeStorageHost {
     }
 
     fn exists(&self, path: &str) -> HostResult<bool> {
+        if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+            ).exists(path);
+        }
         Ok(self.resolve(path)?.exists())
     }
 
     fn list(&self, prefix: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
+        // Use the shared non-following traversal for managed workspace contents.
+        if normalizeStoragePath(prefix)?.first().map(String::as_str) == Some("workspaces") {
+            return operit_host_native_common::NativeRuntimeStorageHost::new(
+                self.runtimeRoot.clone(),
+                self.workspaceRoot.clone(),
+            ).list(prefix);
+        }
         let directory = self.resolve(prefix)?;
         let mut entries = Vec::new();
         if !directory.exists() {
@@ -361,7 +404,9 @@ impl RuntimeSqliteConnection for RusqliteRuntimeConnection {
     fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
         let transaction = self
             .connection
-            .transaction()
+            // Acquire the writer before reads so independent plugin connections
+            // wait instead of deadlocking during a read-to-write lock upgrade.
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| HostError::new(error.to_string()))?;
         Ok(Box::new(RusqliteRuntimeTransaction { transaction }))
     }
@@ -390,6 +435,13 @@ impl RuntimeSqliteTransaction for RusqliteRuntimeTransaction<'_> {
     fn commit(self: Box<Self>) -> HostResult<()> {
         self.transaction
             .commit()
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    /// Aborts the host transaction explicitly instead of relying on destructor cleanup.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        self.transaction
+            .rollback()
             .map_err(|error| HostError::new(error.to_string()))
     }
 }

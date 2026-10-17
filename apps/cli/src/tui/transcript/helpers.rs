@@ -54,6 +54,7 @@ pub(super) fn render_message_lines_folded(
         return FoldedLines {
             lines: render_blue_cat_lines(content_width, text),
             hits: Vec::new(),
+            xml: Vec::new(),
         };
     }
 
@@ -625,6 +626,7 @@ fn wrap_folded_lines(block: FoldedLines, width: usize) -> FoldedLines {
     let width = width.max(1);
     let mut wrapped_lines = Vec::new();
     let mut wrapped_hits = Vec::new();
+    let mut boundaries = vec![0];
     let mut hits_by_line: HashMap<usize, Vec<super::fold::FoldTarget>> = HashMap::new();
     for hit in block.hits {
         hits_by_line
@@ -636,6 +638,7 @@ fn wrap_folded_lines(block: FoldedLines, width: usize) -> FoldedLines {
         let start = wrapped_lines.len();
         wrapped_lines.extend(wrap_message_lines(vec![line], width));
         let end = wrapped_lines.len();
+        boundaries.push(end);
         if let Some(targets) = hits_by_line.remove(&index) {
             for target in targets {
                 for line_index in start..end {
@@ -648,6 +651,14 @@ fn wrap_folded_lines(block: FoldedLines, width: usize) -> FoldedLines {
         }
     }
     FoldedLines {
+        xml: block
+            .xml
+            .into_iter()
+            .map(|mut slot| {
+                slot.lines = boundaries[slot.lines.start]..boundaries[slot.lines.end];
+                slot
+            })
+            .collect(),
         lines: wrapped_lines,
         hits: wrapped_hits,
     }
@@ -734,8 +745,37 @@ pub(super) fn transcript_max_scroll(lines: &[Line<'_>], area: Rect) -> u16 {
     content_lines.saturating_sub(viewport)
 }
 
+/// Resolves the transcript offset for one frame from the reader's intent.
+///
+/// Following pins the viewport to the newest line; a reader who scrolled into
+/// history keeps their offset while lines are appended below, because only a
+/// transcript that shrinks under them pulls them back to the newest line.
+pub(super) fn resolve_transcript_scroll(follow: bool, scroll: u16, max_scroll: u16) -> (u16, bool) {
+    if follow {
+        (max_scroll, true)
+    } else if scroll > max_scroll {
+        (max_scroll, true)
+    } else {
+        (scroll, false)
+    }
+}
+
 pub(super) fn display_width(value: &str) -> usize {
     value.chars().map(char_display_width).sum()
+}
+
+/// Converts a terminal cell column within `text` to a char index, rounding
+/// down to the wide character that spans the cell.
+pub(super) fn cell_column_to_char_index(text: &str, cell_column: usize) -> usize {
+    let mut width = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        let char_width = char_display_width(ch);
+        if width + char_width > cell_column {
+            return index;
+        }
+        width += char_width;
+    }
+    text.chars().count()
 }
 
 fn char_display_width(ch: char) -> usize {
@@ -1003,6 +1043,63 @@ mod tests {
         assert!(rendered.contains("内部推理"));
     }
 
+    /// An expanded fold body is guttered and demoted so it reads as secondary
+    /// content even without its header, and conversation prose keeps the normal
+    /// text color.
+    #[test]
+    fn expanded_thinking_body_is_guttered_and_demoted() {
+        let message = ChatMessage::new_with_markdown_timestamp(
+            "ai".to_string(),
+            "<thinking>内部推理</thinking>\n普通正文".to_string(),
+            1,
+        );
+        let mut fold_state = TranscriptFoldState::default();
+        fold_state.set_user_expanded(1, "think-0", true);
+        let mut typewriter_state = TypewriterState::default();
+        let lines = render_transcript_message_lines_with_cache(
+            &message,
+            0,
+            1,
+            48,
+            false,
+            &Line::from("Thinking Process"),
+            &mut typewriter_state,
+            &fold_state,
+            TuiLanguage::English.text(),
+        )
+        .lines;
+
+        let body = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("内部推理")))
+            .expect("the expanded thinking body must render");
+        let gutter = body
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "│ ")
+            .expect("the fold body must carry a gutter");
+        assert_eq!(gutter.style.fg, Some(theme::TEXT_SUBTLE));
+        let prose = body
+            .spans
+            .iter()
+            .find(|span| span.content.contains("内部推理"))
+            .expect("body prose span");
+        assert_eq!(prose.style.fg, Some(theme::FOLD_BODY_TEXT));
+
+        let conversation = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("普通正文")))
+            .expect("conversation prose must render");
+        assert!(
+            conversation.spans.iter().all(|span| span
+                .style
+                .fg
+                .is_none_or(|fg| fg != theme::FOLD_BODY_TEXT)
+                && span.content.as_ref() != "│ "),
+            "conversation text must not pick up the fold body treatment"
+        );
+    }
+
     #[test]
     fn closed_thinking_keeps_process_title_while_message_still_streams() {
         let ai = ChatMessage::new_with_markdown_timestamp(
@@ -1205,5 +1302,23 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Lines appended below a reader who scrolled into history must not move
+    /// the viewport, so a streaming response stays readable above its newest
+    /// line.
+    #[test]
+    fn transcript_scroll_keeps_a_readers_place_while_lines_grow_below() {
+        assert_eq!(resolve_transcript_scroll(false, 12, 40), (12, false));
+        assert_eq!(resolve_transcript_scroll(false, 40, 60), (40, false));
+    }
+
+    /// Following still pins to the newest line, and a transcript that shrinks
+    /// under the reader (resize, chat switch) returns them to it.
+    #[test]
+    fn transcript_scroll_follows_newest_line_or_recovers_from_shrink() {
+        assert_eq!(resolve_transcript_scroll(true, 3, 40), (40, true));
+        assert_eq!(resolve_transcript_scroll(false, 90, 40), (40, true));
+        assert_eq!(resolve_transcript_scroll(true, 0, 0), (0, true));
     }
 }

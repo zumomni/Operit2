@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.0.0+7
+version: 2.0.0+19
 
 environment:
   sdk: ^3.10.8
@@ -28,6 +28,10 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  operit_ui:
+    path: ../packages/operit_ui
+  operit_folder_access:
+    path: ../thirdparty/operit_folder_access
   flutter:
     sdk: flutter
   flutter_localizations:
@@ -48,7 +52,17 @@ dependencies:
   printing: ^5.14.3
   audioplayers: ^6.7.0
   video_player: ^2.11.1
+  video_player_ohos:
+    git:
+      url: https://gitee.com/openharmony-sig/flutter_packages.git
+      ref: 35fb467533e174411a117b2a030c15d2a3a9687c
+      path: packages/video_player/video_player_ohos
   path_provider: ^2.1.5
+  path_provider_ohos:
+    git:
+      url: https://gitee.com/openharmony-sig/flutter_packages.git
+      ref: 35fb467533e174411a117b2a030c15d2a3a9687c
+      path: packages/path_provider/path_provider_ohos
   path: ^1.9.1
   record: ^6.2.1
   record_ohos:
@@ -59,11 +73,34 @@ dependencies:
     path: ../thirdparty/webview_all
   webview_all_windows: ^1.2.1
   url_launcher: ^6.3.2
+  package_info_plus: ^10.2.2
+  url_launcher_ohos:
+    git:
+      url: https://gitee.com/openharmony-sig/flutter_packages.git
+      ref: 35fb467533e174411a117b2a030c15d2a3a9687c
+      path: packages/url_launcher/url_launcher_ohos
   file_selector: ^1.1.0
+  image_picker_android: ^0.8.13+17
+  image_picker_ios:
+    path: ../thirdparty/image_picker_ios
+  image_picker_platform_interface: ^2.11.1
+  mime: ^2.0.0
+  image_picker_windows:
+    path: ../thirdparty/image_picker_windows
+  image_picker_for_web:
+    path: ../thirdparty/image_picker_for_web
+  image_picker_ohos:
+    path: ../thirdparty/image_picker_ohos
+  image_picker_macos:
+    path: ../thirdparty/image_picker_macos
   file_selector_android:
     path: ../thirdparty/file_selector_android
+  file_selector_ios:
+    path: ../thirdparty/file_selector_ios
   file_selector_platform_interface:
     path: ../thirdparty/file_selector_platform_interface
+  file_selector_ohos:
+    path: ../thirdparty/file_selector_ohos
   xterm:
     path: ../thirdparty/xterm
   liquid_glass_widgets:
@@ -72,13 +109,19 @@ dependencies:
   desktop_multi_window: ^0.3.0
   desktop_widgets:
     path: ../thirdparty/desktop_widgets
+  geolocator: ^14.1.1
 
 dev_dependencies:
+  file_selector_web: ^0.9.5
   webview_all_linux: ^1.4.0
   webview_all_web: ^1.2.1
   webview_flutter_platform_interface: ^2.15.1
+  webview_flutter_wkwebview:
+    path: ../thirdparty/webview_flutter_wkwebview
   ffi: ^2.2.0
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to
@@ -89,6 +132,12 @@ dev_dependencies:
   flutter_lints: ^6.0.0
 
 dependency_overrides:
+  webview_all_linux:
+    path: ../thirdparty/webview_all_linux
+  image_picker_ios:
+    path: ../thirdparty/image_picker_ios
+  dynamic_color:
+    path: ../thirdparty/dynamic_color
   webview_flutter_wkwebview:
     path: ../thirdparty/webview_flutter_wkwebview
   webview_platform_interface:
@@ -97,8 +146,12 @@ dependency_overrides:
     path: ../thirdparty/webview_all_ohos
   file_selector_android:
     path: ../thirdparty/file_selector_android
+  file_selector_ios:
+    path: ../thirdparty/file_selector_ios
   file_selector_platform_interface:
     path: ../thirdparty/file_selector_platform_interface
+  file_selector_web:
+    path: ../thirdparty/file_selector_web
   webview_all_web:
     path: ../thirdparty/webview_all_web
   webview_all_windows:
@@ -107,6 +160,13 @@ dependency_overrides:
     path: ../thirdparty/webview_flutter_android
   webview_flutter_platform_interface:
     path: ../thirdparty/webview_flutter_platform_interface
+  # image 4.11.0 declares `archive: ^4.0.9` but calls ZLibDecoder.decodeLazy, which only
+  # exists in archive >= 4.5.0. pdf (via printing) pins archive below 4.1.0, so any fresh
+  # dependency resolution lands on the broken 4.11.0 and the Dart build fails to compile
+  # with "The method 'decodeLazy' isn't defined for the type 'ZLibDecoder'".
+  # Remove this once the bundled Flutter SDK ships Dart >= 3.12 (pdf 3.13.1, which lifts
+  # the archive cap, requires it).
+  image: ">=4.10.0 <4.11.0"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -125,32 +185,6 @@ flutter:
     - android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
     - assets/images/operit_avatar.png
     - assets/model_logos/
-    - path: assets/web_access/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/android/app/src/main/res/mipmap-xxxhdpi/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/assets/fonts/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/assets/images/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/fonts/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/packages/cupertino_icons/assets/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/packages/flutter_math_fork/lib/katex_fonts/fonts/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/packages/liquid_glass_widgets/shaders/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/assets/shaders/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/canvaskit/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/canvaskit/chromium/
-      platforms: [android, ios, linux, macos, windows]
-    - path: assets/web_access/icons/
-      platforms: [android, ios, linux, macos, windows]
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg
 

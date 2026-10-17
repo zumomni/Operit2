@@ -1,3 +1,5 @@
+//! Compact typed proxy subset for resource-constrained builds.
+//! Proxy packaging does not determine node identity, authorization, or transport.
 #![allow(non_snake_case)]
 
 use std::fmt::{Display, Formatter};
@@ -12,7 +14,9 @@ use operit_link::{
     fromCoreValue, CoreCallRequest, CoreEventStream, CoreLinkError, CoreLinkSharedClient,
     CoreValue, CoreWatchRequest,
 };
-use operit_node_edge::{EdgeScreenInputRequest, EdgeScreenInputState, EdgeScreenSnapshot};
+use operit_edge_contract::{EdgeScreenInputRequest, EdgeScreenInputState, EdgeScreenSnapshot};
+
+
 
 /// Owns the typed proxy entry point for Edge Core services.
 pub struct EdgeProxy<C> {

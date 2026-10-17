@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'web_kit.g.dart';
 
@@ -11,6 +14,10 @@ import 'web_kit.g.dart';
 /// iOS and macOS reference different `WebView` implementations, so this handles
 /// delegating calls to the implementation of the current platform.
 class PlatformWebView {
+  static const String _backgroundColorChannelName =
+      'operit/webview_background_color';
+  static const String _zoomChannelName = 'operit/webview_zoom';
+
   /// Creates a [PlatformWebView].
   PlatformWebView({
     required WKWebViewConfiguration initialConfiguration,
@@ -105,16 +112,19 @@ class PlatformWebView {
   }
 
   /// Evaluates the specified JavaScript string.
-  Future<Object?> evaluateJavaScript(String javaScriptString) {
+  Future<Object?> evaluateJavaScript(String javaScriptString) async {
     final WKWebView webView = nativeWebView;
+    final Object? result;
     switch (webView) {
       case UIViewWKWebView():
-        return webView.evaluateJavaScript(javaScriptString);
+        result = await webView.evaluateJavaScript(javaScriptString);
       case NSViewWKWebView():
-        return webView.evaluateJavaScript(javaScriptString);
+        result = await webView.evaluateJavaScript(javaScriptString);
+      default:
+        throw UnimplementedError('${webView.runtimeType} is not supported.');
     }
-
-    throw UnimplementedError('${webView.runtimeType} is not supported.');
+    final envelope = jsonDecode(result as String) as Map<String, dynamic>;
+    return envelope['value'];
   }
 
   /// The custom user agent string.
@@ -323,6 +333,22 @@ class PlatformWebView {
     throw UnimplementedError('${webView.runtimeType} is not supported.');
   }
 
+  /// Sets the native WebKit page zoom for this view.
+  ///
+  /// `WKWebView.pageZoom` is not part of the generated proxy API used by this
+  /// fork, so the platform package exposes this one operation through a small
+  /// method channel. The native side resolves [webViewIdentifier] through the
+  /// same Pigeon instance manager and updates the actual `WKWebView`.
+  Future<void> setPageZoom(int webViewIdentifier, double zoomFactor) async {
+    await MethodChannel(
+      _zoomChannelName,
+      const StandardMethodCodec(),
+    ).invokeMethod<void>('setPageZoom', <String, Object?>{
+      'identifier': webViewIdentifier,
+      'zoomFactor': zoomFactor,
+    });
+  }
+
   /// The view’s background color.
   Future<void> setBackgroundColor(UIColor? value) {
     final WKWebView webView = nativeWebView;
@@ -330,11 +356,46 @@ class PlatformWebView {
       case UIViewWKWebView():
         return webView.setBackgroundColor(value);
       case NSViewWKWebView():
-        // TODO(stuartmorgan): Implement background color support.
-        throw UnimplementedError('backgroundColor is not implemented on macOS');
+        // macOS WKWebView uses underPageBackgroundColor instead of UIView's
+        // backgroundColor property. Callers should use
+        // [setMacOSBackgroundColor] so they do not need to construct UIColor,
+        // which has no macOS proxy implementation.
+        throw UnsupportedError(
+          'Use setMacOSBackgroundColor for macOS background colors.',
+        );
     }
 
     throw UnimplementedError('${webView.runtimeType} is not supported.');
+  }
+
+  /// Sets the native WebKit background color on macOS.
+  Future<void> setMacOSBackgroundColor({
+    required double red,
+    required double green,
+    required double blue,
+    required double alpha,
+  }) async {
+    if (nativeWebView is! NSViewWKWebView) {
+      throw UnsupportedError('This operation is only available on macOS.');
+    }
+
+    final int? identifier = PigeonInstanceManager.instance.getIdentifier(
+      nativeWebView,
+    );
+    if (identifier == null) {
+      throw StateError('WKWebView is not registered with the instance manager');
+    }
+
+    await MethodChannel(
+      _backgroundColorChannelName,
+      const StandardMethodCodec(),
+    ).invokeMethod<void>('setBackgroundColor', <String, Object?>{
+      'identifier': identifier,
+      'red': red,
+      'green': green,
+      'blue': blue,
+      'alpha': alpha,
+    });
   }
 
   /// The custom user agent string.

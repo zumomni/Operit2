@@ -465,6 +465,36 @@ export function encodeToolPkgAppLifecycleHookRuntime(value: ToolPkgAppLifecycleH
   };
 }
 
+export interface ToolPkgChatComposerSlotRuntime {
+  readonly id: string;
+  readonly slot: string;
+  readonly screen: string;
+  readonly order: number;
+  readonly keepAlive: boolean;
+}
+
+export function decodeToolPkgChatComposerSlotRuntime(value: unknown): ToolPkgChatComposerSlotRuntime {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    slot: input['slot'] as string,
+    screen: input['screen'] as string,
+    order: input['order'] as number,
+    keepAlive: input['keepAlive'] as boolean,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgChatComposerSlotRuntime(value: ToolPkgChatComposerSlotRuntime): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'slot': value.slot,
+    'screen': value.screen,
+    'order': value.order,
+    'keepAlive': value.keepAlive,
+  };
+}
+
 export interface ToolPkgChatMessageMenuDialogRuntime {
   readonly screen: string;
   readonly title: LocalizedText;
@@ -531,9 +561,15 @@ export interface ToolPkgContainerRuntime {
   readonly description: LocalizedText;
   readonly version: string;
   readonly apiVersion: string;
+  readonly publicApi: string | null;
+  readonly publicApis: Array<ToolPkgRegisteredFunctionHook>;
   readonly requires: Array<ToolPkgManifestRequirement>;
+  readonly dependencyIssues: Array<ToolPkgDependencyIssue>;
+  readonly manifestExtensions: Record<string, unknown>;
   readonly author: Array<string>;
   readonly mainEntry: string;
+  readonly themes: Array<ToolPkgManifestTheme>;
+  readonly license: string | null;
   readonly sourceType: ToolPkgSourceType;
   readonly sourcePath: string;
   readonly subpackages: Array<ToolPkgSubpackageRuntime>;
@@ -543,6 +579,7 @@ export interface ToolPkgContainerRuntime {
   readonly workspaceTemplates: Array<ToolPkgWorkspaceTemplateRuntime>;
   readonly uiModules: Array<ToolPkgUiModuleRuntime>;
   readonly uiRoutes: Array<ToolPkgUiRouteRuntime>;
+  readonly chatComposerSlots: Array<ToolPkgChatComposerSlotRuntime>;
   readonly navigationEntries: Array<ToolPkgNavigationEntryRuntime>;
   readonly desktopWidgets: Array<ToolPkgDesktopWidgetRuntime>;
   readonly appLifecycleHooks: Array<ToolPkgAppLifecycleHookRuntime>;
@@ -552,6 +589,7 @@ export interface ToolPkgContainerRuntime {
   readonly chatInputHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatViewHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatMessageHooks: Array<ToolPkgFunctionHookRuntime>;
+  readonly chatLifecycleHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatMessageMenuItems: Array<ToolPkgChatMessageMenuItemRuntime>;
   readonly chatRuntimeHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly hostEventHooks: Array<ToolPkgHostEventHookRuntime>;
@@ -564,7 +602,9 @@ export interface ToolPkgContainerRuntime {
   readonly promptFinalizeHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly promptEstimateFinalizeHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly summaryGenerateHooks: Array<ToolPkgFunctionHookRuntime>;
+  readonly coreCommands: Array<ToolPkgCoreCommandRuntime>;
   readonly aiProviders: Array<ToolPkgAiProviderRuntime>;
+  readonly manifestExtensionHandlers: Array<ToolPkgRegisteredManifestExtension>;
   readonly logoResource: ToolPkgResourceRuntime | null;
   readonly marketOrigin: ToolPkgMarketOrigin | null;
 }
@@ -577,9 +617,15 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     description: decodeLocalizedText(input['description']) as LocalizedText,
     version: input['version'] as string,
     apiVersion: input['apiVersion'] as string,
+    publicApi: input['publicApi'] == null ? null : input['publicApi'] as string | null,
+    publicApis: (input['publicApis'] as unknown[]).map((item) => decodeToolPkgRegisteredFunctionHook(item)) as Array<ToolPkgRegisteredFunctionHook>,
     requires: (input['requires'] as unknown[]).map((item) => decodeToolPkgManifestRequirement(item)) as Array<ToolPkgManifestRequirement>,
+    dependencyIssues: (input['dependencyIssues'] as unknown[]).map((item) => decodeToolPkgDependencyIssue(item)) as Array<ToolPkgDependencyIssue>,
+    manifestExtensions: input['manifestExtensions'] as Record<string, unknown>,
     author: (input['author'] as unknown[]).map((item) => item) as Array<string>,
     mainEntry: input['mainEntry'] as string,
+    themes: (input['themes'] as unknown[]).map((item) => decodeToolPkgManifestTheme(item)) as Array<ToolPkgManifestTheme>,
+    license: input['license'] == null ? null : input['license'] as string | null,
     sourceType: decodeToolPkgSourceType(input['sourceType']) as ToolPkgSourceType,
     sourcePath: input['sourcePath'] as string,
     subpackages: (input['subpackages'] as unknown[]).map((item) => decodeToolPkgSubpackageRuntime(item)) as Array<ToolPkgSubpackageRuntime>,
@@ -589,6 +635,7 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     workspaceTemplates: (input['workspaceTemplates'] as unknown[]).map((item) => decodeToolPkgWorkspaceTemplateRuntime(item)) as Array<ToolPkgWorkspaceTemplateRuntime>,
     uiModules: (input['uiModules'] as unknown[]).map((item) => decodeToolPkgUiModuleRuntime(item)) as Array<ToolPkgUiModuleRuntime>,
     uiRoutes: (input['uiRoutes'] as unknown[]).map((item) => decodeToolPkgUiRouteRuntime(item)) as Array<ToolPkgUiRouteRuntime>,
+    chatComposerSlots: (input['chatComposerSlots'] as unknown[]).map((item) => decodeToolPkgChatComposerSlotRuntime(item)) as Array<ToolPkgChatComposerSlotRuntime>,
     navigationEntries: (input['navigationEntries'] as unknown[]).map((item) => decodeToolPkgNavigationEntryRuntime(item)) as Array<ToolPkgNavigationEntryRuntime>,
     desktopWidgets: (input['desktopWidgets'] as unknown[]).map((item) => decodeToolPkgDesktopWidgetRuntime(item)) as Array<ToolPkgDesktopWidgetRuntime>,
     appLifecycleHooks: (input['appLifecycleHooks'] as unknown[]).map((item) => decodeToolPkgAppLifecycleHookRuntime(item)) as Array<ToolPkgAppLifecycleHookRuntime>,
@@ -598,6 +645,7 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     chatInputHooks: (input['chatInputHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatViewHooks: (input['chatViewHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatMessageHooks: (input['chatMessageHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
+    chatLifecycleHooks: (input['chatLifecycleHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatMessageMenuItems: (input['chatMessageMenuItems'] as unknown[]).map((item) => decodeToolPkgChatMessageMenuItemRuntime(item)) as Array<ToolPkgChatMessageMenuItemRuntime>,
     chatRuntimeHooks: (input['chatRuntimeHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     hostEventHooks: (input['hostEventHooks'] as unknown[]).map((item) => decodeToolPkgHostEventHookRuntime(item)) as Array<ToolPkgHostEventHookRuntime>,
@@ -610,7 +658,9 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     promptFinalizeHooks: (input['promptFinalizeHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     promptEstimateFinalizeHooks: (input['promptEstimateFinalizeHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     summaryGenerateHooks: (input['summaryGenerateHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
+    coreCommands: (input['coreCommands'] as unknown[]).map((item) => decodeToolPkgCoreCommandRuntime(item)) as Array<ToolPkgCoreCommandRuntime>,
     aiProviders: (input['aiProviders'] as unknown[]).map((item) => decodeToolPkgAiProviderRuntime(item)) as Array<ToolPkgAiProviderRuntime>,
+    manifestExtensionHandlers: (input['manifestExtensionHandlers'] as unknown[]).map((item) => decodeToolPkgRegisteredManifestExtension(item)) as Array<ToolPkgRegisteredManifestExtension>,
     logoResource: input['logoResource'] == null ? null : decodeToolPkgResourceRuntime(input['logoResource']) as ToolPkgResourceRuntime | null,
     marketOrigin: input['marketOrigin'] == null ? null : decodeToolPkgMarketOrigin(input['marketOrigin']) as ToolPkgMarketOrigin | null,
   };
@@ -624,9 +674,15 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'description': encodeLocalizedText(value.description),
     'version': value.version,
     'apiVersion': value.apiVersion,
+    'publicApi': value.publicApi === null ? null : value.publicApi,
+    'publicApis': value.publicApis.map(item => encodeToolPkgRegisteredFunctionHook(item)),
     'requires': value.requires.map(item => encodeToolPkgManifestRequirement(item)),
+    'dependencyIssues': value.dependencyIssues.map(item => encodeToolPkgDependencyIssue(item)),
+    'manifestExtensions': Object.fromEntries(Object.entries(value.manifestExtensions).map(([key, item]) => [key, item])),
     'author': value.author.map(item => item),
     'mainEntry': value.mainEntry,
+    'themes': value.themes.map(item => encodeToolPkgManifestTheme(item)),
+    'license': value.license === null ? null : value.license,
     'sourceType': encodeToolPkgSourceType(value.sourceType),
     'sourcePath': value.sourcePath,
     'subpackages': value.subpackages.map(item => encodeToolPkgSubpackageRuntime(item)),
@@ -636,6 +692,7 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'workspaceTemplates': value.workspaceTemplates.map(item => encodeToolPkgWorkspaceTemplateRuntime(item)),
     'uiModules': value.uiModules.map(item => encodeToolPkgUiModuleRuntime(item)),
     'uiRoutes': value.uiRoutes.map(item => encodeToolPkgUiRouteRuntime(item)),
+    'chatComposerSlots': value.chatComposerSlots.map(item => encodeToolPkgChatComposerSlotRuntime(item)),
     'navigationEntries': value.navigationEntries.map(item => encodeToolPkgNavigationEntryRuntime(item)),
     'desktopWidgets': value.desktopWidgets.map(item => encodeToolPkgDesktopWidgetRuntime(item)),
     'appLifecycleHooks': value.appLifecycleHooks.map(item => encodeToolPkgAppLifecycleHookRuntime(item)),
@@ -645,6 +702,7 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'chatInputHooks': value.chatInputHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatViewHooks': value.chatViewHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatMessageHooks': value.chatMessageHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
+    'chatLifecycleHooks': value.chatLifecycleHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatMessageMenuItems': value.chatMessageMenuItems.map(item => encodeToolPkgChatMessageMenuItemRuntime(item)),
     'chatRuntimeHooks': value.chatRuntimeHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'hostEventHooks': value.hostEventHooks.map(item => encodeToolPkgHostEventHookRuntime(item)),
@@ -657,9 +715,80 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'promptFinalizeHooks': value.promptFinalizeHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'promptEstimateFinalizeHooks': value.promptEstimateFinalizeHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'summaryGenerateHooks': value.summaryGenerateHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
+    'coreCommands': value.coreCommands.map(item => encodeToolPkgCoreCommandRuntime(item)),
     'aiProviders': value.aiProviders.map(item => encodeToolPkgAiProviderRuntime(item)),
+    'manifestExtensionHandlers': value.manifestExtensionHandlers.map(item => encodeToolPkgRegisteredManifestExtension(item)),
     'logoResource': value.logoResource === null ? null : encodeToolPkgResourceRuntime(value.logoResource),
     'marketOrigin': value.marketOrigin === null ? null : encodeToolPkgMarketOrigin(value.marketOrigin),
+  };
+}
+
+export interface ToolPkgCoreCommandRuntime {
+  readonly id: string;
+  readonly name: string;
+  readonly title: LocalizedText;
+  readonly description: LocalizedText;
+  readonly usage: string;
+  readonly function: string;
+  readonly functionSource: string | null;
+}
+
+export function decodeToolPkgCoreCommandRuntime(value: unknown): ToolPkgCoreCommandRuntime {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    name: input['name'] as string,
+    title: decodeLocalizedText(input['title']) as LocalizedText,
+    description: decodeLocalizedText(input['description']) as LocalizedText,
+    usage: input['usage'] as string,
+    function: input['function'] as string,
+    functionSource: input['functionSource'] == null ? null : input['functionSource'] as string | null,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgCoreCommandRuntime(value: ToolPkgCoreCommandRuntime): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'name': value.name,
+    'title': encodeLocalizedText(value.title),
+    'description': encodeLocalizedText(value.description),
+    'usage': value.usage,
+    'function': value.function,
+    'functionSource': value.functionSource === null ? null : value.functionSource,
+  };
+}
+
+export interface ToolPkgDependencyIssue {
+  readonly id: string;
+  readonly code: string;
+  readonly requiredMinVersion: string | null;
+  readonly requiredMaxVersion: string | null;
+  readonly installedVersion: string | null;
+  readonly enabled: boolean;
+}
+
+export function decodeToolPkgDependencyIssue(value: unknown): ToolPkgDependencyIssue {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    code: input['code'] as string,
+    requiredMinVersion: input['requiredMinVersion'] == null ? null : input['requiredMinVersion'] as string | null,
+    requiredMaxVersion: input['requiredMaxVersion'] == null ? null : input['requiredMaxVersion'] as string | null,
+    installedVersion: input['installedVersion'] == null ? null : input['installedVersion'] as string | null,
+    enabled: input['enabled'] as boolean,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgDependencyIssue(value: ToolPkgDependencyIssue): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'code': value.code,
+    'requiredMinVersion': value.requiredMinVersion === null ? null : value.requiredMinVersion,
+    'requiredMaxVersion': value.requiredMaxVersion === null ? null : value.requiredMaxVersion,
+    'installedVersion': value.installedVersion === null ? null : value.installedVersion,
+    'enabled': value.enabled,
   };
 }
 
@@ -786,6 +915,33 @@ export function encodeToolPkgManifestRequirement(value: ToolPkgManifestRequireme
   };
 }
 
+export interface ToolPkgManifestTheme {
+  readonly id: string;
+  readonly path: string;
+  readonly preview: string;
+  readonly files: Array<ManifestFile>;
+}
+
+export function decodeToolPkgManifestTheme(value: unknown): ToolPkgManifestTheme {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    path: input['path'] as string,
+    preview: input['preview'] as string,
+    files: (input['files'] as unknown[]).map((item) => decodeManifestFile(item)) as Array<ManifestFile>,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgManifestTheme(value: ToolPkgManifestTheme): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'path': value.path,
+    'preview': value.preview,
+    'files': value.files.map(item => encodeManifestFile(item)),
+  };
+}
+
 export interface ToolPkgMarketOrigin {
   readonly market: string;
   readonly toolpkgId: string;
@@ -837,6 +993,7 @@ export function encodeToolPkgNavigationActionHookRuntime(value: ToolPkgNavigatio
 export interface ToolPkgNavigationEntryRuntime {
   readonly id: string;
   readonly routeId: string;
+  readonly params: unknown;
   readonly surface: string;
   readonly title: LocalizedText;
   readonly action: ToolPkgNavigationActionHookRuntime | null;
@@ -849,6 +1006,7 @@ export function decodeToolPkgNavigationEntryRuntime(value: unknown): ToolPkgNavi
   return {
     id: input['id'] as string,
     routeId: input['routeId'] as string,
+    params: input['params'] as unknown,
     surface: input['surface'] as string,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     action: input['action'] == null ? null : decodeToolPkgNavigationActionHookRuntime(input['action']) as ToolPkgNavigationActionHookRuntime | null,
@@ -862,11 +1020,60 @@ export function encodeToolPkgNavigationEntryRuntime(value: ToolPkgNavigationEntr
   return {
     'id': value.id,
     'routeId': value.routeId,
+    'params': value.params,
     'surface': value.surface,
     'title': encodeLocalizedText(value.title),
     'action': value.action === null ? null : encodeToolPkgNavigationActionHookRuntime(value.action),
     'icon': value.icon === null ? null : value.icon,
     'order': value.order,
+  };
+}
+
+export interface ToolPkgRegisteredFunctionHook {
+  readonly id: string;
+  readonly function: string;
+  readonly functionSource: string | null;
+}
+
+export function decodeToolPkgRegisteredFunctionHook(value: unknown): ToolPkgRegisteredFunctionHook {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    function: input['function'] as string,
+    functionSource: input['functionSource'] == null ? null : input['functionSource'] as string | null,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgRegisteredFunctionHook(value: ToolPkgRegisteredFunctionHook): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'function': value.function,
+    'functionSource': value.functionSource === null ? null : value.functionSource,
+  };
+}
+
+export interface ToolPkgRegisteredManifestExtension {
+  readonly key: string;
+  readonly function: string;
+  readonly functionSource: string | null;
+}
+
+export function decodeToolPkgRegisteredManifestExtension(value: unknown): ToolPkgRegisteredManifestExtension {
+  const input = value as Record<string, unknown>;
+  return {
+    key: input['key'] as string,
+    function: input['function'] as string,
+    functionSource: input['functionSource'] == null ? null : input['functionSource'] as string | null,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgRegisteredManifestExtension(value: ToolPkgRegisteredManifestExtension): Record<string, unknown> {
+  return {
+    'key': value.key,
+    'function': value.function,
+    'functionSource': value.functionSource === null ? null : value.functionSource,
   };
 }
 
@@ -970,6 +1177,7 @@ export interface ToolPkgUiModuleRuntime {
   readonly id: string;
   readonly runtime: string;
   readonly screen: string;
+  readonly screenExport: string | null;
   readonly title: LocalizedText;
   readonly keepAlive: boolean;
 }
@@ -980,6 +1188,7 @@ export function decodeToolPkgUiModuleRuntime(value: unknown): ToolPkgUiModuleRun
     id: input['id'] as string,
     runtime: input['runtime'] as string,
     screen: input['screen'] as string,
+    screenExport: input['screenExport'] == null ? null : input['screenExport'] as string | null,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     keepAlive: input['keepAlive'] as boolean,
   };
@@ -991,6 +1200,7 @@ export function encodeToolPkgUiModuleRuntime(value: ToolPkgUiModuleRuntime): Rec
     'id': value.id,
     'runtime': value.runtime,
     'screen': value.screen,
+    'screenExport': value.screenExport === null ? null : value.screenExport,
     'title': encodeLocalizedText(value.title),
     'keepAlive': value.keepAlive,
   };
@@ -1001,6 +1211,7 @@ export interface ToolPkgUiRouteRuntime {
   readonly routeId: string;
   readonly runtime: string;
   readonly screen: string;
+  readonly screenExport: string | null;
   readonly title: LocalizedText;
   readonly keepAlive: boolean;
 }
@@ -1012,6 +1223,7 @@ export function decodeToolPkgUiRouteRuntime(value: unknown): ToolPkgUiRouteRunti
     routeId: input['routeId'] as string,
     runtime: input['runtime'] as string,
     screen: input['screen'] as string,
+    screenExport: input['screenExport'] == null ? null : input['screenExport'] as string | null,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     keepAlive: input['keepAlive'] as boolean,
   };
@@ -1024,6 +1236,7 @@ export function encodeToolPkgUiRouteRuntime(value: ToolPkgUiRouteRuntime): Recor
     'routeId': value.routeId,
     'runtime': value.runtime,
     'screen': value.screen,
+    'screenExport': value.screenExport === null ? null : value.screenExport,
     'title': encodeLocalizedText(value.title),
     'keepAlive': value.keepAlive,
   };
@@ -1113,6 +1326,27 @@ export function encodeToolPkgWorkspaceTemplateRuntime(value: ToolPkgWorkspaceTem
     'description': encodeLocalizedText(value.description),
     'resource_key': value.resource_key,
     'project_type': value.project_type,
+  };
+}
+
+export interface ManifestFile {
+  readonly path: string;
+  readonly media_type: string;
+}
+
+export function decodeManifestFile(value: unknown): ManifestFile {
+  const input = value as Record<string, unknown>;
+  return {
+    path: input['path'] as string,
+    media_type: input['mediaType'] as string,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeManifestFile(value: ManifestFile): Record<string, unknown> {
+  return {
+    'path': value.path,
+    'mediaType': value.media_type,
   };
 }
 
@@ -1212,6 +1446,39 @@ export function encodePluginLoadingProgress(value: PluginLoadingProgress): Recor
     'pluginsStarted': value.pluginsStarted,
     'pluginsTotal': value.pluginsTotal,
     'plugins': value.plugins.map(item => encodePluginLoadingItem(item)),
+  };
+}
+
+export interface ToolPkgLoadIssue {
+  readonly sourcePath: string;
+  readonly packageName: string | null;
+  readonly displayName: string;
+  readonly code: string;
+  readonly message: string;
+  readonly packageKind: string;
+}
+
+export function decodeToolPkgLoadIssue(value: unknown): ToolPkgLoadIssue {
+  const input = value as Record<string, unknown>;
+  return {
+    sourcePath: input['sourcePath'] as string,
+    packageName: input['packageName'] == null ? null : input['packageName'] as string | null,
+    displayName: input['displayName'] as string,
+    code: input['code'] as string,
+    message: input['message'] as string,
+    packageKind: input['packageKind'] as string,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgLoadIssue(value: ToolPkgLoadIssue): Record<string, unknown> {
+  return {
+    'sourcePath': value.sourcePath,
+    'packageName': value.packageName === null ? null : value.packageName,
+    'displayName': value.displayName,
+    'code': value.code,
+    'message': value.message,
+    'packageKind': value.packageKind,
   };
 }
 

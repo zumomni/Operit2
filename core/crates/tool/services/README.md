@@ -11,6 +11,17 @@ surfaces live here.
   tool access rules.
 - Own ToolPkg package loading, package manager behavior, package hook models,
   and package resource helpers.
+- Capture Compose script and session requests as owned futures. `ToolPkgResourceReader`
+  performs archive and text-resource I/O after proxy dispatch releases the package manager.
+  It shares the existing cache lock and holds it through reads to serialize invalidation;
+  session publication rechecks the exact engine identity against concurrent context release.
+- Capture IPC state with `withReady` instead of cloning the runtime package manager.
+  IPC and public API calls load only their declared main entry through the revision-scoped
+  text cache. Cold calls decompress one entry and borrow immutable asset bytes; warm calls
+  reuse cached text. Full resource snapshots are loaded only when requested by UI sessions.
+  Both read forms share the same package slots and invalidation lifecycle. Resource I/O
+  runs outside the manager lock, and dispatch checks engine identity after loading.
+  Package reload and removal use the existing resource invalidation lifecycle.
 - Isolate every ToolPkg main-script registration in a temporary JavaScript engine so one package
   cannot retain registration state or block later package scans.
 - Own MCP package models, MCP runtime repository code, MCP bridge helpers, and
@@ -56,3 +67,17 @@ MCP and skill are part of this crate. Provider APIs are not tools and belong in
 the top-level runtime injects an SDK `JsExecutionProvider`.
 
 See `core/CRATE_BOUNDARIES.md` for the full dependency direction.
+
+## Finalized AI Tool Results
+
+`ToolExecutionManager` retains serial invocation ordering and aggregates each
+invocation's execution steps into one final result. `ToolExecutionBatch` formats
+those results once; the same finalized `message` is published to the chat stream
+and inserted into the next model request. Presentation adds only line boundaries.
+
+`MAX_SINGLE_TOOL_RESULT_MESSAGE_CHARS` bounds each serialized result, including
+its XML wrapper and explicit truncation marker, to 64,000 Unicode scalar values.
+Payload, wrapper, and marker use the same unit; UTF-8 byte lengths are diagnostic
+only. A batch retains every result in invocation order, including repeated tool
+names. There is no batch-wide truncation that can remove result slots. Request
+context-window admission remains the responsibility of conversation orchestration.

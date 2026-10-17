@@ -6,7 +6,6 @@ pub(crate) fn object_specs(
     store_root: &SourceRoot,
     tools_root: &SourceRoot,
     providers_root: &SourceRoot,
-    link_access_root: &SourceRoot,
     server_root: &SourceRoot,
 ) -> Vec<ObjectSpec> {
     let mut specs = Vec::new();
@@ -26,7 +25,7 @@ pub(crate) fn object_specs(
         "ChatServiceCore",
         ObjectAccess::ResolvedHolder {
             holder_field: "chatRuntimeHolder".to_string(),
-            resolver_method: "coreForObjectId".to_string(),
+            resolver_method: "coreForTarget".to_string(),
             proxy_aliases: Vec::new(),
         },
         ObjectPathMatch::Exact,
@@ -75,11 +74,6 @@ pub(crate) fn object_specs(
         server_root,
         ".",
         "server",
-    ));
-    specs.extend(discover_constructible_objects_recursive(
-        link_access_root,
-        ".",
-        "linkAccess",
     ));
     specs.sort_by(|left, right| left.schema_key.cmp(&right.schema_key));
     specs
@@ -200,7 +194,7 @@ pub(crate) fn discover_factory_object_specs(
                 continue;
             }
             specs.push(ObjectSpec {
-                object_id: 0,
+                object_id: String::new(),
                 dispatch_name: dispatch_name_from_schema_key(&schema_key),
                 schema_key,
                 type_name: target_type.type_name.clone(),
@@ -272,7 +266,7 @@ fn required_object_spec(
 ) -> ObjectSpec {
     let source_path = source_root.as_path().join(relative_path);
     ObjectSpec {
-        object_id: 0,
+        object_id: String::new(),
         schema_key: schema_key.to_string(),
         dispatch_name: dispatch_name_from_schema_key(schema_key),
         type_name: type_name.to_string(),
@@ -329,7 +323,7 @@ fn discover_core_proxy_objects_inner(
         }
         let schema_key = lower_first(&type_name);
         specs.push(ObjectSpec {
-            object_id: 0,
+            object_id: String::new(),
             dispatch_name: dispatch_name_from_schema_key(&schema_key),
             schema_key,
             full_type: full_type_for_source_with_crate(
@@ -369,7 +363,7 @@ fn discover_constructible_objects(
         let path_match = constructible_object_path_match(&access);
         let schema_key = format!("{schema_prefix}.{}", lower_first(&type_name));
         specs.push(ObjectSpec {
-            object_id: 0,
+            object_id: String::new(),
             schema_key: schema_key.clone(),
             dispatch_name: dispatch_name_from_schema_key(&schema_key),
             full_type: full_type_for_source_with_crate(
@@ -448,7 +442,7 @@ fn discover_constructible_objects_recursive_inner(
             schema_key = format!("{prefix}.{}", lower_first(&type_name));
         }
         specs.push(ObjectSpec {
-            object_id: 0,
+            object_id: String::new(),
             schema_key: schema_key.clone(),
             dispatch_name: dispatch_name_from_schema_key(&schema_key),
             full_type: full_type_for_source_with_crate(
@@ -702,7 +696,7 @@ pub(crate) fn scan_object(
         type_registry,
     );
     SourceObject {
-        object_id: spec.object_id,
+        object_id: spec.object_id.clone(),
         schema_key: spec.schema_key.clone(),
         dispatch_name: spec.dispatch_name.clone(),
         full_type: spec.full_type.clone(),
@@ -778,12 +772,16 @@ fn impl_type_name(item_impl: &ItemImpl) -> Option<String> {
         .map(|segment| segment.ident.to_string())
 }
 
+/// Preserves declared availability without excluding portable node DTOs by their crate name.
 fn scan_method(function: &ImplItemFn, resolver: &TypeResolver) -> SourceMethod {
     let name = function.sig.ident.to_string();
     let mut args = Vec::new();
     let mut method_error = None::<String>;
-    let is_async = function.sig.asyncness.is_some();
-    let mut cfg_attrs = cfg_attrs(function);
+    let owned_output = function.sig.asyncness.is_none()
+        .then(|| owned_future_output(&function.sig.output)).flatten();
+    let returns_owned_future = owned_output.is_some();
+    let is_async = function.sig.asyncness.is_some() || returns_owned_future;
+    let cfg_attrs = cfg_attrs(function);
     let doc_lines = doc_lines(function);
     let mut has_receiver = false;
 
@@ -813,14 +811,14 @@ fn scan_method(function: &ImplItemFn, resolver: &TypeResolver) -> SourceMethod {
     if !has_receiver {
         method_error = Some("associated function is not an instance method".to_string());
     }
-    let (rust_return_type, mut protocol) = scan_return_protocol(&function.sig.output, resolver);
-    if rust_return_type.contains("operit_node_runtime::")
-        || args
-            .iter()
-            .any(|argument| argument.ty.contains("operit_node_runtime::"))
-    {
-        cfg_attrs.push("#[cfg(not(target_arch = \"wasm32\"))]".to_string());
-    }
+    let (rust_return_type, mut protocol) = match owned_output {
+        Some(output) => {
+            let normalized = normalize_type(output, resolver);
+            let protocol = classify_return_protocol(&normalized, resolver);
+            (normalized, protocol)
+        }
+        None => scan_return_protocol(&function.sig.output, resolver),
+    };
     let reverse_arguments = args
         .iter()
         .filter_map(|argument| {
@@ -850,6 +848,7 @@ fn scan_method(function: &ImplItemFn, resolver: &TypeResolver) -> SourceMethod {
         args,
         rust_return_type,
         is_async,
+        returns_owned_future,
         cfg_attrs,
         doc_lines,
         protocol,
@@ -917,6 +916,44 @@ fn cfg_attrs(function: &ImplItemFn) -> Vec<String> {
         .collect()
 }
 
+/// Reads an explicit `impl Future<Output = T> + 'static` capture contract from syntax.
+fn owned_future_output(return_type: &ReturnType) -> Option<&Type> {
+    let ReturnType::Type(_, ty) = return_type else {
+        return None;
+    };
+    let Type::ImplTrait(future) = ty.as_ref() else {
+        return None;
+    };
+    let owned = future.bounds.iter().any(|bound| {
+        matches!(bound,
+        syn::TypeParamBound::Lifetime(lifetime) if lifetime.ident == "static")
+    });
+    if !owned {
+        return None;
+    }
+    for bound in &future.bounds {
+        let syn::TypeParamBound::Trait(bound) = bound else {
+            continue;
+        };
+        let segment = bound.path.segments.last()?;
+        if segment.ident != "Future" {
+            continue;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            continue;
+        };
+        for argument in &arguments.args {
+            if let syn::GenericArgument::AssocType(output) = argument {
+                if output.ident == "Output" {
+                    return Some(&output.ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Classifies the wire result of a directly returning method.
 fn scan_return_protocol(
     return_type: &ReturnType,
     resolver: &TypeResolver,
@@ -1023,4 +1060,89 @@ fn plain_stream_item_type(ty: &str, resolver: &TypeResolver) -> Option<String> {
 /// Returns the item type for the portable caller-owned reverse stream argument.
 fn reverse_stream_item_type(ty: &str) -> Option<String> {
     single_generic_arg(ty, "operit_util::stream::ReverseStream::ReverseStream").map(str::to_string)
+}
+
+#[cfg(test)]
+mod method_availability_tests {
+    use super::*;
+
+    /// Scans one method using the same portable node DTO imports as the production facade.
+    fn scan_node_method(source: &str) -> SourceMethod {
+        let file = syn::parse_file(
+            "use operit_node_runtime::RuntimeRemoteLinkService::{RuntimeDeviceSpaceDevice, SpaceJoinRequest};
+             use operit_node_runtime::PeerStateStore::PeerHostConfig;",
+        ).unwrap();
+        let types = HashSet::from([
+            "operit_node_runtime::RuntimeRemoteLinkService::RuntimeDeviceSpaceDevice".to_string(),
+            "operit_node_runtime::RuntimeRemoteLinkService::SpaceJoinRequest".to_string(),
+            "operit_node_runtime::PeerStateStore::PeerHostConfig".to_string(),
+        ]);
+        let resolver = TypeResolver::from_file(
+            &file,
+            "operit_node_runtime::RuntimeRemoteLinkService",
+            "operit_node_runtime",
+            types.clone(),
+            types,
+            TypeRegistry::default(),
+        );
+        scan_method(&syn::parse_str::<ImplItemFn>(source).unwrap(), &resolver)
+    }
+
+    /// Keeps synchronous and asynchronous node metadata calls available on every host.
+    #[test]
+    fn node_dto_arguments_and_results_do_not_add_platform_restrictions() {
+        for source in [
+            "pub fn updateCurrentDeviceUserName(&self, userName: String) -> Result<RuntimeDeviceSpaceDevice, String> { unimplemented!() }",
+            "pub fn outgoingDeviceSpaceJoins(&self) -> Result<Vec<SpaceJoinRequest>, String> { unimplemented!() }",
+            "pub async fn incomingDeviceSpaceJoins(&self) -> Result<Vec<SpaceJoinRequest>, String> { unimplemented!() }",
+            "pub fn saveLocalHostConfig(&self, config: PeerHostConfig) -> Result<(), String> { unimplemented!() }",
+        ] {
+            let method = scan_node_method(source);
+            assert!(method.call_protocol().is_some(), "{}", method.name);
+            assert!(method.cfg_attrs.is_empty(), "{}", method.name);
+        }
+    }
+
+    /// Preserves the wire result while recognizing an owned future capture method.
+    #[test]
+    fn owned_future_uses_its_output_as_the_wire_result() {
+        for receiver in ["&self", "&mut self"] {
+            let method = scan_node_method(&format!(
+                "pub fn acquire({receiver}, name: &str) -> impl std::future::Future<Output = Result<(), String>> + 'static {{ unimplemented!() }}"));
+            assert!(method.is_async);
+            assert!(method.returns_owned_future);
+            assert_eq!(method.rust_return_type, "Result<(),String>");
+            assert!(matches!(
+                method.call_protocol(),
+                Some(CallProtocol::ResultUnit { .. })
+            ));
+        }
+    }
+
+    /// Rejects futures that retain a receiver borrow instead of treating them as detached operations.
+    #[test]
+    fn borrowed_future_is_not_an_owned_capture() {
+        for bound in ["", " + '_"] {
+            let method = scan_node_method(&format!(
+                "pub fn acquire(&self) -> impl Future<Output = Result<(), String>>{bound} {{ unimplemented!() }}"));
+            assert!(!method.returns_owned_future);
+            assert!(method.call_protocol().is_none());
+        }
+        let method = scan_node_method(
+            "pub async fn acquire(&self) -> Result<(), String> { unimplemented!() }",
+        );
+        assert!(method.is_async);
+        assert!(!method.returns_owned_future);
+        assert!(method.call_protocol().is_some());
+    }
+
+    /// Retains only availability conditions explicitly declared on the source method.
+    #[test]
+    fn declared_feature_conditions_are_preserved() {
+        let source = "#[cfg(feature = \"listener\")] pub fn config(&self) -> Result<PeerHostConfig, String> { unimplemented!() }";
+        let method = scan_node_method(source);
+        let declaration = syn::parse_str::<ImplItemFn>(source).unwrap();
+        assert_eq!(method.cfg_attrs, cfg_attrs(&declaration));
+        assert_eq!(method.cfg_attrs.len(), 1);
+    }
 }

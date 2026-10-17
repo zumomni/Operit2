@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,11 +23,12 @@ pub struct CoreRouteResumeContext {
     pub workspacePath: Option<String>,
     pub promptFunctionType: PromptFunctionType,
     pub enableThinking: bool,
-    pub enableMemoryAutoUpdate: bool,
-    pub roleCardId: String,
-    pub roleName: String,
-    pub groupOrchestrationMode: bool,
-    pub groupParticipantNamesText: Option<String>,
+    /// Identifies the participant selected by the authenticated configuration descriptor.
+    pub participantId: String,
+    /// Identifies the registered snapshot owner, injected solely by the runtime.
+    pub extensionOwner: String,
+    /// Preserves the opaque actor, voice, and profile snapshot for this continuation.
+    pub messageExtension: serde_json::Map<String, serde_json::Value>,
     pub proxySenderName: Option<String>,
     pub notifyReplyOverride: Option<bool>,
     pub chatProviderIdOverride: Option<String>,
@@ -46,59 +47,12 @@ pub type CoreRouteChangeHandler = Arc<
         + Sync,
 >;
 
-/// Runtime-owned character card tool-access result consumed by tools.
-#[derive(Clone, Debug, Default)]
-pub struct ResolvedCharacterCardToolAccess {
-    pub customEnabled: bool,
-    pub effectiveBuiltinToolVisibility: HashMap<String, bool>,
-    pub allowedPackageNames: HashSet<String>,
-    pub allowedSkillNames: HashSet<String>,
-    pub allowedMcpServerNames: HashSet<String>,
-    pub canUsePackageSystem: bool,
-    pub hasAnyAllowedExternalSource: bool,
-}
-
-impl ResolvedCharacterCardToolAccess {
-    /// Returns whether a built-in tool is visible under the resolved access rules.
-    #[allow(non_snake_case)]
-    pub fn isBuiltinToolAllowed(&self, toolName: &str) -> bool {
-        if !self.customEnabled {
-            return self
-                .effectiveBuiltinToolVisibility
-                .get(toolName)
-                .copied()
-                .unwrap_or(true);
-        }
-        match toolName {
-            "package_proxy" => self.hasAnyAllowedExternalSource,
-            _ => self
-                .effectiveBuiltinToolVisibility
-                .get(toolName)
-                .copied()
-                .unwrap_or(false),
-        }
-    }
-
-    /// Returns whether an external package, skill, or MCP source is visible.
-    #[allow(non_snake_case)]
-    pub fn isExternalSourceAllowed(&self, sourceName: &str) -> bool {
-        if !self.customEnabled {
-            return true;
-        }
-        if !self.canUsePackageSystem {
-            return false;
-        }
-        self.allowedPackageNames.contains(sourceName)
-            || self.allowedSkillNames.contains(sourceName)
-            || self.allowedMcpServerNames.contains(sourceName)
-    }
-}
-
 /// Bundled package asset exposed by the runtime crate.
 #[derive(Clone, Copy)]
 pub struct RuntimePluginAsset {
     pub name: &'static str,
     pub bytes: &'static [u8],
+    pub sha256: &'static str,
 }
 
 /// Bundled external skill asset exposed by the runtime crate.
@@ -129,27 +83,6 @@ pub struct RuntimeSkillCatalogEntry {
     pub description: String,
 }
 
-/// Character card metadata exposed to tools.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(non_snake_case)]
-pub struct RuntimeCharacterCardInfo {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub isDefault: bool,
-    pub createdAt: i64,
-    pub updatedAt: i64,
-}
-
-/// Character memory binding data exposed to memory tools.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(non_snake_case)]
-pub struct RuntimeCharacterMemoryBinding {
-    pub id: String,
-    pub memoryBindingMode: String,
-    pub sharedMemoryId: Option<String>,
-}
-
 /// Operation supported by the structured file edit interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeStructuredEditAction {
@@ -173,15 +106,59 @@ pub enum RuntimeChatSlot {
     FLOATING,
 }
 
+/// Contains native-generated correlation identities scoped to the authenticated calling package.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTurnHandle {
+    pub sequenceId: String,
+    pub executionId: String,
+    pub chatId: String,
+}
+
+/// Reports whether the exact native execution accepted a cancellation request.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTurnCancelResultData {
+    pub executionId: String,
+    pub cancelRequested: bool,
+}
+
+/// Describes the native aggregate state rather than a plugin-local planner status.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatSequenceStatus {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Finalizes only the exact records accumulated by native commits in one admitted sequence.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSequenceFinishResultData {
+    pub sequenceId: String,
+    pub chatId: String,
+    pub status: ChatSequenceStatus,
+    pub userMessageTimestamp: Option<i64>,
+    pub assistants: Vec<operit_plugin_sdk::js_sdk::results::ChatCommittedMessage>,
+    pub error: Option<String>,
+}
+
+
 /// Parameters for sending a chat message through the parent runtime.
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
 pub struct RuntimeChatSendRequest {
     pub slot: RuntimeChatSlot,
-    pub roleCardId: Option<String>,
+    pub participantId: Option<String>,
     pub chatId: Option<String>,
     pub message: String,
     pub proxySenderName: Option<String>,
+    pub attachments: Vec<operit_model::AttachmentInfo::AttachmentInfo>,
+    pub replyToMessageTimestamp: Option<i64>,
     pub turnOptions: ChatTurnOptions,
 }
 
@@ -205,6 +182,12 @@ pub struct RuntimeCoreNodeStatus {
     pub platform: String,
     pub model: String,
     pub reachable: bool,
+    /// Whether this device can be selected to host Core execution.
+    pub canExecute: bool,
+    /// Peer Links one routed request traverses, reported only for multi-hop members.
+    pub relayHops: Option<u32>,
+    /// Hop node ids from the first hop through the member, reported only for multi-hop members.
+    pub relayPath: Option<Vec<String>>,
 }
 
 /// Describes the current device and every member of its device space.
@@ -213,6 +196,104 @@ pub struct RuntimeCoreNodeStatus {
 pub struct RuntimeCoreNodeRouteState {
     pub currentNodeId: String,
     pub nodes: Vec<RuntimeCoreNodeStatus>,
+}
+
+/// Outcome of resolving one user-facing device reference against a route snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub enum CoreNodeReferenceMatch<'a> {
+    /// Exactly one space member matched the reference.
+    Resolved(&'a RuntimeCoreNodeStatus),
+    /// No member matched the reference at all.
+    Unknown,
+    /// More than one member matched; callers must never guess a target.
+    Ambiguous(Vec<&'a RuntimeCoreNodeStatus>),
+}
+
+impl RuntimeCoreNodeRouteState {
+    /// Resolves one device reference to a single space member.
+    ///
+    /// An exact node id wins first. A device or user name may then match
+    /// exactly, then case-insensitively. A node id prefix is accepted last and
+    /// only when it is unique. Every stage that matches several members is
+    /// reported as ambiguous instead of picking one.
+    #[allow(non_snake_case)]
+    pub fn resolveNodeReference<'a>(&'a self, reference: &str) -> CoreNodeReferenceMatch<'a> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return CoreNodeReferenceMatch::Unknown;
+        }
+        if let Some(node) = self.nodes.iter().find(|node| node.nodeId == reference) {
+            return CoreNodeReferenceMatch::Resolved(node);
+        }
+        for nameMatch in [
+            RuntimeCoreNodeNameMatch::Exact,
+            RuntimeCoreNodeNameMatch::AsciiCaseInsensitive,
+        ] {
+            let matches = self
+                .nodes
+                .iter()
+                .filter(|node| nameMatch.matches(node, reference))
+                .collect::<Vec<_>>();
+            match matches.len() {
+                0 => continue,
+                1 => return CoreNodeReferenceMatch::Resolved(matches[0]),
+                _ => return CoreNodeReferenceMatch::Ambiguous(matches),
+            }
+        }
+        let prefix = reference.to_ascii_lowercase();
+        let matches = self
+            .nodes
+            .iter()
+            .filter(|node| node.nodeId.to_ascii_lowercase().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => CoreNodeReferenceMatch::Unknown,
+            1 => CoreNodeReferenceMatch::Resolved(matches[0]),
+            _ => CoreNodeReferenceMatch::Ambiguous(matches),
+        }
+    }
+}
+
+/// Selects how one matching stage compares member names.
+#[derive(Clone, Copy)]
+enum RuntimeCoreNodeNameMatch {
+    Exact,
+    AsciiCaseInsensitive,
+}
+
+impl RuntimeCoreNodeNameMatch {
+    /// Reports whether one member's display or user name matches the reference.
+    fn matches(self, node: &RuntimeCoreNodeStatus, reference: &str) -> bool {
+        [node.displayName.as_str(), node.userName.as_str()]
+            .into_iter()
+            .filter(|name| !name.trim().is_empty())
+            .any(|name| match self {
+                Self::Exact => name == reference,
+                Self::AsciiCaseInsensitive => name.eq_ignore_ascii_case(reference),
+            })
+    }
+}
+
+/// Formats one member as a user-facing label that always carries its node id.
+#[allow(non_snake_case)]
+pub fn coreNodeReferenceLabel(node: &RuntimeCoreNodeStatus) -> String {
+    let name = node.displayName.trim();
+    if name.is_empty() || name == node.nodeId {
+        node.nodeId.clone()
+    } else {
+        format!("{name} ({})", node.nodeId)
+    }
+}
+
+/// Formats matched members as a copyable candidate list for tool errors.
+#[allow(non_snake_case)]
+pub fn formatCoreNodeReferenceCandidates(candidates: &[&RuntimeCoreNodeStatus]) -> String {
+    candidates
+        .iter()
+        .map(|node| coreNodeReferenceLabel(node))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Supplies live Core routing state without coupling tools to the transport implementation.
@@ -224,6 +305,17 @@ pub trait CoreNodeToolRuntime: Send + Sync {
 
 /// Provides runtime-owned services that the tools crate must not own.
 pub trait ToolRuntimeSupport: Send + Sync {
+    fn bindDeviceToolRuntime(&self, _runtime: Arc<dyn crate::tools::DeviceTools::DeviceToolRuntime>) -> Result<(), String> {
+        Err("Device tool routing is not supported by this runtime".into())
+    }
+    fn closeDeviceTransports(&self, _owner: &str) {}
+
+    fn executeDeviceTool(&self, _request: operit_plugin_sdk::javascript::JsToolCallRequest,
+        _preflight: Option<crate::tools::DeviceTools::DeviceToolPreflight>)
+        -> operit_plugin_sdk::javascript::JsExecutionCompletion<operit_plugin_sdk::javascript::JsToolCallResult> {
+        Box::pin(async { crate::tools::DeviceTools::failure("Device tool routing is not initialized") })
+    }
+
     /// Installs the live Core routing capability owned by the outer proxy.
     #[allow(non_snake_case)]
     fn bindCoreNodeToolRuntime(&self, runtime: Arc<dyn CoreNodeToolRuntime>) -> Result<(), String>;
@@ -245,14 +337,71 @@ pub trait ToolRuntimeSupport: Send + Sync {
         resumeContext: CoreRouteResumeContext,
     ) -> ToolRuntimeSupportFuture<'a, Result<(), String>>;
 
-    /// Resolves role-card tool access for the active invocation context.
+    /// Reads complete configured model summaries directly from the canonical configuration manager.
     #[allow(non_snake_case)]
-    fn resolveCharacterCardToolAccess(
+    fn listModelSummaries(
         &self,
-        roleCardId: Option<&str>,
-        packageManager: &RuntimePackageManager,
-        globalToolVisibility: Option<HashMap<String, bool>>,
-    ) -> ResolvedCharacterCardToolAccess;
+    ) -> Result<Vec<operit_plugin_sdk::js_sdk::models::ModelsSummary>, String>;
+    /// Synthesizes encoded audio through the configured provider on this host.
+    fn synthesizeSpeech(&self, _request: operit_plugin_sdk::js_sdk::tts::TtsSynthesizeRequest)
+        -> Result<operit_plugin_sdk::js_sdk::results::TtsSynthesizeResultData, String> {
+        Err("Speech synthesis is unavailable on this host".into())
+    }
+    /// Recognizes supplied audio through the configured provider on this host.
+    fn transcribeSpeech(&self, _request: operit_plugin_sdk::js_sdk::stt::SttTranscribeRequest)
+        -> Result<operit_plugin_sdk::js_sdk::results::SttTranscribeResultData, String> {
+        Err("Speech recognition is unavailable on this host".into())
+    }
+    /// Reads complete configured speech records directly from the canonical configuration manager.
+    #[allow(non_snake_case)]
+    fn listTtsConfigs(
+        &self,
+    ) -> Result<Vec<operit_plugin_sdk::js_sdk::tts::TtsConfig>, String>;
+    /// Lists complete independent named appearance snapshots from the ordinary canonical preference manager.
+    #[allow(non_snake_case)]
+    fn listThemeConfigs(&self) -> Result<Vec<operit_plugin_sdk::js_sdk::theme::ThemeConfig>, String>;
+    /// Applies one exact existing named appearance snapshot and its active ID in the canonical transaction.
+    #[allow(non_snake_case)]
+    fn applyThemeConfig(&self, id: String) -> Result<operit_plugin_sdk::js_sdk::theme::ThemeConfig, String>;
+    /// Reads the actual current canonical speech ID without resolving any plugin-owned usage.
+    #[allow(non_snake_case)]
+    fn getCurrentTtsConfigId(&self) -> Result<String, String>;
+    /// Selects only the exact existing canonical speech ID and propagates validation or persistence errors.
+    #[allow(non_snake_case)]
+    fn setCurrentTtsConfigId(&self, id: String) -> Result<String, String>;
+    /// Filters the hidden model-facing catalog using actual registered tool-prompt hooks and execution context.
+    #[allow(non_snake_case)]
+    fn filterToolCatalog<'a>(
+        &'a self,
+        entries: Vec<crate::tools::climode::CliToolModeSupport::HiddenToolCatalogEntry>,
+        context: crate::ToolExecutionManager::ToolRuntimeContext,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<crate::tools::climode::CliToolModeSupport::HiddenToolCatalogEntry>,
+                        String,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Reads actual tool source registries after the one initial registry load has completed.
+    #[allow(non_snake_case)]
+    fn readToolSourceCatalog<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        operit_plugin_sdk::js_sdk::catalog::CatalogToolSources,
+                        String,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
 
     /// Reads one stored environment variable.
     #[allow(non_snake_case)]
@@ -332,23 +481,58 @@ pub trait ToolRuntimeSupport: Send + Sync {
 
     /// Switches the parent-owned main chat runtime to a chat id.
     #[allow(non_snake_case)]
-    fn switchMainChat(&self, chatId: &str) -> Result<(), String>;
+    fn switchMainChat<'a>(
+        &'a self,
+        chatId: &'a str,
+    ) -> ToolRuntimeSupportFuture<'a, Result<(), String>>;
 
-    /// Creates a chat through the parent-owned chat runtime.
+    /// Creates a workspace conversation with explicit source and opaque creation input.
     #[allow(non_snake_case)]
-    fn createChatRuntime(
-        &self,
-        characterCardName: Option<String>,
-        group: Option<String>,
+    fn createChatRuntime<'a>(
+        &'a self,
         setAsCurrentChat: bool,
-    ) -> Result<(), String>;
+        sourceChatId: Option<String>,
+        input: Option<serde_json::Value>,
+    ) -> ToolRuntimeSupportFuture<'a, Result<String, String>>;
+
+    /// Reads one authenticated owner's object extension directly from an existing record.
+    fn readChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+    ) -> Result<Option<operit_plugin_sdk::js_sdk::core::JsonObject>, String>;
+
+    /// Replaces one authenticated owner's object extension directly on an existing record.
+    fn writeChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+        value: operit_plugin_sdk::js_sdk::core::JsonObject,
+    ) -> Result<operit_plugin_sdk::js_sdk::core::JsonObject, String>;
+
+    /// Deletes one authenticated owner's extension directly from an existing record.
+    fn deleteChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+    ) -> Result<bool, String>;
+
+    /// Admits one authenticated message and returns its bounded semantic observation before generation awaits.
+    fn openPluginChatMessage(
+        &self, owner: &str, request: operit_plugin_sdk::js_sdk::chat::ChatSendRequest, observeParts: bool,
+    ) -> Result<operit_plugin_sdk::js_sdk::JsAsyncIterable<operit_plugin_sdk::js_sdk::chat::ChatSendEvent>, String>;
+
+    /// Captures and requests cancellation of this owner's current execution before any asynchronous model access.
+    fn requestPluginChatCancellation(
+        &self, owner: &str, chatId: &str,
+    ) -> Result<operit_plugin_sdk::js_sdk::chat::ChatCancelResult, String>;
 
     /// Sends a message through the parent-owned chat runtime.
     #[allow(non_snake_case)]
     fn sendChatMessage<'a>(
         &'a self,
         request: RuntimeChatSendRequest,
-    ) -> ToolRuntimeSupportFuture<'a, Result<(), String>>;
+    ) -> ToolRuntimeSupportFuture<'a, Result<operit_plugin_sdk::js_sdk::results::MessageSendResultData, String>>;
 
     /// Calls a functional model without adding messages to chat history.
     #[allow(non_snake_case)]
@@ -356,27 +540,6 @@ pub trait ToolRuntimeSupport: Send + Sync {
         &'a self,
         request: RuntimeChatCallRequest,
     ) -> ToolRuntimeSupportFuture<'a, Result<String, String>>;
-
-    /// Lists character cards through parent-owned preferences.
-    #[allow(non_snake_case)]
-    fn listCharacterCards(&self) -> Result<Vec<RuntimeCharacterCardInfo>, String>;
-
-    /// Resolves a character card name by id.
-    #[allow(non_snake_case)]
-    fn characterCardName(&self, cardId: &str) -> Result<String, String>;
-
-    /// Resolves memory binding metadata by character card id.
-    #[allow(non_snake_case)]
-    fn characterMemoryBinding(&self, cardId: &str)
-        -> Result<RuntimeCharacterMemoryBinding, String>;
-
-    /// Rejects memory owner keys that are not a registered character card or shared store.
-    #[allow(non_snake_case)]
-    fn assertMemoryOwnerExists(&self, ownerKey: &str) -> Result<(), String>;
-
-    /// Loads memory search settings for an owner scope.
-    #[allow(non_snake_case)]
-    fn loadMemorySearchSettings(&self, ownerScope: &str) -> Result<(), String>;
 
     /// Applies structured edits to file content.
     #[allow(non_snake_case)]
@@ -428,5 +591,128 @@ impl ToolRuntimeDependencies {
     /// Clones the JavaScript execution provider for this tool runtime.
     pub fn shared_js_execution_provider(&self) -> Arc<dyn JsExecutionProvider> {
         self.js_execution_provider.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(nodeId: &str, displayName: &str, userName: &str, reachable: bool) -> RuntimeCoreNodeStatus {
+        RuntimeCoreNodeStatus {
+            nodeId: nodeId.to_string(),
+            displayName: displayName.to_string(),
+            userName: userName.to_string(),
+            platform: "android".to_string(),
+            model: "M2007J1SC".to_string(),
+            reachable,
+            canExecute: true,
+            relayHops: None,
+            relayPath: None,
+        }
+    }
+
+    fn state(nodes: Vec<RuntimeCoreNodeStatus>) -> RuntimeCoreNodeRouteState {
+        RuntimeCoreNodeRouteState {
+            currentNodeId: nodes.first().map(|node| node.nodeId.clone()).unwrap_or_default(),
+            nodes,
+        }
+    }
+
+    fn resolvedNodeId(matchResult: CoreNodeReferenceMatch<'_>) -> String {
+        match matchResult {
+            CoreNodeReferenceMatch::Resolved(node) => node.nodeId.clone(),
+            other => panic!("expected a resolved node, got {other:?}"),
+        }
+    }
+
+    /// An exact node id wins even when another member is named like it.
+    #[test]
+    fn exactNodeIdOutranksNamesAndPrefixes() {
+        let state = state(vec![
+            status("core-1-cas", "cas", "harmoon", true),
+            status("core-2-device", "core-1-cas", "harmoon", true),
+        ]);
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("core-1-cas")), "core-1-cas");
+    }
+
+    /// Device and user names resolve exactly, then case-insensitively.
+    #[test]
+    fn deviceAndUserNamesResolveThroughEveryExactStage() {
+        let state = state(vec![
+            status("core-1-cas", "cas", "harmoon", true),
+            status("core-2-elish", "Elish", "lin", true),
+        ]);
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("cas")), "core-1-cas");
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("elish")), "core-2-elish");
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("  cas  ")), "core-1-cas");
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("lin")), "core-2-elish");
+    }
+
+    /// A unique node id prefix resolves, including the timestamp-only form.
+    #[test]
+    fn uniqueNodeIdPrefixesResolve() {
+        let state = state(vec![
+            status("core-1791589326795-13765763d4b74d4ab76648f26ee874be", "cas", "harmoon", true),
+            status("core-1791589400000-58f0d4ee0efc47f59a1f1b4d514b7af0", "elish", "lin", true),
+        ]);
+        assert_eq!(
+            resolvedNodeId(state.resolveNodeReference("core-1791589326795")),
+            "core-1791589326795-13765763d4b74d4ab76648f26ee874be"
+        );
+        assert_eq!(
+            resolvedNodeId(state.resolveNodeReference("CORE-17915894")),
+            "core-1791589400000-58f0d4ee0efc47f59a1f1b4d514b7af0"
+        );
+    }
+
+    /// Repeated names and prefixes never pick a target by accident, while an
+    /// exactly spelled name still outranks its case-insensitive neighbours.
+    #[test]
+    fn ambiguousReferencesReportEveryCandidate() {
+        let state = state(vec![
+            status("core-1", "cas", "harmoon", true),
+            status("core-2", "cas", "harmoon", true),
+            status("core-3", "Mac", "lin", true),
+            status("core-4", "mac", "lin", true),
+        ]);
+        for reference in ["cas", "harmoon", "MAC", "core-"] {
+            match state.resolveNodeReference(reference) {
+                CoreNodeReferenceMatch::Ambiguous(candidates) => {
+                    assert!(candidates.len() >= 2, "{reference}");
+                }
+                other => panic!("ambiguous reference {reference} resolved as {other:?}"),
+            }
+        }
+        assert_eq!(resolvedNodeId(state.resolveNodeReference("mac")), "core-4");
+        match state.resolveNodeReference("cas") {
+            CoreNodeReferenceMatch::Ambiguous(candidates) => {
+                assert_eq!(
+                    formatCoreNodeReferenceCandidates(&candidates),
+                    "cas (core-1), cas (core-2)"
+                );
+            }
+            other => panic!("expected candidates, got {other:?}"),
+        }
+    }
+
+    /// Unknown, empty, and name-less members stay unresolved instead of guessing.
+    #[test]
+    fn unknownAndEmptyReferencesStayUnknown() {
+        let state = state(vec![
+            status("core-1", "cas", "", true),
+            status("core-2", "", "", true),
+        ]);
+        for reference in ["", "   ", "linux", "core-9"] {
+            assert_eq!(state.resolveNodeReference(reference), CoreNodeReferenceMatch::Unknown, "{reference}");
+        }
+    }
+
+    /// Labels always carry the stable node id for copyable error messages.
+    #[test]
+    fn referenceLabelsFallBackToTheNodeId() {
+        assert_eq!(coreNodeReferenceLabel(&status("core-1", "cas", "", true)), "cas (core-1)");
+        assert_eq!(coreNodeReferenceLabel(&status("core-1", "", "", true)), "core-1");
+        assert_eq!(coreNodeReferenceLabel(&status("core-1", "core-1", "", true)), "core-1");
     }
 }

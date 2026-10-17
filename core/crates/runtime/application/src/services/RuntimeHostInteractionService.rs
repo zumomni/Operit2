@@ -13,14 +13,11 @@ use operit_host_api::TimeUtils::tryCurrentTimeMillisU128;
 use operit_host_api::{
     SystemNotificationActivation, SystemNotificationRequest, SystemOperationHost,
 };
+use operit_store::PreferencesDataStore::{mutableStateFlow, MutableStateFlow, StateFlow};
 use operit_util::stream::Stream::{CollectFuture, Stream};
 use operit_util::ImagePoolManager::ImagePoolManager;
 use operit_util::MediaPoolManager::MediaPoolManager;
 use tokio::sync::{oneshot, Notify};
-
-tokio::task_local! {
-    static RUNTIME_HOST_INTERACTION_ORIGIN: RuntimeHostInteractionRequestOrigin;
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Host-side interaction category requested by runtime services.
@@ -35,6 +32,8 @@ pub enum RuntimeHostInteractionKind {
     ComposeWebViewController,
     #[serde(rename = "compose_file_picker")]
     ComposeFilePicker,
+    #[serde(rename = "compose_file_save")]
+    ComposeFileSave,
     #[serde(rename = "system_capture_screenshot")]
     SystemCaptureScreenshot,
     #[serde(rename = "system_language_code")]
@@ -59,10 +58,6 @@ pub enum RuntimeHostInteractionKind {
     TtsPlayback,
     #[serde(rename = "local_inference")]
     LocalInference,
-    #[serde(rename = "tool_permission")]
-    ToolPermission,
-    #[serde(rename = "web_access_pairing")]
-    WebAccessPairing,
     #[serde(rename = "app_notification")]
     AppNotification,
 }
@@ -77,6 +72,7 @@ pub struct RuntimeHostInteractionRequest {
     pub webVisit: Option<RuntimeHostInteractionWebVisitPayload>,
     pub composeWebViewController: Option<RuntimeHostInteractionComposeWebViewControllerPayload>,
     pub composeFilePicker: Option<RuntimeHostInteractionComposeFilePickerPayload>,
+    pub composeFileSave: Option<RuntimeHostInteractionComposeFileSavePayload>,
     pub systemCaptureScreenshot: Option<RuntimeHostInteractionSystemCaptureScreenshotPayload>,
     pub systemLanguageCode: Option<RuntimeHostInteractionSystemLanguageCodePayload>,
     pub systemRecognizeText: Option<RuntimeHostInteractionSystemRecognizeTextPayload>,
@@ -89,22 +85,12 @@ pub struct RuntimeHostInteractionRequest {
     pub ttsSynthesis: Option<RuntimeHostInteractionTtsSynthesisPayload>,
     pub ttsPlayback: Option<RuntimeHostInteractionTtsPlaybackPayload>,
     pub localInference: Option<RuntimeHostInteractionLocalInferencePayload>,
-    pub toolPermission: Option<RuntimeHostInteractionToolPermissionPayload>,
-    pub webAccessPairing: Option<RuntimeHostInteractionWebAccessPairingPayload>,
     pub appNotification: Option<RuntimeHostInteractionAppNotificationPayload>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Logical origin used to route controller-specific runtime host interactions.
-pub enum RuntimeHostInteractionRequestOrigin {
-    LocalOwner,
-    RemoteSession { sessionId: String, deviceId: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuntimeHostInteractionTarget {
     OwnerHost,
-    Controller(RuntimeHostInteractionRequestOrigin),
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +132,13 @@ impl RuntimeHostInteractionRequest {
     fn composeFilePicker(payload: RuntimeHostInteractionComposeFilePickerPayload) -> Self {
         let mut request = Self::empty(RuntimeHostInteractionKind::ComposeFilePicker);
         request.composeFilePicker = Some(payload);
+        request
+    }
+
+    /// Creates a request for the owner file-save selector.
+    fn composeFileSave(payload: RuntimeHostInteractionComposeFileSavePayload) -> Self {
+        let mut request = Self::empty(RuntimeHostInteractionKind::ComposeFileSave);
+        request.composeFileSave = Some(payload);
         request
     }
 
@@ -225,18 +218,7 @@ impl RuntimeHostInteractionRequest {
         request
     }
 
-    fn toolPermission(payload: RuntimeHostInteractionToolPermissionPayload) -> Self {
-        let mut request = Self::empty(RuntimeHostInteractionKind::ToolPermission);
-        request.toolPermission = Some(payload);
-        request
-    }
 
-    /// Builds a non-blocking notification for one browser Web Access pairing request.
-    fn webAccessPairing(payload: RuntimeHostInteractionWebAccessPairingPayload) -> Self {
-        let mut request = Self::empty(RuntimeHostInteractionKind::WebAccessPairing);
-        request.webAccessPairing = Some(payload);
-        request
-    }
 
     /// Builds a non-blocking notification for one application-level event.
     fn appNotification(payload: RuntimeHostInteractionAppNotificationPayload) -> Self {
@@ -254,6 +236,7 @@ impl RuntimeHostInteractionRequest {
             webVisit: None,
             composeWebViewController: None,
             composeFilePicker: None,
+            composeFileSave: None,
             systemCaptureScreenshot: None,
             systemLanguageCode: None,
             systemRecognizeText: None,
@@ -266,8 +249,6 @@ impl RuntimeHostInteractionRequest {
             ttsSynthesis: None,
             ttsPlayback: None,
             localInference: None,
-            toolPermission: None,
-            webAccessPairing: None,
             appNotification: None,
         }
     }
@@ -315,6 +296,12 @@ pub struct RuntimeHostInteractionComposeWebViewControllerPayload {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Compose DSL file-picker request payload.
 pub struct RuntimeHostInteractionComposeFilePickerPayload {
+    pub requestJson: String,
+}
+
+/// Compose DSL file-save request payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeHostInteractionComposeFileSavePayload {
     pub requestJson: String,
 }
 
@@ -434,25 +421,28 @@ pub struct RuntimeHostInteractionLocalInferencePayload {
     pub requestJson: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Tool parameter included in a host permission request.
 pub struct RuntimeHostInteractionToolPermissionToolParameter {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Tool identity and arguments included in a host permission request.
 pub struct RuntimeHostInteractionToolPermissionTool {
     pub name: String,
     pub parameters: Vec<RuntimeHostInteractionToolPermissionToolParameter>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Tool permission request payload routed to the controlling runtime.
-pub struct RuntimeHostInteractionToolPermissionPayload {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Chat-scoped tool permission request exposed through chat state.
+pub struct RuntimeHostInteractionToolPermissionRequest {
+    pub requestId: String,
+    pub chatId: String,
     pub tool: RuntimeHostInteractionToolPermissionTool,
     pub description: String,
+    pub requestedAtMillis: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,6 +454,7 @@ pub struct RuntimeHostInteractionResponse {
     pub webVisit: Option<RuntimeHostInteractionWebVisitResponse>,
     pub composeWebViewController: Option<RuntimeHostInteractionComposeWebViewControllerResponse>,
     pub composeFilePicker: Option<RuntimeHostInteractionComposeFilePickerResponse>,
+    pub composeFileSave: Option<RuntimeHostInteractionComposeFileSaveResponse>,
     pub systemCaptureScreenshot: Option<RuntimeHostInteractionSystemCaptureScreenshotResponse>,
     pub systemLanguageCode: Option<RuntimeHostInteractionSystemLanguageCodeResponse>,
     pub systemRecognizeText: Option<RuntimeHostInteractionSystemRecognizeTextResponse>,
@@ -476,7 +467,6 @@ pub struct RuntimeHostInteractionResponse {
     pub ttsSynthesis: Option<RuntimeHostInteractionTtsSynthesisResponse>,
     pub ttsPlayback: Option<RuntimeHostInteractionTtsPlaybackResponse>,
     pub localInference: Option<RuntimeHostInteractionLocalInferenceResponse>,
-    pub toolPermission: Option<RuntimeHostInteractionToolPermissionResponse>,
 }
 
 impl RuntimeHostInteractionResponse {
@@ -514,6 +504,13 @@ impl RuntimeHostInteractionResponse {
     pub fn composeFilePicker(response: RuntimeHostInteractionComposeFilePickerResponse) -> Self {
         let mut value = Self::empty();
         value.composeFilePicker = Some(response);
+        value
+    }
+
+    /// Creates the response for an owner file-save interaction.
+    pub fn composeFileSave(response: RuntimeHostInteractionComposeFileSaveResponse) -> Self {
+        let mut value = Self::empty();
+        value.composeFileSave = Some(response);
         value
     }
 
@@ -605,13 +602,6 @@ impl RuntimeHostInteractionResponse {
         value
     }
 
-    /// Builds a tool permission response envelope.
-    pub fn toolPermission(response: RuntimeHostInteractionToolPermissionResponse) -> Self {
-        let mut value = Self::empty();
-        value.toolPermission = Some(response);
-        value
-    }
-
     fn empty() -> Self {
         Self {
             error: None,
@@ -620,6 +610,7 @@ impl RuntimeHostInteractionResponse {
             webVisit: None,
             composeWebViewController: None,
             composeFilePicker: None,
+            composeFileSave: None,
             systemCaptureScreenshot: None,
             systemLanguageCode: None,
             systemRecognizeText: None,
@@ -632,7 +623,6 @@ impl RuntimeHostInteractionResponse {
             ttsSynthesis: None,
             ttsPlayback: None,
             localInference: None,
-            toolPermission: None,
         }
     }
 }
@@ -698,6 +688,12 @@ pub struct RuntimeHostInteractionComposeFilePickerResponse {
     pub resultJson: String,
 }
 
+/// Compose DSL file-save response payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeHostInteractionComposeFileSaveResponse {
+    pub resultJson: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Screenshot capture response payload.
 pub struct RuntimeHostInteractionSystemCaptureScreenshotResponse {
@@ -759,22 +755,7 @@ pub struct RuntimeHostInteractionLocalInferenceResponse {
     pub resultJson: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Tool permission response payload.
-pub struct RuntimeHostInteractionToolPermissionResponse {
-    pub result: String,
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Browser identity and code for one Web Access pairing request.
-pub struct RuntimeHostInteractionWebAccessPairingPayload {
-    pub pairingId: String,
-    pub clientDeviceId: String,
-    pub clientPlatform: String,
-    pub clientModel: String,
-    pub pairingCode: String,
-    pub createdAt: i64,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Application event that the owning Flutter process may surface as a system notification.
@@ -793,7 +774,6 @@ struct RuntimeHostInteractionState {
     nextSequence: u64,
 }
 
-#[derive(Debug)]
 struct RuntimeHostInteractionBroker {
     state: Mutex<RuntimeHostInteractionState>,
     changed: Condvar,
@@ -812,9 +792,366 @@ impl Default for RuntimeHostInteractionBroker {
 
 static RUNTIME_HOST_INTERACTIONS: OnceLock<RuntimeHostInteractionBroker> = OnceLock::new();
 
+#[derive(Default)]
+struct ChatToolPermissionState {
+    pending: BTreeMap<String, RuntimeHostInteractionToolPermissionRequest>,
+    decisions: BTreeMap<String, String>,
+}
+
+struct ChatToolPermissionBroker {
+    state: Mutex<ChatToolPermissionState>,
+    changed: Notify,
+    requests: MutableStateFlow<Vec<RuntimeHostInteractionToolPermissionRequest>>,
+}
+
+impl Default for ChatToolPermissionBroker {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ChatToolPermissionState::default()),
+            changed: Notify::new(),
+            requests: mutableStateFlow(Vec::new()),
+        }
+    }
+}
+
+static CHAT_TOOL_PERMISSIONS: OnceLock<ChatToolPermissionBroker> = OnceLock::new();
+
+/// Returns the process-wide chat tool permission broker.
+fn chatToolPermissionBroker() -> &'static ChatToolPermissionBroker {
+    CHAT_TOOL_PERMISSIONS.get_or_init(ChatToolPermissionBroker::default)
+}
+
+impl ChatToolPermissionBroker {
+    /// Publishes all unresolved requests to subscribed chat state flows.
+    fn refreshRequests(&self, state: &ChatToolPermissionState) {
+        let mut requests = state
+            .pending
+            .iter()
+            .filter(|(requestId, _)| !state.decisions.contains_key(*requestId))
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.requestedAtMillis
+                .cmp(&right.requestedAtMillis)
+                .then_with(|| left.requestId.cmp(&right.requestId))
+        });
+        self.requests.set_value(requests);
+    }
+
+    /// Adds one chat-bound request and awaits its decision or deadline.
+    async fn request(
+        &self,
+        chatId: String,
+        tool: RuntimeHostInteractionToolPermissionTool,
+        description: String,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let timeoutMillis = u64::try_from(timeout.as_millis())
+            .map_err(|_| "tool permission timeout exceeds u64 milliseconds")?;
+        let requestId = Uuid::new_v4().to_string();
+        let requestedAtMillis = i64::try_from(tryCurrentTimeMillisU128()?)
+            .map_err(|_| "tool permission timestamp exceeds i64 milliseconds")?;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|error| format!("tool permission mutex poisoned: {error}"))?;
+            state.pending.insert(
+                requestId.clone(),
+                RuntimeHostInteractionToolPermissionRequest {
+                    requestId: requestId.clone(),
+                    chatId,
+                    tool,
+                    description,
+                    requestedAtMillis,
+                },
+            );
+            self.refreshRequests(&state);
+        }
+        self.changed.notify_waiters();
+
+        let (timeoutSender, mut timeoutReceiver) = oneshot::channel();
+        if let Err(error) = defaultHostRuntimeTaskSchedulerHost()
+            .scheduleDelayedHostRuntimeTask(
+                "chat-tool-permission-timeout",
+                timeoutMillis,
+                Box::new(move || {
+                    let _ = timeoutSender.send(());
+                }),
+            )
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|lockError| format!("tool permission mutex poisoned: {lockError}"))?;
+            state.pending.remove(&requestId);
+            self.refreshRequests(&state);
+            self.changed.notify_waiters();
+            return Err(error.message);
+        }
+
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|error| format!("tool permission mutex poisoned: {error}"))?;
+                if let Some(result) = state.decisions.remove(&requestId) {
+                    state.pending.remove(&requestId);
+                    self.refreshRequests(&state);
+                    return Ok(result);
+                }
+            }
+            tokio::select! {
+                _ = changed => {}
+                timeout = &mut timeoutReceiver => {
+                    timeout.map_err(|_| "tool permission timeout task was cancelled".to_string())?;
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|error| format!("tool permission mutex poisoned: {error}"))?;
+                    if let Some(result) = state.decisions.remove(&requestId) {
+                        state.pending.remove(&requestId);
+                        self.refreshRequests(&state);
+                        return Ok(result);
+                    }
+                    state.pending.remove(&requestId);
+                    self.refreshRequests(&state);
+                    return Err(format!("chat tool permission timed out: {requestId}"));
+                }
+            }
+        }
+    }
+
+    /// Applies a decision only when the request belongs to the addressed chat.
+    fn respond(&self, chatId: &str, requestId: &str, result: String) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| format!("tool permission mutex poisoned: {error}"))?;
+        let Some(request) = state.pending.get(requestId) else {
+            return Err(format!(
+                "chat tool permission request not found: {requestId}"
+            ));
+        };
+        if request.chatId != chatId {
+            return Err(format!(
+                "chat does not own tool permission request: {requestId}"
+            ));
+        }
+        state.decisions.insert(requestId.to_string(), result);
+        self.refreshRequests(&state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+}
+
 /// Service facade for publishing and responding to host interaction requests.
 pub struct RuntimeHostInteractionService {
     systemOperationHost: Option<Arc<dyn SystemOperationHost>>,
+    httpHost: Option<Arc<dyn operit_host_api::HttpHost>>,
+}
+
+/// A terminal image download result transported through the runtime proxy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeImageData {
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+    pub displayUrl: Option<String>,
+    pub error: Option<String>,
+}
+
+/// A cold image source whose collection lifetime owns any host byte request.
+pub struct RuntimeImageStream {
+    url: String,
+    host: Option<Arc<dyn operit_host_api::HttpHost>>,
+}
+
+/// Closes the host request when collection completes or is cancelled.
+struct RuntimeImageRequest {
+    id: String,
+    host: Arc<dyn operit_host_api::HttpHost>,
+}
+
+impl Drop for RuntimeImageRequest {
+    /// Releases the request, including when the proxy drops its collector.
+    fn drop(&mut self) {
+        let _ = self.host.closeHttpByteStream(&self.id);
+    }
+}
+
+/// Accumulates at most sixteen MiB without buffering an unbounded chunk queue.
+#[derive(Default)]
+struct RuntimeImageBuffer {
+    bytes: Vec<u8>,
+    completion: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
+}
+
+impl RuntimeImageBuffer {
+    /// Accepts a chunk or terminates the request when its byte budget is exceeded.
+    fn push(&mut self, chunk: Vec<u8>) {
+        if self.completion.is_none() {
+            return;
+        }
+        if chunk.len() > 16 * 1024 * 1024 - self.bytes.len() {
+            self.finish(Err("Image exceeded 16 MiB size limit".to_string()));
+            return;
+        }
+        self.bytes.extend_from_slice(&chunk);
+    }
+
+    /// Publishes exactly one terminal result and releases the buffered bytes.
+    fn finish(&mut self, result: Result<(), String>) {
+        if let Some(completion) = self.completion.take() {
+            let bytes = std::mem::take(&mut self.bytes);
+            let result = result.and_then(|()| {
+                if bytes.is_empty() {
+                    Err("Image response was empty".to_string())
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let _ = completion.send(result);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtimeImageBufferTests {
+    use super::RuntimeImageBuffer;
+    use tokio::sync::oneshot;
+
+    /// Verifies the byte limit rejects excess data before retaining it.
+    #[test]
+    fn rejectsOversizedImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: vec![0; 16 * 1024 * 1024],
+            completion: Some(sender),
+        };
+        buffer.push(vec![1]);
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err(),
+            "Image exceeded 16 MiB size limit"
+        );
+        assert!(buffer.bytes.is_empty());
+        buffer.push(vec![2]);
+        assert!(buffer.bytes.is_empty());
+    }
+
+    /// Verifies ordered chunks are delivered only after successful completion.
+    #[test]
+    fn completesOrderedImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        };
+        buffer.push(vec![1, 2]);
+        buffer.push(vec![3]);
+        buffer.finish(Ok(()));
+        assert_eq!(receiver.try_recv().unwrap().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// Verifies an empty successful response cannot become an image result.
+    #[test]
+    fn rejectsEmptyImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        };
+        buffer.finish(Ok(()));
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err(),
+            "Image response was empty"
+        );
+    }
+}
+
+impl RuntimeImageStream {
+    /// Resolves image delivery through the host and bounds byte-stream downloads.
+    async fn load(&self) -> Result<RuntimeImageData, String> {
+        let url = url::Url::parse(&self.url).map_err(|error| error.to_string())?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Image URL must use HTTP or HTTPS".to_string());
+        }
+        let host = self.host.clone().ok_or("HTTP host is not registered")?;
+        match host.imageDelivery() {
+            operit_host_api::HttpImageDelivery::DisplayUrl => {
+                return Ok(RuntimeImageData {
+                    bytes: Vec::new(),
+                    displayUrl: Some(url.to_string()),
+                    error: None,
+                });
+            }
+            operit_host_api::HttpImageDelivery::Bytes => {}
+        }
+        let request = RuntimeImageRequest {
+            id: format!("markdown-image-{}", Uuid::new_v4()),
+            host,
+        };
+        let (sender, receiver) = oneshot::channel();
+        let buffer = Arc::new(Mutex::new(RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        }));
+        let chunkBuffer = buffer.clone();
+        request
+            .host
+            .openHttpByteStream(
+                request.id.clone(),
+                operit_host_api::HttpRequestData {
+                    url: url.to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    formFields: Vec::new(),
+                    fileParts: Vec::new(),
+                    connectTimeoutSeconds: 20,
+                    readTimeoutSeconds: 30,
+                    followRedirects: true,
+                    ignoreSsl: false,
+                    proxyHost: String::new(),
+                    proxyPort: 0,
+                },
+                Arc::new(|| {}),
+                Arc::new(move |chunk| chunkBuffer.lock().expect("image buffer lock").push(chunk)),
+                Arc::new(move |result| buffer.lock().expect("image buffer lock").finish(result)),
+            )
+            .map_err(|error| error.message)?;
+        let scheduler = defaultHostRuntimeTaskSchedulerHost();
+        let timeout = scheduler.waitForHostRuntimeDelay(30_000);
+        let bytes = tokio::select! {
+            result = receiver => result.map_err(|error| error.to_string())?,
+            _ = timeout => Err("Image download timed out after 30 seconds".to_string()),
+        }?;
+        Ok(RuntimeImageData {
+            bytes,
+            displayUrl: None,
+            error: None,
+        })
+    }
+}
+
+impl Stream for RuntimeImageStream {
+    type Item = RuntimeImageData;
+
+    /// Emits one result and cancels the HTTP request when collection is dropped.
+    fn collect<'a>(&'a mut self, collector: &'a mut dyn FnMut(Self::Item)) -> CollectFuture<'a> {
+        Box::pin(async move {
+            let result = match self.load().await {
+                Ok(data) => data,
+                Err(error) => RuntimeImageData {
+                    bytes: Vec::new(),
+                    displayUrl: None,
+                    error: Some(error),
+                },
+            };
+            collector(result);
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,7 +1168,6 @@ pub struct RuntimeMediaPoolData {
 /// Blocking stream of pending host interaction requests for selected kinds.
 pub struct RuntimeHostInteractionEventStream {
     kinds: Vec<RuntimeHostInteractionKind>,
-    controllerOrigin: RuntimeHostInteractionRequestOrigin,
 }
 
 impl Stream for RuntimeHostInteractionEventStream {
@@ -873,6 +1209,15 @@ impl RuntimeHostInteractionService {
     pub fn getInstance(context: &HostManager) -> Self {
         Self {
             systemOperationHost: context.systemOperationHost.clone(),
+            httpHost: context.httpHost.clone(),
+        }
+    }
+
+    /// Creates a cancellable image download through the active runtime HTTP host.
+    pub fn imageBytes(&self, url: String) -> RuntimeImageStream {
+        RuntimeImageStream {
+            url,
+            host: self.httpHost.clone(),
         }
     }
 
@@ -970,10 +1315,7 @@ impl RuntimeHostInteractionService {
         &self,
         kinds: Vec<RuntimeHostInteractionKind>,
     ) -> RuntimeHostInteractionEventStream {
-        RuntimeHostInteractionEventStream {
-            kinds,
-            controllerOrigin: currentRuntimeHostInteractionOrigin(),
-        }
+        RuntimeHostInteractionEventStream { kinds }
     }
 }
 
@@ -1050,6 +1392,19 @@ pub fn requestOwnerComposeFilePicker(
     response
         .composeFilePicker
         .ok_or_else(|| "compose file picker response payload is missing".to_string())
+}
+
+/// Requests an export through the owner host file-save selector.
+pub fn requestOwnerComposeFileSave(
+    payload: RuntimeHostInteractionComposeFileSavePayload,
+    timeout: Duration,
+) -> Result<RuntimeHostInteractionComposeFileSaveResponse, String> {
+    let response = runtimeHostInteractionBroker().request(
+        RuntimeHostInteractionTarget::OwnerHost,
+        RuntimeHostInteractionRequest::composeFileSave(payload),
+        timeout,
+    )?;
+    response.composeFileSave.ok_or_else(|| "compose file save response payload is missing".to_string())
 }
 
 /// Requests a screenshot capture from the owner host.
@@ -1230,30 +1585,43 @@ pub fn requestOwnerLocalInference(
         .ok_or_else(|| "local inference response payload is missing".to_string())
 }
 
-/// Requests a tool permission decision without blocking the active runtime task.
-pub async fn requestOwnerToolPermissionAsync(
-    payload: RuntimeHostInteractionToolPermissionPayload,
-    timeout: Duration,
-) -> Result<RuntimeHostInteractionToolPermissionResponse, String> {
-    let response = runtimeHostInteractionBroker()
-        .requestAsync(
-            RuntimeHostInteractionTarget::Controller(currentRuntimeHostInteractionOrigin()),
-            RuntimeHostInteractionRequest::toolPermission(payload),
-            timeout,
-        )
-        .await?;
-    response
-        .toolPermission
-        .ok_or_else(|| "tool permission response payload is missing".to_string())
+/// Returns the permission requests currently pending for one chat.
+pub fn chatToolPermissionRequestsFlow(
+    chatId: String,
+) -> StateFlow<Vec<RuntimeHostInteractionToolPermissionRequest>> {
+    chatToolPermissionBroker()
+        .requests
+        .asStateFlow()
+        .map(move |requests| {
+            requests
+                .into_iter()
+                .filter(|request| request.chatId == chatId)
+                .collect()
+        })
 }
 
-/// Publishes one browser Web Access pairing request to the owner host.
-pub fn publishOwnerWebAccessPairing(payload: RuntimeHostInteractionWebAccessPairingPayload) {
-    runtimeHostInteractionBroker().publish(
-        RuntimeHostInteractionTarget::OwnerHost,
-        RuntimeHostInteractionRequest::webAccessPairing(payload),
-    );
+/// Responds to a permission request through its owning chat scope.
+pub fn respondChatToolPermission(
+    chatId: String,
+    requestId: String,
+    result: String,
+) -> Result<(), String> {
+    chatToolPermissionBroker().respond(&chatId, &requestId, result)
 }
+
+/// Publishes a permission request into its chat state and awaits the chat decision.
+pub async fn requestChatToolPermissionAsync(
+    chatId: String,
+    tool: RuntimeHostInteractionToolPermissionTool,
+    description: String,
+    timeout: Duration,
+) -> Result<String, String> {
+    chatToolPermissionBroker()
+        .request(chatId, tool, description, timeout)
+        .await
+}
+
+
 
 /// Publishes one application notification event to the owner host.
 pub fn publishOwnerAppNotification(payload: RuntimeHostInteractionAppNotificationPayload) {
@@ -1261,24 +1629,6 @@ pub fn publishOwnerAppNotification(payload: RuntimeHostInteractionAppNotificatio
         RuntimeHostInteractionTarget::OwnerHost,
         RuntimeHostInteractionRequest::appNotification(payload),
     );
-}
-
-/// Runs a future with a task-local host interaction origin.
-pub async fn withRuntimeHostInteractionOrigin<F, T>(
-    origin: RuntimeHostInteractionRequestOrigin,
-    future: F,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    RUNTIME_HOST_INTERACTION_ORIGIN.scope(origin, future).await
-}
-
-fn currentRuntimeHostInteractionOrigin() -> RuntimeHostInteractionRequestOrigin {
-    match RUNTIME_HOST_INTERACTION_ORIGIN.try_with(Clone::clone) {
-        Ok(origin) => origin,
-        Err(_) => RuntimeHostInteractionRequestOrigin::LocalOwner,
-    }
 }
 
 fn runtimeHostInteractionBroker() -> &'static RuntimeHostInteractionBroker {
@@ -1290,13 +1640,7 @@ impl RuntimeHostInteractionEventStream {
         if !self.kinds.iter().any(|kind| kind == &pending.request.kind) {
             return false;
         }
-        match pending.request.kind {
-            RuntimeHostInteractionKind::ToolPermission => {
-                pending.target
-                    == RuntimeHostInteractionTarget::Controller(self.controllerOrigin.clone())
-            }
-            _ => pending.target == RuntimeHostInteractionTarget::OwnerHost,
-        }
+        pending.target == RuntimeHostInteractionTarget::OwnerHost
     }
 }
 
@@ -1314,8 +1658,8 @@ impl RuntimeHostInteractionBroker {
         request: RuntimeHostInteractionRequest,
         timeout: Duration,
     ) -> Result<RuntimeHostInteractionResponse, String> {
-        let requestId = request.requestId.clone();
         let startedAt = tryCurrentTimeMillisU128()?;
+        let requestId = request.requestId.clone();
         let mut state = self
             .state
             .lock()
@@ -1427,14 +1771,14 @@ impl RuntimeHostInteractionBroker {
                         .map_err(|error| format!("host interaction mutex poisoned: {error}"))?;
                     if let Some(response) = state.responses.remove(&requestId) {
                         state.pending.remove(&requestId);
-                        self.notifyChanged();
+                                        self.notifyChanged();
                         if let Some(error) = response.error.as_ref() {
                             return Err(error.clone());
                         }
                         return Ok(response);
                     }
                     state.pending.remove(&requestId);
-                    self.notifyChanged();
+                                self.notifyChanged();
                     return Err(format!("host interaction timed out: {requestId}"));
                 }
             }
@@ -1545,42 +1889,7 @@ mod tests {
         MediaPoolManager::remove_media(&invalidAudioId);
     }
 
-    /// Verifies non-blocking owner notifications remain pending until acknowledged.
-    #[test]
-    fn brokerRemovesPublishedNotificationAfterAcknowledgement() {
-        let broker = RuntimeHostInteractionBroker::default();
-        let request = RuntimeHostInteractionRequest::webAccessPairing(
-            RuntimeHostInteractionWebAccessPairingPayload {
-                pairingId: "pairing-1".to_string(),
-                clientDeviceId: "browser-1".to_string(),
-                clientPlatform: "web".to_string(),
-                clientModel: "browser".to_string(),
-                pairingCode: "123456".to_string(),
-                createdAt: 1,
-            },
-        );
-        let requestId = request.requestId.clone();
 
-        broker.publish(RuntimeHostInteractionTarget::OwnerHost, request);
-
-        assert!(broker
-            .state
-            .lock()
-            .expect("host interaction mutex poisoned")
-            .pending
-            .contains_key(&requestId));
-
-        broker
-            .acknowledge(&requestId)
-            .expect("notification acknowledgement must succeed");
-
-        assert!(!broker
-            .state
-            .lock()
-            .expect("host interaction mutex poisoned")
-            .pending
-            .contains_key(&requestId));
-    }
 
     /// Verifies that a structured owner error returns without waiting for timeout.
     #[test]

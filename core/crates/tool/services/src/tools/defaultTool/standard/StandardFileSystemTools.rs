@@ -8,11 +8,15 @@ use operit_host_api::{
     HttpRequestData, RuntimeStorageHost, SystemOperationHost,
 };
 use operit_store::RuntimeFileSyncStore::RuntimeFileSyncStore;
+use operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH;
 
 use crate::runtime_support::{
-    RuntimeStructuredEditAction, RuntimeStructuredEditOperation, ToolRuntimeSupport,
+    RuntimeChatCallRequest, RuntimeStructuredEditAction, RuntimeStructuredEditOperation,
+    ToolRuntimeSupport,
 };
 use operit_host_api::HostManager::HostManager;
+use operit_model::FunctionType::FunctionType;
+use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_tools::files::PathMapper::PathMapper;
 use operit_tools::files::VisualFileSystem::VisualFileSystem;
 use operit_tools::tools::ToolExecutionLimits::ToolExecutionLimits;
@@ -28,14 +32,13 @@ use operit_tools::ToolExecutionManager::{
     AITool, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor, ToolParameter,
     ToolValidationResult,
 };
-use operit_util::ImagePoolManager::ImagePoolManager;
+use operit_util::ChatUtils::ChatUtils;
 use operit_util::DocumentConversionUtil::DocumentConversionUtil;
 use operit_util::FileUtils::FileUtils;
+use operit_util::ImagePoolManager::ImagePoolManager;
 use operit_util::MediaPoolManager::MediaPoolManager;
 use operit_util::OCRUtils::{OCRUtils, Quality as OCRQuality};
-use operit_util::RuntimeStorageLayout::{
-    EXTENSIONS_PLUGIN_CONFIGS_DIR_PATH, RUNTIME_ROOT_PATH_PREFIX, RUNTIME_SYNC_DIR_PATH,
-};
+use operit_util::RuntimeStorageLayout::RUNTIME_ROOT_PATH_PREFIX;
 
 use super::StandardWebVisitTool::StandardWebVisitTool;
 
@@ -79,11 +82,33 @@ impl StandardFileSystemTools {
             PathMapper::new(
                 self.runtimeStoreRoot.clone(),
                 self.workspaceCollectionRoot.clone(),
+                self.runtimeStorageHost.clone(),
             ),
         )
     }
 
-    /// Writes one text file through the synchronized plugin-config store or its mapped host.
+    /// File tools honor registered storage ownership; no extension-specific synchronization.
+    #[allow(non_snake_case)]
+    fn synchronizeMappedChanges<T>(&self, paths: &[&str], change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let mut storagePaths = Vec::new();
+        let mut workspaceChanged = false;
+        for path in paths {
+            let canonical = PathMapper::canonicalizeVfsPath(path)?;
+            workspaceChanged |= PathMapper::relativePath("/app/workspaces", &canonical)?.is_some();
+            if let Some(relative) = PathMapper::relativePath("/app/data", &canonical)? {
+                storagePaths.push(format!("runtime/{relative}"));
+            }
+        }
+        let tracked = || RuntimeFileSyncStore::new(self.runtimeStorageHost.clone(), RUNTIME_SYNC_DIR_PATH)
+            .trackChanges(&storagePaths, change);
+        if workspaceChanged {
+            operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(
+                self.runtimeStorageHost.clone(), RUNTIME_SYNC_DIR_PATH,
+            ).track(tracked)
+        } else { tracked() }
+    }
+
+    /// Writes text and publishes changed Space files, including appended bytes.
     #[allow(non_snake_case)]
     fn writeMappedText(
         &self,
@@ -92,23 +117,10 @@ impl StandardFileSystemTools {
         content: &str,
         append: bool,
     ) -> Result<(), String> {
-        match pluginConfigStoragePath(path)? {
-            Some(storagePath) => {
-                let store = RuntimeFileSyncStore::new(
-                    self.runtimeStorageHost.clone(),
-                    RUNTIME_SYNC_DIR_PATH,
-                );
-                if append {
-                    store.appendBytes(&storagePath, content.as_bytes())
-                } else {
-                    store.writeBytes(&storagePath, content.as_bytes())
-                }
-            }
-            None => vfs.writeFile(path, content, append),
-        }
+        self.synchronizeMappedChanges(&[path], || vfs.writeFile(path, content, append))
     }
 
-    /// Writes one binary file through the synchronized plugin-config store or its mapped host.
+    /// Writes binary data using the same generic file synchronization path.
     #[allow(non_snake_case)]
     fn writeMappedBytes(
         &self,
@@ -116,13 +128,7 @@ impl StandardFileSystemTools {
         path: &str,
         content: &[u8],
     ) -> Result<(), String> {
-        match pluginConfigStoragePath(path)? {
-            Some(storagePath) => {
-                RuntimeFileSyncStore::new(self.runtimeStorageHost.clone(), RUNTIME_SYNC_DIR_PATH)
-                    .writeBytes(&storagePath, content)
-            }
-            None => vfs.writeFileBytes(path, content),
-        }
+        self.synchronizeMappedChanges(&[path], || vfs.writeFileBytes(path, content))
     }
 
     #[allow(non_snake_case)]
@@ -279,13 +285,11 @@ impl StandardFileSystemTools {
                             content,
                         }),
                     ),
-                    Err(error) => {
-                        toolError(
-                            tool,
-                            String::new(),
-                            format!("Error decoding text file: {error}"),
-                        )
-                    }
+                    Err(error) => toolError(
+                        tool,
+                        String::new(),
+                        format!("Error decoding text file: {error}"),
+                    ),
                 }
             }
             Ok(existence) if !existence.exists => {
@@ -465,15 +469,40 @@ impl StandardFileSystemTools {
     }
 
     #[allow(non_snake_case)]
-    /// Reads image files using the requested direct-image mode or the standard OCR mode.
+    /// Reads image files through the same three-stage chain as the Kotlin client:
+    /// direct media link, backend image recognition with intent, then local OCR.
     fn handleImageFileRead(&self, tool: &AITool, vfs: &VisualFileSystem, path: &str) -> ToolResult {
         if parameterBool(tool, "direct_image") {
-            return self.handleDirectImageFileRead(tool, vfs, path);
+            let directResult = self.handleDirectImageFileRead(tool, vfs, path);
+            // A failed direct registration must not abort the read. Kotlin falls back to
+            // intent recognition/OCR when ImagePoolManager cannot register the image.
+            if directResult.success {
+                return directResult;
+            }
         }
-        let physicalPath = match vfs.resolvePath(path) {
-            Ok(resolved) => resolved.physicalPath,
+
+        let physicalPath = match vfs.resolvePath(path).and_then(|resolved| resolved.nativePath()) {
+            Ok(path) => path,
             Err(error) => return toolError(tool, String::new(), error),
         };
+        let intent = optionalParameterValue(tool, "intent")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if !intent.is_empty() {
+            if let Some(recognitionResult) = self.recognizeImageWithIntent(vfs, path, &intent) {
+                return successData(
+                    tool,
+                    ToolResultData::FileContentData(FileContentData {
+                        path: path.to_string(),
+                        size: recognitionResult.len() as i64,
+                        content: recognitionResult,
+                    }),
+                );
+            }
+        }
+
         let content = match self.recognizeImageText(&physicalPath) {
             Ok(ocrText) if ocrText.trim().is_empty() => "No text detected in image.".to_string(),
             Ok(ocrText) => ocrText,
@@ -487,6 +516,63 @@ impl StandardFileSystemTools {
                 content,
             }),
         )
+    }
+
+    #[allow(non_snake_case)]
+    /// Sends an image plus the caller's intent to the configured image-recognition model.
+    /// Returns None on any registration/model failure so the caller can fall back to OCR.
+    fn recognizeImageWithIntent(
+        &self,
+        vfs: &VisualFileSystem,
+        path: &str,
+        intent: &str,
+    ) -> Option<String> {
+        let bytes = match vfs.readFileBytes(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w("StandardFileSystemTools", &format!("unable to read image for intent recognition: {error}"));
+                return None;
+            }
+        };
+        let imageId = ImagePoolManager::add_image_bytes(
+            &bytes,
+            Some(imageMimeTypeFromPath(path)),
+            None,
+        );
+        if imageId == "error" {
+            operit_util::AppLogger::AppLogger::w("StandardFileSystemTools", &format!("unable to register image for intent recognition: {path}"));
+            return None;
+        }
+
+        let prompt = format!("{}\n{}", buildImageMediaLink(&imageId), intent);
+        let request = RuntimeChatCallRequest {
+            functionType: FunctionType::IMAGE_RECOGNITION,
+            turns: vec![PromptTurn::new(PromptTurnKind::USER, prompt)],
+            recordTokenUsage: false,
+            enableThinking: false,
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+            .and_then(|runtime| runtime.block_on(self.runtimeSupport.callChatModel(request)));
+        ImagePoolManager::remove_image(&imageId);
+
+        match result {
+            Ok(output) => {
+                let output = ChatUtils::remove_thinking_content(&output);
+                if !output.trim().is_empty() {
+                    Some(output)
+                } else {
+                    operit_util::AppLogger::AppLogger::w("StandardFileSystemTools", &format!("image recognition returned an empty result: {path}"));
+                    None
+                }
+            }
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w("StandardFileSystemTools", &format!("image recognition failed for {path}: {error}"));
+                None
+            }
+        }
     }
 
     #[allow(non_snake_case)]
@@ -625,7 +711,8 @@ impl StandardFileSystemTools {
         };
         let isTruncated = partContent.len() > ToolExecutionLimits::MAX_FILE_READ_BYTES;
         if isTruncated {
-            partContent = utf8Prefix(&partContent, ToolExecutionLimits::MAX_FILE_READ_BYTES).to_string();
+            partContent =
+                utf8Prefix(&partContent, ToolExecutionLimits::MAX_FILE_READ_BYTES).to_string();
         }
         let mut numbered = addLineNumbers(&partContent, startIndex, totalLines);
         if isTruncated {
@@ -734,7 +821,8 @@ impl StandardFileSystemTools {
         let recursive = parameterBool(tool, "recursive");
         let vfs = self.vfs();
 
-        match vfs.deleteFile(&path, recursive) {
+        match self.synchronizeMappedChanges(&[&path], || vfs.deleteFile(&path, recursive))
+        {
             Ok(()) => successData(
                 tool,
                 fileOperationResult(
@@ -778,7 +866,8 @@ impl StandardFileSystemTools {
         let destPath = parameterValue(tool, "destination");
         let vfs = self.vfs();
 
-        match vfs.moveFile(&sourcePath, &destPath) {
+        match self.synchronizeMappedChanges(&[&sourcePath, &destPath], || vfs.moveFile(&sourcePath, &destPath))
+        {
             Ok(()) => successData(
                 tool,
                 fileOperationResult(
@@ -803,7 +892,8 @@ impl StandardFileSystemTools {
         let recursive = parameterBoolDefaultTrue(tool, "recursive");
         let vfs = self.vfs();
 
-        match vfs.copyFile(&sourcePath, &destPath, recursive) {
+        match self.synchronizeMappedChanges(&[&destPath], || vfs.copyFile(&sourcePath, &destPath, recursive))
+        {
             Ok(()) => successData(
                 tool,
                 fileOperationResult(
@@ -1233,7 +1323,7 @@ impl StandardFileSystemTools {
                     message.to_string(),
                 )];
             }
-            return vec![match vfs.writeFile(&path, &newContent, false) {
+            return vec![match self.writeMappedText(&vfs, &path, &newContent, false) {
                 Ok(()) => {
                     let diffContent = self.runtimeSupport.generateUnifiedDiff("", &newContent);
                     let details = format!("Successfully created new file: {path}");
@@ -1334,7 +1424,7 @@ impl StandardFileSystemTools {
                 aiInstructions,
             )];
         }
-        vec![match vfs.writeFile(&path, &mergedContent, false) {
+        vec![match self.writeMappedText(&vfs, &path, &mergedContent, false) {
             Ok(()) => {
                 let details = format!("Successfully applied AI code to file: {path}");
                 let diffContent = self
@@ -1474,39 +1564,9 @@ pub enum FileSystemToolOperation {
     ShareFile,
 }
 
-/// Maps one ToolPkg or JS plugin configuration VFS file into runtime storage.
-#[allow(non_snake_case)]
-fn pluginConfigStoragePath(vfsPath: &str) -> Result<Option<String>, String> {
-    let relativeRoot = EXTENSIONS_PLUGIN_CONFIGS_DIR_PATH
-        .strip_prefix(RUNTIME_ROOT_PATH_PREFIX)
-        .expect("plugin configuration layout must be below runtime");
-    let vfsRoot = PathMapper::joinVfsPath("/app/data", relativeRoot)?;
-    let Some(relativePath) = PathMapper::relativePath(&vfsRoot, vfsPath)? else {
-        return Ok(None);
-    };
-    if relativePath.is_empty() {
-        return Err("plugin configuration writes must identify a file".to_string());
-    }
-    Ok(Some(format!(
-        "{EXTENSIONS_PLUGIN_CONFIGS_DIR_PATH}/{relativePath}"
-    )))
-}
-
 impl ToolExecutor for FileSystemToolExecutor {
     fn validateParameters(&self, tool: &AITool) -> ToolValidationResult {
-        let names = requiredParameters(&self.operation);
-        for name in names {
-            if parameterValue(tool, name).trim().is_empty() {
-                return ToolValidationResult {
-                    valid: false,
-                    errorMessage: format!("{name} parameter is required"),
-                };
-            }
-        }
-        ToolValidationResult {
-            valid: true,
-            errorMessage: String::new(),
-        }
+        validateOperationParameters(&self.operation, tool)
     }
 
     fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
@@ -1543,11 +1603,17 @@ impl ToolExecutor for FileSystemToolExecutor {
             | FileSystemToolOperation::DownloadFile
             | FileSystemToolOperation::CreateFile
             | FileSystemToolOperation::EditFile
-            | FileSystemToolOperation::OpenFile
             | FileSystemToolOperation::ShareFile => ToolAccessSpec {
                 effect: ToolEffect::WRITE,
                 boundary: ToolBoundary::FilePath {
                     effect: ToolEffect::WRITE,
+                },
+            },
+            // Presentation is an external side effect, but the source only needs read access.
+            FileSystemToolOperation::OpenFile => ToolAccessSpec {
+                effect: ToolEffect::WRITE,
+                boundary: ToolBoundary::FilePath {
+                    effect: ToolEffect::READ,
                 },
             },
             FileSystemToolOperation::ApplyFile => ToolAccessSpec {
@@ -1591,6 +1657,32 @@ impl ToolExecutor for FileSystemToolExecutor {
     }
 }
 
+/// Validates only the required operation fields; write payloads may be empty or omitted.
+#[allow(non_snake_case)]
+fn validateOperationParameters(
+    operation: &FileSystemToolOperation,
+    tool: &AITool,
+) -> ToolValidationResult {
+    for name in requiredParameters(operation) {
+        let parameter = tool
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == *name);
+        if parameter.is_none()
+            || parameter.is_some_and(|parameter| parameter.value.trim().is_empty())
+        {
+            return ToolValidationResult {
+                valid: false,
+                errorMessage: format!("{name} parameter is required"),
+            };
+        }
+    }
+    ToolValidationResult {
+        valid: true,
+        errorMessage: String::new(),
+    }
+}
+
 fn requiredParameters(operation: &FileSystemToolOperation) -> &'static [&'static str] {
     match operation {
         FileSystemToolOperation::ListFiles
@@ -1602,8 +1694,8 @@ fn requiredParameters(operation: &FileSystemToolOperation) -> &'static [&'static
         | FileSystemToolOperation::FileExists
         | FileSystemToolOperation::MakeDirectory
         | FileSystemToolOperation::FileInfo => &["path"],
-        FileSystemToolOperation::WriteFile => &["path", "content"],
-        FileSystemToolOperation::WriteFileBinary => &["path", "base64Content"],
+        // Empty or omitted payloads intentionally write an empty file; only the target path is required.
+        FileSystemToolOperation::WriteFile | FileSystemToolOperation::WriteFileBinary => &["path"],
         FileSystemToolOperation::MoveFile | FileSystemToolOperation::CopyFile => {
             &["source", "destination"]
         }
@@ -1904,4 +1996,43 @@ fn isSpecialFileType(fileExtension: &str) -> bool {
             | "avi"
             | "m4v"
     )
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+
+    /// Covers real write validation without needing a filesystem or a successful host fixture.
+    #[test]
+    fn writes_accept_empty_or_missing_payload_but_reject_blank_path() {
+        for (operation, field) in [
+            (FileSystemToolOperation::WriteFile, "content"),
+            (FileSystemToolOperation::WriteFileBinary, "base64Content"),
+        ] {
+            let mut tool = AITool {
+                name: "write".to_string(),
+                parameters: vec![
+                    ToolParameter {
+                        name: "path".to_string(),
+                        value: "/USER.md".to_string(),
+                    },
+                    ToolParameter {
+                        name: field.to_string(),
+                        value: String::new(),
+                    },
+                ],
+            };
+            assert!(validateOperationParameters(&operation, &tool).valid);
+            tool.parameters[1].value = " ".to_string();
+            assert!(validateOperationParameters(&operation, &tool).valid);
+            tool.parameters.pop();
+            assert!(validateOperationParameters(&operation, &tool).valid);
+            tool.parameters.push(ToolParameter {
+                name: field.to_string(),
+                value: String::new(),
+            });
+            tool.parameters[0].value = " ".to_string();
+            assert!(!validateOperationParameters(&operation, &tool).valid);
+        }
+    }
 }

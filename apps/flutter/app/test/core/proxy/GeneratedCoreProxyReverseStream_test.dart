@@ -15,6 +15,40 @@ import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart';
 
 /// Verifies generated reverse-stream clients serialize structured item values.
 void main() {
+  test('concurrent compose submissions own distinct push streams', () async {
+    final bridge = _ConcurrentPushBridge();
+    final clients = GeneratedCoreProxyClients(bridge);
+
+    await Future.wait([
+      for (var index = 0; index < 1024; index++)
+        clients.servicesComposeDslSessionService.submit(
+          sessionId: 'session-$index',
+          commands: const Stream<ToolPkgComposeDslCommand>.empty(),
+        ),
+    ]);
+
+    expect(bridge.requests, hasLength(1024));
+    expect(
+      bridge.requests.map((request) => request.requestId).toSet(),
+      hasLength(1024),
+    );
+    expect(bridge.sinks.every((sink) => sink.closed), isTrue);
+  });
+
+  test(
+    'device space watch decodes membership and online changes together',
+    () async {
+      final bridge = _DeviceSpaceBridge();
+      final snapshots = await GeneratedCoreProxyClients(
+        bridge,
+      ).server.runtimeRemoteLinkService.deviceSpaceSnapshotFlow().toList();
+      expect(bridge.watchRequest?.propertyName, 'deviceSpaceSnapshotFlow');
+      expect(snapshots.map((s) => s.space.members.length), [1, 2, 2]);
+      expect(snapshots.map((s) => s.topology.devices.length), [1, 2, 2]);
+      expect(snapshots[1].topology.devices.last.online, isTrue);
+      expect(snapshots[2].topology.devices.last.online, isFalse);
+    },
+  );
   test('browser interaction stream sends a Link map', () async {
     final bridge = _RecordingBridge();
     const command = RuntimeBrowserCommand(
@@ -85,7 +119,7 @@ void main() {
       final bridge = ProxyCoreRuntimeBridge(coreProxy: proxy);
       final firstStream = bridge.openEmbeddedCoreStream<MarkdownStreamEvent>(
         'stream-ai',
-        64,
+        'core/test64',
         'openCoreStream',
         <String, Object?>{'streamId': 'stream-ai'},
         MarkdownStreamEvent.fromMessagePack,
@@ -97,7 +131,7 @@ void main() {
 
       final secondStream = bridge.openEmbeddedCoreStream<MarkdownStreamEvent>(
         'stream-ai',
-        64,
+        'core/test64',
         'openCoreStream',
         <String, Object?>{'streamId': 'stream-ai'},
         MarkdownStreamEvent.fromMessagePack,
@@ -110,6 +144,26 @@ void main() {
       expect(proxy.embeddedWatchOpenCount, 1);
     },
   );
+
+  test('embedded stream values retain slices of their source bytes', () async {
+    final proxy = _GeneratedFlowCoreProxy();
+    final bridge = ProxyCoreRuntimeBridge(coreProxy: proxy);
+    final bytes = encodeCoreLink(Uint8List.fromList([7, 9]));
+    proxy.embeddedValueBytes = bytes;
+    final values = await bridge
+        .openEmbeddedCoreStream<Uint8List>(
+          'binary-stream',
+          'core/test64',
+          'openCoreStream',
+          null,
+          (reader) => reader.readBytes(),
+        )
+        .toList();
+    expect(values.single, [7, 9]);
+    bytes[bytes.length - 1] = 42;
+    expect(values.single, [7, 42]);
+    expect(proxy.embeddedWatchOpenCount, 1);
+  });
 }
 
 /// Records the values a generated Core client submits to its Link bridge.
@@ -140,7 +194,7 @@ class _RecordingBridge extends OperitRuntimeBridge {
   @override
   Stream<T> openEmbeddedCoreStream<T>(
     String streamId,
-    int targetObjectId,
+    String target,
     String propertyName,
     Object? args,
     T Function(CoreLinkValueReader reader) decode,
@@ -179,7 +233,64 @@ class _RecordingPushSink implements CorePushSink {
   }
 }
 
+/// Enforces the shared runtime's duplicate-id rejection for concurrent streams.
+class _ConcurrentPushBridge extends _RecordingBridge {
+  final List<CorePushRequest> requests = [];
+  final List<_RecordingPushSink> sinks = [];
+  final Set<String> _openedIds = {};
+
+  /// Reserves each request id and gives every accepted stream its own sink.
+  @override
+  Future<CorePushSink> push(CorePushRequest request) async {
+    if (!_openedIds.add(request.requestId)) {
+      throw const CoreLinkError(
+        code: 'PUSH_ALREADY_EXISTS',
+        message: 'Link push stream already exists',
+      );
+    }
+    requests.add(request);
+    final sink = _RecordingPushSink();
+    sinks.add(sink);
+    return sink;
+  }
+}
+
 /// Emits generated watch events that mimic a streamed AI message update.
+class _DeviceSpaceBridge extends _GeneratedFlowBridge {
+  @override
+  Stream<CoreEvent> watchStream(CoreWatchRequest request) async* {
+    watchRequest = request;
+    for (var step = 0; step < 3; step++) {
+      final members = ['ios', if (step > 0) 'mac'];
+      yield _rawGeneratedEvent(request, 'Snapshot', {
+        'space': {
+          'spaceId': 'space-test',
+          'spaceName': 'test',
+          'spaceRevision': step == 0 ? 1 : 2,
+          'members': members,
+        },
+        'topology': {
+          'currentDeviceId': 'ios',
+          'connections': <Object?>[],
+          'devices': [
+            for (final id in members)
+              {
+                'deviceId': id,
+                'userName': '',
+                'deviceName': id,
+                'platform': id,
+                'model': 'test',
+                'coreVersion': null,
+                'currentIdentity': null,
+                'online': id == 'ios' || step == 1,
+              },
+          ],
+        },
+      });
+    }
+  }
+}
+
 class _GeneratedFlowBridge extends OperitRuntimeBridge {
   CoreWatchRequest? watchRequest;
   final openedStreamIds = <String>[];
@@ -206,7 +317,7 @@ class _GeneratedFlowBridge extends OperitRuntimeBridge {
   @override
   Stream<T> openEmbeddedCoreStream<T>(
     String streamId,
-    int targetObjectId,
+    String target,
     String propertyName,
     Object? args,
     T Function(CoreLinkValueReader reader) decode,
@@ -257,7 +368,16 @@ class _GeneratedFlowBridge extends OperitRuntimeBridge {
 /// Emits generated watch events through the production ProxyCoreRuntimeBridge path.
 class _GeneratedFlowCoreProxy extends CoreProxy {
   CoreWatchRequest? outerWatchRequest;
+  Uint8List embeddedValueBytes = encodeCoreLink(
+    _markdownStreamEventValue('hello'),
+  );
   var embeddedWatchOpenCount = 0;
+
+  /// Rejects offline rescue calls because this test only exercises watch streams.
+  @override
+  Future<Object?> dataRescue(Map<String, Object?> request) {
+    throw UnimplementedError();
+  }
 
   /// Rejects storage default reads because this test only exercises watch streams.
   @override
@@ -341,10 +461,14 @@ class _GeneratedFlowCoreProxy extends CoreProxy {
     }
     if (request.propertyName == 'openCoreStream') {
       embeddedWatchOpenCount += 1;
-      yield _rawGeneratedEvent(
-        request,
-        'Snapshot',
-        _markdownStreamEventValue('hello'),
+      yield CoreEvent.raw(
+        requestId: request.requestId,
+        target: request.target,
+        propertyName: request.propertyName,
+        kind: 'Snapshot',
+        valueBytes: embeddedValueBytes,
+        decodeValue: (_) =>
+            throw StateError('embedded values require typed decoding'),
       );
       yield _rawGeneratedEvent(request, 'Completed', null);
       return;
@@ -361,7 +485,7 @@ CoreEvent _rawGeneratedEvent(
 ) {
   return CoreEvent.raw(
     requestId: request.requestId,
-    targetObjectId: request.targetObjectId,
+    target: request.target,
     propertyName: request.propertyName,
     kind: kind,
     valueBytes: encodeCoreLink(value),
@@ -390,6 +514,7 @@ Map<String, Object?> _chatMessageValue({required Object? contentStream}) {
     'displayMode': 'NORMAL',
     'isFavorite': false,
     'contentStream': contentStream,
+    'pluginExtensions': <String, Object?>{},
   };
 }
 
@@ -398,7 +523,7 @@ Map<String, Object?> _streamDescriptorValue(String streamId) {
   return <String, Object?>{
     r'$coreStream': <String, Object?>{
       'streamId': streamId,
-      'targetObjectId': 64,
+      'target': 'core/test64',
       'propertyName': 'openCoreStream',
       'args': <String, Object?>{'streamId': streamId},
     },

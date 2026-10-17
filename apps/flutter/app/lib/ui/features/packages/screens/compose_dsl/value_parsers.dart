@@ -99,19 +99,53 @@ EdgeInsets? _commonPaddingFromProps(Map<String, Object?> props) {
       vertical: vertical ?? 0,
     );
   }
-  if (props['contentPadding'] != null) {
-    return _edgeInsetsFromValue(props['contentPadding']);
-  }
   return null;
 }
 
-/// Uses spaced-by gap only when the arrangement is the Compose start default.
+/// Preserves fixed gaps in aligned groups; distributed arrangements own their gaps.
 double _flexSpacing(Object? arrangement, Object? spacing) {
   final token = _normalizeToken(_string(arrangement));
-  if (token.isNotEmpty && token != 'start') {
+  if (token == 'spacebetween' ||
+      token == 'spacearound' ||
+      token == 'spaceevenly') {
     return 0;
   }
   return _number(spacing) ?? 0;
+}
+
+/// Resolves a flow-line gap while preserving distributed arrangement behavior.
+double _flowSpacing(Object? arrangement, Object? spacing) =>
+    _flexSpacing(arrangement, spacing);
+
+/// Resolves a Compose arrangement for Flutter's flow layout.
+WrapAlignment _wrapAlignment(Object? raw) {
+  final token = _string(raw);
+  if (token.isEmpty) {
+    return WrapAlignment.start;
+  }
+  return switch (token) {
+    'start' => WrapAlignment.start,
+    'center' => WrapAlignment.center,
+    'end' => WrapAlignment.end,
+    'spaceBetween' => WrapAlignment.spaceBetween,
+    'spaceAround' => WrapAlignment.spaceAround,
+    'spaceEvenly' => WrapAlignment.spaceEvenly,
+    _ => throw FormatException('Invalid FlowRow arrangement: $raw'),
+  };
+}
+
+/// Resolves a Compose item alignment for Flutter's flow layout.
+WrapCrossAlignment _wrapCrossAxis(Object? raw) {
+  final token = _string(raw);
+  if (token.isEmpty) {
+    return WrapCrossAlignment.start;
+  }
+  return switch (token) {
+    'start' => WrapCrossAlignment.start,
+    'center' => WrapCrossAlignment.center,
+    'end' => WrapCrossAlignment.end,
+    _ => throw FormatException('Invalid FlowRow item alignment: $raw'),
+  };
 }
 
 /// Resolves modifier ops for the Compose DSL renderer.
@@ -199,6 +233,7 @@ TextStyle? _textStyle(BuildContext context, Map<String, Object?> props) {
   return _scaledTextStyle(style!, _number(props['fontSize'])).copyWith(
     color: _color(context, props['color']),
     fontWeight: _fontWeight(_string(props['fontWeight'])),
+    letterSpacing: _number(props['letterSpacing']),
   );
 }
 
@@ -265,11 +300,11 @@ Alignment _alignment(Object? raw) {
     'center' => Alignment.center,
     'topCenter' || 'centerTop' => Alignment.topCenter,
     'topEnd' || 'endTop' => Alignment.topRight,
-    'centerEnd' || 'endCenter' => Alignment.centerRight,
+    'end' || 'centerEnd' || 'endCenter' => Alignment.centerRight,
     'bottomEnd' || 'endBottom' => Alignment.bottomRight,
     'bottomCenter' || 'centerBottom' => Alignment.bottomCenter,
     'bottomStart' || 'startBottom' => Alignment.bottomLeft,
-    'centerStart' || 'startCenter' => Alignment.centerLeft,
+    'start' || 'centerStart' || 'startCenter' => Alignment.centerLeft,
     _ => Alignment.topLeft,
   };
 }
@@ -392,6 +427,26 @@ Color? _colorToken(ColorScheme scheme, String token) {
     'onTertiaryContainer' => scheme.onTertiaryContainer,
     'surface' => scheme.surface,
     'onSurface' => scheme.onSurface,
+    'surfaceDim' => scheme.surfaceDim,
+    'surfaceBright' => scheme.surfaceBright,
+    'surfaceContainerLowest' => scheme.surfaceContainerLowest,
+    'surfaceContainerLow' => scheme.surfaceContainerLow,
+    'surfaceContainer' => scheme.surfaceContainer,
+    'surfaceContainerHigh' => scheme.surfaceContainerHigh,
+    'surfaceContainerHighest' => scheme.surfaceContainerHighest,
+    'shadow' => scheme.shadow,
+    'primaryFixed' => scheme.primaryFixed,
+    'primaryFixedDim' => scheme.primaryFixedDim,
+    'onPrimaryFixed' => scheme.onPrimaryFixed,
+    'onPrimaryFixedVariant' => scheme.onPrimaryFixedVariant,
+    'secondaryFixed' => scheme.secondaryFixed,
+    'secondaryFixedDim' => scheme.secondaryFixedDim,
+    'onSecondaryFixed' => scheme.onSecondaryFixed,
+    'onSecondaryFixedVariant' => scheme.onSecondaryFixedVariant,
+    'tertiaryFixed' => scheme.tertiaryFixed,
+    'tertiaryFixedDim' => scheme.tertiaryFixedDim,
+    'onTertiaryFixed' => scheme.onTertiaryFixed,
+    'onTertiaryFixedVariant' => scheme.onTertiaryFixedVariant,
     'surfaceVariant' => scheme.surfaceContainerHighest,
     'onSurfaceVariant' => scheme.onSurfaceVariant,
     'background' => scheme.surface,
@@ -413,35 +468,7 @@ Color? _colorToken(ColorScheme scheme, String token) {
 
 /// Resolves icon data for the Compose DSL renderer.
 IconData _iconData(String name) {
-  final alias = switch (name) {
-    'add' || 'plus' => Icons.add,
-    'close' => Icons.close,
-    'check' => Icons.check,
-    'settings' => Icons.settings,
-    'search' => Icons.search,
-    'delete' => Icons.delete_outline,
-    'edit' => Icons.edit_outlined,
-    'refresh' => Icons.refresh,
-    'download' => Icons.download,
-    'upload' => Icons.upload,
-    'save' => Icons.save_outlined,
-    'home' => Icons.home_outlined,
-    'info' => Icons.info_outline,
-    'warning' => Icons.warning_amber_outlined,
-    'person' || 'account' => Icons.person_outline,
-    'folder' => Icons.folder_outlined,
-    'file' => Icons.insert_drive_file_outlined,
-    'play' => Icons.play_arrow,
-    'pause' => Icons.pause,
-    'stop' => Icons.stop,
-    'menu' => Icons.menu,
-    'more' || 'moreVert' => Icons.more_vert,
-    'arrowBack' || 'back' => Icons.arrow_back,
-    'arrowForward' || 'forward' => Icons.arrow_forward,
-    _ => null,
-  };
-  return alias ??
-      MaterialIconNameResolver.resolveOrDefault(name, Icons.widgets_outlined);
+  return MaterialIconNameResolver.resolve(name);
 }
 
 /// Resolves box fit for the Compose DSL renderer.
@@ -520,9 +547,7 @@ String _requiredActionId(Object? raw, String propertyName) {
 /// Resolves string map for the Compose DSL renderer.
 Map<String, Object?> _stringMap(Object? raw) {
   if (raw is Map) {
-    return raw.map(
-      (key, value) => MapEntry(key.toString(), value as Object?),
-    );
+    return raw.map((key, value) => MapEntry(key.toString(), value as Object?));
   }
   return <String, Object?>{};
 }

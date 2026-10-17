@@ -24,7 +24,7 @@ impl SourceRoot {
 
 #[derive(Clone, Debug)]
 pub struct ObjectSpec {
-    pub object_id: u32,
+    pub object_id: String,
     pub schema_key: String,
     pub dispatch_name: String,
     pub type_name: String,
@@ -138,7 +138,7 @@ impl TypeRegistry {
 
 #[derive(Clone, Debug)]
 pub struct SourceObject {
-    pub object_id: u32,
+    pub object_id: String,
     pub schema_key: String,
     pub dispatch_name: String,
     pub full_type: String,
@@ -214,6 +214,8 @@ pub struct SourceMethod {
     pub args: Vec<SourceArg>,
     pub rust_return_type: String,
     pub is_async: bool,
+    /// Marks a synchronous capture method returning an explicitly owned future.
+    pub returns_owned_future: bool,
     pub cfg_attrs: Vec<String>,
     pub doc_lines: Vec<String>,
     pub protocol: MethodProtocol,

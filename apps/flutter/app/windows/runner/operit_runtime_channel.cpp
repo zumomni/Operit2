@@ -35,10 +35,6 @@ using BridgeCreate = BridgeHandle (*)();
 using BridgeCreateWithStorageRoots = BridgeHandle (*)(const char*, const char*);
 using BridgeCreateError = char* (*)();
 using BridgeDestroy = void (*)(BridgeHandle);
-using BridgeStartWebAccessServer =
-    char* (*)(BridgeHandle, const char*, const char*, const char*, const char*,
-              const char*, const char*, const char*);
-using BridgeStopWebAccessServer = char* (*)(BridgeHandle);
 using BridgeFreeString = void (*)(char*);
 using BridgeRuntimeBootstrapRead = char* (*)(const char*);
 using BridgeRuntimeBootstrapWrite = char* (*)(const char*, const char*);
@@ -105,6 +101,21 @@ bool InvokeRuntimeBootstrapStorage(const std::string& default_runtime_root,
   }
   free_string(raw);
   FreeLibrary(library);
+  return true;
+}
+
+/// Invokes maintenance on a permanently mapped bridge without constructing a Core handle.
+bool InvokeDataRescue(const std::string& root, const std::string& request,
+                     std::string* response, std::string* error) {
+  static HMODULE library = LoadLibraryW(L"operit_flutter_bridge.dll");
+  if (library == nullptr) { *error = "operit_flutter_bridge.dll was not found"; return false; }
+  const auto call = reinterpret_cast<BridgeRuntimeBootstrapWrite>(GetProcAddress(library, "operit_flutter_bridge_data_rescue"));
+  const auto release = reinterpret_cast<BridgeFreeString>(GetProcAddress(library, "operit_flutter_bridge_free_string"));
+  if (call == nullptr || release == nullptr) { *error = "Data rescue ABI is incomplete"; return false; }
+  char* raw = call(root.c_str(), request.c_str());
+  if (raw == nullptr) { *error = "Data rescue returned null"; return false; }
+  *response = raw;
+  release(raw);
   return true;
 }
 
@@ -678,15 +689,11 @@ class OperitRuntimeLibrary {
           GetProcAddress(library_, "operit_flutter_bridge_create_error"));
       destroy_ = reinterpret_cast<BridgeDestroy>(
           GetProcAddress(library_, "operit_flutter_bridge_destroy"));
-      start_web_access_server_ = reinterpret_cast<BridgeStartWebAccessServer>(
-          GetProcAddress(library_, "operit_flutter_bridge_start_web_access_server"));
-      stop_web_access_server_ = reinterpret_cast<BridgeStopWebAccessServer>(
-          GetProcAddress(library_, "operit_flutter_bridge_stop_web_access_server"));
       free_string_ = reinterpret_cast<BridgeFreeString>(
           GetProcAddress(library_, "operit_flutter_bridge_free_string"));
 
       if (create_ == nullptr || create_with_storage_roots_ == nullptr ||
-          destroy_ == nullptr || start_web_access_server_ == nullptr || stop_web_access_server_ == nullptr ||
+          destroy_ == nullptr ||
           free_string_ == nullptr) {
         AssignError(error, "operit flutter bridge exports are incomplete");
         return false;
@@ -718,31 +725,7 @@ class OperitRuntimeLibrary {
     return TakeBridgeString(connect(handle_), response, error);
   }
 
-  bool StartWebAccessServer(const std::string& bind_address,
-                            const std::string& token,
-                            const std::string& shutdown_token,
-                            const std::string& web_root,
-                            const std::string& device_info,
-                            const std::string& enable_web_access,
-                            const std::string& enable_discovery,
-                            std::string* response, std::string* error) {
-    if (!EnsureReadyThreadSafe(error)) {
-      return false;
-    }
-      char* raw_response = start_web_access_server_(
-          handle_, bind_address.c_str(), token.c_str(), shutdown_token.c_str(),
-          web_root.c_str(), device_info.c_str(), enable_web_access.c_str(),
-          enable_discovery.c_str());
-    return TakeBridgeString(raw_response, response, error);
-  }
 
-  bool StopWebAccessServer(std::string* response, std::string* error) {
-    if (!EnsureReadyThreadSafe(error)) {
-      return false;
-    }
-    char* raw_response = stop_web_access_server_(handle_);
-    return TakeBridgeString(raw_response, response, error);
-  }
 
   /// Sets the runtime and workspace roots used when the runtime handle is created.
   bool SetStorageRoots(const std::string& runtime_root,
@@ -820,8 +803,6 @@ class OperitRuntimeLibrary {
   BridgeCreateWithStorageRoots create_with_storage_roots_ = nullptr;
   BridgeCreateError create_error_ = nullptr;
   BridgeDestroy destroy_ = nullptr;
-  BridgeStartWebAccessServer start_web_access_server_ = nullptr;
-  BridgeStopWebAccessServer stop_web_access_server_ = nullptr;
   BridgeFreeString free_string_ = nullptr;
 };
 
@@ -1180,6 +1161,18 @@ void RegisterOperitRuntimeChannel(flutter::FlutterEngine* engine, HWND window) {
           result->Success(WindowsStoragePaths(runtime_root, workspace_root));
           return;
         }
+        if (method_call.method_name() == "dataRescue") {
+          const auto* request = StringArgument(method_call);
+          if (request == nullptr) { result->Error("INVALID_ARGS", "dataRescue expects JSON text"); return; }
+          std::string root;
+          std::string workspace;
+          if (!ResolveWindowsDefaultStorageRoots(&root, &workspace, &error)) { result->Error("DATA_RESCUE_ERROR", error); return; }
+          RespondRuntimeStringAsync(channel_owner,
+            [root, request = *request](std::string* response, std::string* error) {
+              return InvokeDataRescue(root, request, response, error);
+            }, std::move(result));
+          return;
+        }
         if (method_call.method_name().compare(
                 "runtimeBootstrapRead") == 0) {
           std::string runtime_root;
@@ -1273,45 +1266,6 @@ void RegisterOperitRuntimeChannel(flutter::FlutterEngine* engine, HWND window) {
               std::move(result));
           return;
         }
-        if (method_call.method_name().compare("startWebAccessServer") == 0) {
-          const std::string* bind_address =
-              StringMapValue(method_call, "bindAddress");
-          const std::string* token = StringMapValue(method_call, "token");
-          const std::string* shutdown_token =
-              StringMapValue(method_call, "shutdownToken");
-          const std::string* web_root = StringMapValue(method_call, "webRoot");
-          const std::string* device_info =
-              StringMapValue(method_call, "deviceInfo");
-          const std::string* enable_web_access =
-              StringMapValue(method_call, "enableWebAccess");
-          const std::string* enable_discovery =
-              StringMapValue(method_call, "enableDiscovery");
-          if (bind_address == nullptr || token == nullptr ||
-                shutdown_token == nullptr || web_root == nullptr ||
-                device_info == nullptr ||
-                enable_web_access == nullptr || enable_discovery == nullptr) {
-              result->Error("INVALID_ARGS",
-                           "startWebAccessServer expects bindAddress, token, shutdownToken, webRoot, deviceInfo, enableWebAccess and enableDiscovery");
-              return;
-            }
-          RespondRuntimeStringAsync(
-              channel_owner,
-              [runtime_library,
-               bind_address = *bind_address,
-               token = *token,
-               shutdown_token = *shutdown_token,
-               web_root = *web_root,
-               device_info = *device_info,
-               enable_web_access = *enable_web_access,
-               enable_discovery = *enable_discovery](
-                  std::string* response, std::string* operation_error) {
-                return runtime_library->StartWebAccessServer(
-                    bind_address, token, shutdown_token, web_root, device_info, enable_web_access,
-                    enable_discovery, response, operation_error);
-              },
-              std::move(result));
-          return;
-        }
         if (method_call.method_name().compare(
                 "hostOnboardingPermissionSnapshot") == 0) {
           const std::string* host_id = StringMapValue(method_call, "hostId");
@@ -1342,17 +1296,6 @@ void RegisterOperitRuntimeChannel(flutter::FlutterEngine* engine, HWND window) {
           }
           result->Error("INVALID_ONBOARDING_REQUIREMENT",
                         "Invalid onboarding requirement");
-          return;
-        }
-        if (method_call.method_name().compare("stopWebAccessServer") == 0) {
-          RespondRuntimeStringAsync(
-              channel_owner,
-              [runtime_library](
-                  std::string* response, std::string* operation_error) {
-                return runtime_library->StopWebAccessServer(
-                    response, operation_error);
-              },
-              std::move(result));
           return;
         }
         result->NotImplemented();

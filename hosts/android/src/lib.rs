@@ -13,6 +13,7 @@ use operit_host_api::RuntimeStorageHost;
 mod audio_playback;
 mod bluetooth;
 mod filesystem;
+mod document_filesystem;
 mod http;
 #[cfg(target_os = "android")]
 mod local_inference;
@@ -65,6 +66,7 @@ pub fn createRuntimeHostManager(
     runtimeRoot: PathBuf,
     workspaceRoot: PathBuf,
     webVisitHost: Arc<dyn operit_host_api::WebVisitHost>,
+    systemOperationHost: Arc<dyn operit_host_api::SystemOperationHost>,
 ) -> HostManager {
     installAndroidLogSink();
     let runtimeStorageWriteHost =
@@ -84,18 +86,22 @@ pub fn createRuntimeHostManager(
         Arc::new(AndroidFileSystemHost::new()),
         webVisitHost,
         Arc::new(AndroidHttpHost::new()),
-        Arc::new(AndroidSystemOperationHost::new()),
+        systemOperationHost,
         Arc::new(AndroidManagedRuntimeHost::new()),
         runtimeStorageHost,
         runtimeSqliteHost,
     )
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(AndroidHttpHost::new()))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
+    .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
     .withRuntimeStorageWriteHost(runtimeStorageWriteHost)
     .withLocalInferenceHost(Arc::new(AndroidLocalInferenceHost::new()))
     .withHostRuntimeEventSchedulerHost(Arc::new(AndroidHostRuntimeEventSchedulerHost::new()))
     .withHostJavaScriptRuntimeHost(Arc::new(AndroidHostJavaScriptRuntimeHost::new()))
+    .withServiceDiscoveryHost(Arc::new(operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::default()))
     .withHostRuntimeTaskSchedulerHost(Arc::new(AndroidHostRuntimeTaskSchedulerHost::new()))
     .withPluginSdkIpcHost(Arc::new(AndroidPluginSdkIpcHost::new()))
 }

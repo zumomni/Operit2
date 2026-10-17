@@ -20,6 +20,7 @@ pub struct LlmRequestTraceContext {
 pub enum ProviderServiceKind {
     OpenAIProvider,
     OpenAIResponsesProvider,
+    OpenCodeProvider,
     ClaudeProvider,
     GeminiProvider,
     OllamaProvider,
@@ -71,6 +72,18 @@ pub enum ProviderCreateParams {
         builtin_tools: Vec<ModelBuiltinTool>,
         enable_tool_call: bool,
     },
+    OpenCodeProvider {
+        api_endpoint: String,
+        api_key_provider: ApiKeyProviderSpec,
+        model_name: String,
+        custom_headers: BTreeMap<String, String>,
+        protocol: ApiProviderType,
+        supports_vision: bool,
+        supports_audio: bool,
+        supports_video: bool,
+        builtin_tools: Vec<ModelBuiltinTool>,
+        enable_tool_call: bool,
+    },
     ClaudeProvider {
         api_endpoint: String,
         api_key_provider: ApiKeyProviderSpec,
@@ -78,6 +91,7 @@ pub enum ProviderCreateParams {
         custom_headers: BTreeMap<String, String>,
         provider_type: ApiProviderType,
         enable_tool_call: bool,
+        enable_claude_1h_prompt_cache: bool,
     },
     GeminiProvider {
         api_endpoint: String,
@@ -270,6 +284,7 @@ impl AIServiceFactory {
         let supports_audio = config.capabilities.directAudio;
         let supports_video = config.capabilities.directVideo;
         let enable_tool_call = config.capabilities.toolCall;
+        let enable_claude_1h_prompt_cache = config.request.enableClaude1hPromptCache;
         let builtin_tools = config.builtinTools.clone();
         let model_name = config.modelId.clone();
         let provider_type = request.provider_type;
@@ -307,11 +322,18 @@ impl AIServiceFactory {
                     enable_tool_call,
                 )
             }
-            ApiProviderType::OPENAI_CODEX => {
-                return Err(AiServiceError::ProviderNotImplemented(
-                    "OPENAI_CODEX chat inference".to_string(),
-                ));
-            }
+            ApiProviderType::OPENAI_CODEX => Self::open_ai_responses_provider(
+                api_endpoint,
+                api_key_provider,
+                model_name,
+                custom_headers,
+                provider_type,
+                supports_vision,
+                supports_audio,
+                supports_video,
+                builtin_tools,
+                enable_tool_call,
+            ),
             ApiProviderType::ANTHROPIC | ApiProviderType::ANTHROPIC_GENERIC => {
                 Self::claude_provider(
                     api_endpoint,
@@ -320,6 +342,7 @@ impl AIServiceFactory {
                     custom_headers,
                     provider_type,
                     enable_tool_call,
+                    enable_claude_1h_prompt_cache,
                 )
             }
             ApiProviderType::GOOGLE | ApiProviderType::GEMINI_GENERIC => Self::gemini_provider(
@@ -458,9 +481,17 @@ impl AIServiceFactory {
                 enable_tool_call,
             ),
             ApiProviderType::OPENCODE => {
-                return Err(AiServiceError::ProviderNotImplemented(
-                    "OPENCODE chat inference".to_string(),
-                ));
+                Self::open_code_provider(
+                    api_endpoint,
+                    api_key_provider,
+                    model_name,
+                    custom_headers,
+                    supports_vision,
+                    supports_audio,
+                    supports_video,
+                    builtin_tools,
+                    enable_tool_call,
+                )
             }
             ApiProviderType::FOUR_ROUTER => Self::four_router_provider(
                 api_endpoint,
@@ -592,6 +623,49 @@ impl AIServiceFactory {
         })
     }
 
+    /// Builds the OpenCode routing provider spec.
+    fn open_code_provider(
+        api_endpoint: String,
+        api_key_provider: ApiKeyProviderSpec,
+        model_name: String,
+        custom_headers: BTreeMap<String, String>,
+        supports_vision: bool,
+        supports_audio: bool,
+        supports_video: bool,
+        builtin_tools: Vec<ModelBuiltinTool>,
+        enable_tool_call: bool,
+    ) -> Result<ProviderServiceSpec, AiServiceError> {
+        let model_name = model_name.trim();
+        let model_name = if let Some(value) = model_name.strip_prefix("opencode/") {
+            value
+        } else if let Some(value) = model_name.strip_prefix("opencode-go/") {
+            value
+        } else {
+            model_name
+        }
+        .to_string();
+        let protocol = crate::chat::llmprovider::OpenCodeProvider::OpenCodeRouting::protocol_for(
+            &api_endpoint,
+            &model_name,
+        )
+        .map_err(AiServiceError::RequestFailed)?;
+        Ok(ProviderServiceSpec {
+            kind: ProviderServiceKind::OpenCodeProvider,
+            params: ProviderCreateParams::OpenCodeProvider {
+                api_endpoint,
+                api_key_provider,
+                model_name,
+                custom_headers,
+                protocol,
+                supports_vision,
+                supports_audio,
+                supports_video,
+                builtin_tools,
+                enable_tool_call,
+            },
+        })
+    }
+
     /// Builds a DeepSeek provider spec.
     fn deepseek_provider(
         api_endpoint: String,
@@ -660,6 +734,7 @@ impl AIServiceFactory {
         custom_headers: BTreeMap<String, String>,
         provider_type: ApiProviderType,
         enable_tool_call: bool,
+        enable_claude_1h_prompt_cache: bool,
     ) -> Result<ProviderServiceSpec, AiServiceError> {
         Ok(ProviderServiceSpec {
             kind: ProviderServiceKind::ClaudeProvider,
@@ -670,6 +745,7 @@ impl AIServiceFactory {
                 custom_headers,
                 provider_type,
                 enable_tool_call,
+                enable_claude_1h_prompt_cache,
             },
         })
     }

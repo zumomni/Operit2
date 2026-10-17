@@ -25,6 +25,7 @@ class UserMessageComposable extends StatefulWidget {
 }
 
 class _UserMessageComposableState extends State<UserMessageComposable> {
+  /// Builds the user message content without a prompt heading.
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -34,7 +35,6 @@ class _UserMessageComposableState extends State<UserMessageComposable> {
     final themePreferenceSnapshot = OperitTheme.of(
       context,
     ).themePreferenceSnapshot;
-    final showUserName = themePreferenceSnapshot.showUserName;
     final bubbleColor =
         _optionalColor(
           widget.useBubbleStyle
@@ -211,21 +211,6 @@ class _UserMessageComposableState extends State<UserMessageComposable> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            if (showUserName) ...<Widget>[
-                              Text(
-                                parseResult.proxySenderName == null
-                                    ? 'Prompt'
-                                    : 'Prompt by ${parseResult.proxySenderName}',
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  color: effectiveTextColor.withValues(
-                                    alpha: 0.7,
-                                  ),
-                                  fontFamily: messageFontFamily,
-                                  fontFamilyFallback: messageFontFamilyFallback,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                            ],
                             SelectableText(
                               parseResult.processedText,
                               style: theme.textTheme.bodyMedium?.copyWith(
@@ -350,8 +335,9 @@ class _AttachmentMatch {
   final RegExpMatch match;
 }
 
+/// Extracts message decorations and trims the remaining display text.
 MessageParseResult parseMessageContent(String content) {
-  var cleanedContent = content.replaceAll(ChatMarkupRegex.memoryTag, '').trim();
+  var cleanedContent = content.trim();
 
   final proxySenderMatch = ChatMarkupRegex.proxySenderTag.firstMatch(
     cleanedContent,
@@ -486,9 +472,9 @@ MessageParseResult parseMessageContent(String content) {
   for (var index = 0; index < matches.length; index++) {
     final match = matches[index].match;
     final startIndex = match.start;
-    final id = match.group(1)!;
-    final filename = match.group(2)!;
-    final type = match.group(3)!;
+    final id = decodeChatXmlText(match.group(1)!);
+    final filename = decodeChatXmlText(match.group(2)!);
+    final type = decodeChatXmlText(match.group(3)!);
     final size = _parseLong(match.group(4));
     final attachmentContent = decodeChatXmlText(match.group(5) ?? '');
     final attachment = AttachmentData(
@@ -526,7 +512,7 @@ MessageParseResult parseMessageContent(String content) {
     messageText.write(cleanedContent.substring(lastIndex));
   }
   return MessageParseResult(
-    processedText: messageText.toString(),
+    processedText: messageText.toString().trim(),
     trailingAttachments: <AttachmentData>[
       ...workspaceAttachments,
       ...mediaLinkAttachments,

@@ -3,13 +3,11 @@
 use std::env;
 use std::path::PathBuf;
 
-const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:4819";
 
 /// Carries explicit runtime settings for the PB_SBC01_H3 controller.
 #[derive(Clone, Debug)]
 pub struct PbSbc01H3Config {
-    pub bindAddress: String,
-    pub token: String,
+    pub bindAddress: Option<String>,
     pub runtimeRoot: PathBuf,
     pub workspaceRoot: PathBuf,
     pub stateRoot: PathBuf,
@@ -22,8 +20,7 @@ impl PbSbc01H3Config {
         I: IntoIterator<Item = String>,
     {
         let dataRoot = defaultDataRoot()?;
-        let mut bindAddress = DEFAULT_BIND_ADDRESS.to_string();
-        let mut token = String::new();
+        let mut bindAddress = None;
         let mut runtimeRoot = dataRoot.join("runtime");
         let mut workspaceRoot = dataRoot.join("workspace");
         let mut stateRoot = dataRoot.join("state");
@@ -31,8 +28,7 @@ impl PbSbc01H3Config {
 
         while let Some(arg) = iterator.next() {
             match arg.as_str() {
-                "--bind" => bindAddress = readArgValue(&mut iterator, "--bind")?,
-                "--token" => token = readArgValue(&mut iterator, "--token")?,
+                "--bind" => bindAddress = Some(readArgValue(&mut iterator, "--bind")?),
                 "--runtime-root" => {
                     runtimeRoot = PathBuf::from(readArgValue(&mut iterator, "--runtime-root")?)
                 }
@@ -47,13 +43,8 @@ impl PbSbc01H3Config {
             }
         }
 
-        if token.trim().is_empty() {
-            return Err(format!("--token is required\n{}", usage()));
-        }
-
         Ok(Self {
             bindAddress,
-            token,
             runtimeRoot,
             workspaceRoot,
             stateRoot,
@@ -85,7 +76,7 @@ fn defaultDataRoot() -> Result<PathBuf, String> {
 /// Returns concise command usage for the PB_SBC01_H3 controller.
 fn usage() -> String {
     [
-        "usage: operit-pb-sbc01-h3 --token <token> [--bind <address:port>]",
+        "usage: operit-pb-sbc01-h3 [--bind <address:port>]",
         "       [--runtime-root <path>] [--workspace-root <path>] [--state-root <path>]",
     ]
     .join("\n")

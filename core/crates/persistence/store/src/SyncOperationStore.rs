@@ -1,7 +1,8 @@
+use operit_host_api::AtomicCounter::AtomicU64;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use operit_host_api::RuntimeStorageHost;
@@ -89,7 +90,7 @@ impl SyncOperationSemantics {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOperation {
     pub opId: String,
     pub originDeviceId: String,
@@ -102,6 +103,41 @@ pub struct SyncOperation {
     pub payload: Value,
     pub createdAt: i64,
     pub schemaVersion: i32,
+}
+
+/// One corrupt operation-log line found while reading an origin journal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationLogLineFinding {
+    pub deviceId: String,
+    pub lineNumber: u64,
+    pub byteOffset: u64,
+    pub byteLength: u64,
+    pub error: String,
+}
+
+/// Raw classification of one origin journal: decodable lines versus corruption.
+/// `operations` carries the decoded lines so diagnostics can inspect them
+/// without a second read; payload envelopes stay untouched (not decrypted).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperationLogScan {
+    pub deviceId: String,
+    pub exists: bool,
+    pub totalLines: u64,
+    pub decodedLines: u64,
+    pub highestSequence: i64,
+    pub findings: Vec<OperationLogLineFinding>,
+    pub operations: Vec<SyncOperation>,
+}
+
+/// One journal line moved to the quarantine sidecar by an explicit repair.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedOperationLine {
+    pub deviceId: String,
+    pub byteOffset: u64,
+    pub byteLength: u64,
+    pub lineHash: String,
+    pub quarantinedAt: i64,
+    pub line: String,
 }
 
 /// Defines the deterministic total order used to resolve concurrent entity operations.
@@ -242,10 +278,12 @@ where
 #[derive(Default)]
 struct SyncOperationLogIndex {
     loaded: bool,
+    domainOperations: BTreeMap<String, Vec<SyncOperation>>,
     operationIds: BTreeSet<String>,
     sequenceOffsets: BTreeMap<i64, u64>,
     highestSequence: i64,
     encodedByteLength: u64,
+    findings: Vec<OperationLogLineFinding>,
 }
 
 struct SyncOperationStoreRegistryKey {
@@ -331,6 +369,9 @@ impl SyncOperationStore {
         };
         let operationOffset = operationLog.encodedByteLength;
         let writtenBytes = self.appendOperationLine(&op)?;
+        if let Some(operations) = operationLog.domainOperations.get_mut(&op.domain) {
+            operations.push(op.clone());
+        }
         operationLog.operationIds.insert(op.opId.clone());
         operationLog
             .sequenceOffsets
@@ -346,6 +387,107 @@ impl SyncOperationStore {
         self.recordAppliedOperation(&op)?;
         publishSyncMutation();
         Ok(op)
+    }
+
+    /// Reuses the last identical state for one local entity when recovering a
+    /// record publication. Transaction commands must never use this shortcut.
+    #[allow(non_snake_case)]
+    pub fn appendLocalStateIfChanged(
+        &self,
+        originDeviceId: &str,
+        mutation: NewSyncOperation,
+    ) -> Result<SyncOperation, SyncOperationStoreError> {
+        if mutation.semantics != SyncOperationSemantics::EntityState {
+            return Err(SyncOperationStoreError::Message(
+                "Idempotent state append requires EntityState semantics".into(),
+            ));
+        }
+        let content = self.readOperationLog(originDeviceId)?;
+        let mut latest = None;
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let operation: SyncOperation = serde_json::from_str(line)?;
+            if operation.domain == mutation.domain
+                && operation.entityType == mutation.entityType
+                && operation.entityId == mutation.entityId
+            {
+                latest = Some(self.decodeOperationPayload(operation)?);
+            }
+        }
+        if let Some(operation) = latest {
+            if operation.operation == mutation.operation
+                && operation.semantics == mutation.semantics
+                && operation.payload == mutation.payload
+            {
+                self.recoverAppendedOperation(&operation)?;
+                return Ok(operation);
+            }
+        }
+        self.appendLocalOperation(originDeviceId, mutation)
+    }
+
+    /// Reuses an identical final preference transaction when retrying journal publication.
+    /// Later edits to the same file make a transaction a new business event.
+    #[allow(non_snake_case)]
+    pub fn appendLocalPreferencesTransactionIfChanged(
+        &self,
+        originDeviceId: &str,
+        mutation: NewSyncOperation,
+    ) -> Result<SyncOperation, SyncOperationStoreError> {
+        if mutation.domain != "preferences"
+            || mutation.operation != "transaction"
+            || mutation.semantics != SyncOperationSemantics::Transaction
+        {
+            return Err(SyncOperationStoreError::Message(
+                "Preference transaction recovery requires an atomic preferences operation".into(),
+            ));
+        }
+        let path = mutation
+            .payload
+            .get("storagePath")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                SyncOperationStoreError::Message(
+                    "Preference transaction is missing its storage path".into(),
+                )
+            })?;
+        let content = self.readOperationLog(originDeviceId)?;
+        let mut latest = None;
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let operation: SyncOperation = serde_json::from_str(line)?;
+            if operation.domain != "preferences" {
+                continue;
+            }
+            let decoded = self.decodeOperationPayload(operation)?;
+            if decoded.payload.get("storagePath").and_then(Value::as_str) == Some(path) {
+                latest = Some(decoded);
+            }
+        }
+        if let Some(operation) = latest {
+            if operation.entityType == mutation.entityType
+                && operation.entityId == mutation.entityId
+                && operation.operation == mutation.operation
+                && operation.semantics == mutation.semantics
+                && operation.payload == mutation.payload
+            {
+                self.recoverAppendedOperation(&operation)?;
+                return Ok(operation);
+            }
+        }
+        self.appendLocalOperation(originDeviceId, mutation)
+    }
+
+    /// Completes metadata after an acknowledged log append but failed later
+    /// writes. Never allocates a second sequence or appends a duplicate line.
+    #[allow(non_snake_case)]
+    pub fn recoverAppendedOperation(
+        &self,
+        operation: &SyncOperation,
+    ) -> Result<(), SyncOperationStoreError> {
+        self.appendOperation(operation)?;
+        self.registerDevice(&operation.originDeviceId)?;
+        self.recordAppliedOperation(operation)?;
+        publishSyncMutation();
+        Ok(())
     }
 
     /// Returns the stable local device identifier for this sync store.
@@ -371,10 +513,9 @@ impl SyncOperationStore {
             }
         }
         let now = currentTimeMillis()?;
-        let mut hasher = DefaultHasher::new();
-        self.rootPath.hash(&mut hasher);
-        now.hash(&mut hasher);
-        let deviceId = format!("core-{now}-{:016x}", hasher.finish());
+        // Hosts commonly use the same relative sync root and may initialize
+        // within the same millisecond. Their operation origins must be unique.
+        let deviceId = format!("core-{now}-{}", uuid::Uuid::new_v4().simple());
         self.storageHost.writeBytes(&path, deviceId.as_bytes())?;
         localDeviceIdState.loaded = true;
         localDeviceIdState.value = Some(deviceId.clone());
@@ -461,6 +602,11 @@ impl SyncOperationStore {
                 self.storageHost
                     .appendBytes(&self.operationsPath(&originDeviceId), &content)?;
                 for (operation, offset, lineLength) in appendedOperations {
+                    if let Some(operations) =
+                        operationLog.domainOperations.get_mut(&operation.domain)
+                    {
+                        operations.push(operation.clone());
+                    }
                     operationLog.operationIds.insert(operation.opId.clone());
                     operationLog
                         .sequenceOffsets
@@ -499,6 +645,9 @@ impl SyncOperationStore {
         }
         let operationOffset = operationLog.encodedByteLength;
         let writtenBytes = self.appendOperationLine(operation)?;
+        if let Some(operations) = operationLog.domainOperations.get_mut(&operation.domain) {
+            operations.push(operation.clone());
+        }
         operationLog.operationIds.insert(operation.opId.clone());
         operationLog
             .sequenceOffsets
@@ -518,15 +667,89 @@ impl SyncOperationStore {
         domains: &[String],
         limit: usize,
     ) -> Result<Vec<SyncOperation>, SyncOperationStoreError> {
+        self.operationsSinceWithExportPolicy(clock, domains, limit, true)
+    }
+
+    /// Reads local preference provenance without treating an export boundary as a conflict boundary.
+    pub fn preferenceHistory(&self) -> Result<Vec<SyncOperation>, SyncOperationStoreError> {
+        self.operationsSinceWithExportPolicy(
+            &SyncClock::empty(),
+            &["preferences".to_owned()],
+            usize::MAX,
+            false,
+        )
+    }
+
+    /// Uses the shared journal cache for exports and internal deterministic state replay.
+    fn operationsSinceWithExportPolicy(
+        &self,
+        clock: &SyncClock,
+        domains: &[String],
+        limit: usize,
+        applyExportFloors: bool,
+    ) -> Result<Vec<SyncOperation>, SyncOperationStoreError> {
         let domainSet = domains.iter().cloned().collect::<BTreeSet<_>>();
-        let exportFloors = {
+        let exportFloors = if applyExportFloors {
             let mut state = lockSyncState(&self.sharedState.exportFloors, "export floors")?;
             self.loadCachedJson(&mut state, &self.exportFloorsPath())?
                 .clone()
+        } else {
+            BTreeMap::new()
         };
         let mut out = Vec::new();
         for deviceId in self.devices()? {
             let operationLog = self.operationLog(&deviceId)?;
+            if !domainSet.is_empty() {
+                let selected = {
+                    let mut index = lockSyncState(&operationLog, "operation log")?;
+                    self.loadOperationLogIndex(&deviceId, &mut index)?;
+                    let missing = domainSet
+                        .iter()
+                        .filter(|domain| !index.domainOperations.contains_key(*domain))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    if !missing.is_empty() {
+                        let content = self.readOperationLog(&deviceId)?;
+                        let mut domains = missing
+                            .iter()
+                            .map(|domain| (domain.clone(), Vec::new()))
+                            .collect::<BTreeMap<_, _>>();
+                        let mut skipped = 0usize;
+                        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+                            match serde_json::from_str::<SyncOperation>(line) {
+                                Ok(operation) => {
+                                    if let Some(operations) = domains.get_mut(&operation.domain) {
+                                        operations.push(operation);
+                                    }
+                                }
+                                Err(_) => skipped += 1,
+                            }
+                        }
+                        if skipped > 0 {
+                            operit_util::AppLogger::AppLogger::w(
+                                "SyncOperationStore",
+                                &format!(
+                                "skipped {skipped} corrupt operation-log line(s) for {deviceId}"
+                            ),
+                            );
+                        }
+                        index.domainOperations.extend(domains);
+                    }
+                    let minimumSequence = clock
+                        .sequenceFor(&deviceId)
+                        .max(exportFloors.get(&deviceId).copied().unwrap_or(0));
+                    domainSet
+                        .iter()
+                        .flat_map(|domain| index.domainOperations[domain].iter())
+                        .filter(|operation| operation.sequence > minimumSequence)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                for operation in selected {
+                    out.push(self.decodeOperationPayload(operation)?);
+                }
+                continue;
+            }
             let content = {
                 let mut operationLog = lockSyncState(&operationLog, "operation log")?;
                 self.loadOperationLogIndex(&deviceId, &mut operationLog)?;
@@ -841,24 +1064,45 @@ impl SyncOperationStore {
     }
 
     /// Decodes one immutable operation-log snapshot without holding its file lock.
+    /// Corrupt lines are skipped and reported, not propagated as a whole-file failure.
     #[allow(non_snake_case)]
     fn decodeOperationLog(
         &self,
         content: &str,
     ) -> Result<Vec<SyncOperation>, SyncOperationStoreError> {
         let mut operations = Vec::new();
+        let mut skipped = 0usize;
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let operation: SyncOperation = serde_json::from_str(trimmed)?;
-            operations.push(self.decodeOperationPayload(operation)?);
+            match serde_json::from_str::<SyncOperation>(trimmed) {
+                Ok(operation) => match self.decodeOperationPayload(operation) {
+                    Ok(operation) => operations.push(operation),
+                    Err(error) => {
+                        skipped += 1;
+                        operit_util::AppLogger::AppLogger::w(
+                            "SyncOperationStore",
+                            &format!("skipped undecodable sync operation payload: {error}"),
+                        );
+                    }
+                },
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            operit_util::AppLogger::AppLogger::w(
+                "SyncOperationStore",
+                &format!("skipped {skipped} corrupt operation-log line(s) during decode"),
+            );
         }
         Ok(operations)
     }
 
     /// Loads the persisted operation IDs once for one locked origin log.
+    /// Corrupt lines are recorded as findings and skipped: one damaged line
+    /// must not make every read of the journal fail.
     #[allow(non_snake_case)]
     fn loadOperationLogIndex(
         &self,
@@ -870,31 +1114,49 @@ impl SyncOperationStore {
         }
         let content = self.readOperationLog(deviceId)?;
         let mut byteOffset = 0u64;
+        let mut lineNumber = 0u64;
         for line in content.split_inclusive('\n') {
+            lineNumber += 1;
             let trimmed = line.trim();
-            if trimmed.is_empty() {
-                byteOffset += u64::try_from(line.len()).map_err(|_| {
-                    SyncOperationStoreError::Message(
-                        "sync operation line length does not fit u64".to_string(),
-                    )
-                })?;
-                continue;
-            }
-            let operation: SyncOperation = serde_json::from_str(trimmed)?;
-            index.highestSequence = index.highestSequence.max(operation.sequence);
-            index.sequenceOffsets.insert(operation.sequence, byteOffset);
-            index.operationIds.insert(operation.opId);
-            byteOffset += u64::try_from(line.len()).map_err(|_| {
+            let lineLength = u64::try_from(line.len()).map_err(|_| {
                 SyncOperationStoreError::Message(
                     "sync operation line length does not fit u64".to_string(),
                 )
             })?;
+            if trimmed.is_empty() {
+                byteOffset += lineLength;
+                continue;
+            }
+            match serde_json::from_str::<SyncOperation>(trimmed) {
+                Ok(operation) => {
+                    index.highestSequence = index.highestSequence.max(operation.sequence);
+                    index.sequenceOffsets.insert(operation.sequence, byteOffset);
+                    index.operationIds.insert(operation.opId);
+                }
+                Err(error) => index.findings.push(OperationLogLineFinding {
+                    deviceId: deviceId.to_string(),
+                    lineNumber,
+                    byteOffset,
+                    byteLength: lineLength,
+                    error: error.to_string(),
+                }),
+            }
+            byteOffset += lineLength;
         }
         index.encodedByteLength = u64::try_from(content.len()).map_err(|_| {
             SyncOperationStoreError::Message(
                 "sync operation log length does not fit u64".to_string(),
             )
         })?;
+        if !index.findings.is_empty() {
+            operit_util::AppLogger::AppLogger::w(
+                "SyncOperationStore",
+                &format!(
+                    "origin {deviceId} journal carries {} corrupt line(s); reads skip them",
+                    index.findings.len()
+                ),
+            );
+        }
         index.loaded = true;
         Ok(())
     }
@@ -983,11 +1245,60 @@ impl SyncOperationStore {
     }
 
     /// Reads a snapshot of registered origin devices under its metadata lock.
-    fn devices(&self) -> Result<Vec<String>, SyncOperationStoreError> {
+    pub fn devices(&self) -> Result<Vec<String>, SyncOperationStoreError> {
         let mut devicesState = lockSyncState(&self.sharedState.devices, "devices")?;
         Ok(self
             .loadCachedJson(&mut devicesState, &self.devicesPath())?
             .clone())
+    }
+
+    /// Scans one origin journal raw, classifying every line as decodable or
+    /// corruption. Diagnostics use this; it never fails on damaged content,
+    /// only on host storage errors. Payload envelopes are not decrypted here.
+    #[allow(non_snake_case)]
+    pub fn scanOperationLog(
+        &self,
+        deviceId: &str,
+    ) -> Result<OperationLogScan, SyncOperationStoreError> {
+        let mut scan = OperationLogScan {
+            deviceId: deviceId.to_string(),
+            ..Default::default()
+        };
+        let content = self.readOperationLog(deviceId)?;
+        if content.is_empty() {
+            return Ok(scan);
+        }
+        scan.exists = true;
+        let mut byteOffset = 0u64;
+        let mut lineNumber = 0u64;
+        for line in content.split_inclusive('\n') {
+            lineNumber += 1;
+            let lineLength = u64::try_from(line.len()).map_err(|_| {
+                SyncOperationStoreError::Message(
+                    "sync operation line length does not fit u64".to_string(),
+                )
+            })?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                match serde_json::from_str::<SyncOperation>(trimmed) {
+                    Ok(operation) => {
+                        scan.decodedLines += 1;
+                        scan.highestSequence = scan.highestSequence.max(operation.sequence);
+                        scan.operations.push(operation);
+                    }
+                    Err(error) => scan.findings.push(OperationLogLineFinding {
+                        deviceId: deviceId.to_string(),
+                        lineNumber,
+                        byteOffset,
+                        byteLength: lineLength,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            scan.totalLines += 1;
+            byteOffset += lineLength;
+        }
+        Ok(scan)
     }
 
     /// Registers one origin device under the dedicated device-list lock.
@@ -1143,14 +1454,100 @@ impl SyncOperationStore {
         format!("{}/export_floors.json", self.rootPath)
     }
 
-    /// Returns the JSONL operation-log path for one origin device.
+    /// Returns the JSONL operation-log path for one origin device. Public for
+    /// diagnostics that copy or back up the raw journal beside the store APIs.
     #[allow(non_snake_case)]
-    fn operationsPath(&self, deviceId: &str) -> String {
+    pub fn operationsPath(&self, deviceId: &str) -> String {
         format!(
             "{}/operations/{}.jsonl",
             self.rootPath,
             storageSafeId(deviceId)
         )
+    }
+
+    /// Returns the reversible quarantine sidecar path for one origin device.
+    #[allow(non_snake_case)]
+    fn quarantinePath(&self, deviceId: &str) -> String {
+        format!(
+            "{}/operations/{}.jsonl.quarantine",
+            self.rootPath,
+            storageSafeId(deviceId)
+        )
+    }
+
+    /// Moves the journal lines at the given byte offsets out of one origin
+    /// log into a reversible quarantine sidecar, holding the same per-origin
+    /// lock as appends, then invalidates every cached view of the journal.
+    /// Nothing is deleted: each moved line is preserved verbatim with its
+    /// original offset, a stable hash and a timestamp. Offsets must come from
+    /// scanOperationLog findings; the byte accounting is identical.
+    #[allow(non_snake_case)]
+    pub fn quarantineOperationLines(
+        &self,
+        deviceId: &str,
+        byteOffsets: &[u64],
+    ) -> Result<Vec<QuarantinedOperationLine>, SyncOperationStoreError> {
+        let operationLog = self.operationLog(deviceId)?;
+        let mut index = lockSyncState(&operationLog, "operation log")?;
+        let content = self.readOperationLog(deviceId)?;
+        let targets: BTreeSet<u64> = byteOffsets.iter().copied().collect();
+        let mut kept = String::new();
+        let mut moved = Vec::new();
+        let mut byteOffset = 0u64;
+        let now = tryCurrentTimeMillis().map_err(SyncOperationStoreError::Message)?;
+        for line in content.split_inclusive('\n') {
+            let lineLength = u64::try_from(line.len()).map_err(|_| {
+                SyncOperationStoreError::Message(
+                    "sync operation line length does not fit u64".to_string(),
+                )
+            })?;
+            if targets.contains(&byteOffset) {
+                let mut hasher = DefaultHasher::new();
+                line.hash(&mut hasher);
+                moved.push(QuarantinedOperationLine {
+                    deviceId: deviceId.to_string(),
+                    byteOffset,
+                    byteLength: lineLength,
+                    lineHash: format!("{:016x}", hasher.finish()),
+                    quarantinedAt: now,
+                    line: line.trim_end_matches('\n').to_string(),
+                });
+            } else {
+                kept.push_str(line);
+            }
+            byteOffset += lineLength;
+        }
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+        let sidecarPath = self.quarantinePath(deviceId);
+        let mut sidecar = if self.storageHost.exists(&sidecarPath)? {
+            String::from_utf8(self.storageHost.readBytes(&sidecarPath)?)
+                .map_err(|error| SyncOperationStoreError::Message(error.to_string()))?
+        } else {
+            String::new()
+        };
+        for entry in &moved {
+            let encoded = serde_json::to_vec(entry)?;
+            sidecar.push_str(
+                std::str::from_utf8(&encoded)
+                    .map_err(|error| SyncOperationStoreError::Message(error.to_string()))?,
+            );
+            sidecar.push('\n');
+        }
+        self.storageHost
+            .writeBytes(&self.operationsPath(deviceId), kept.as_bytes())?;
+        self.storageHost
+            .writeBytes(&sidecarPath, sidecar.as_bytes())?;
+        index.domainOperations.clear();
+        index.operationIds.clear();
+        index.sequenceOffsets.clear();
+        index.highestSequence = 0;
+        index.encodedByteLength = 0;
+        index.findings.clear();
+        index.loaded = false;
+        publishSyncMutation();
+        Ok(moved)
     }
 }
 
@@ -1222,7 +1619,7 @@ fn storageSafeId(value: &str) -> String {
 /// Reports whether this decoded operation carries encrypted Space preferences.
 fn encryptedPreferenceSyncOperation(operation: &SyncOperation) -> bool {
     operation.domain == "preferences"
-        && operation.operation == "set"
+        && matches!(operation.operation.as_str(), "set" | "transaction")
         && operation.payload.get("encrypted").and_then(Value::as_bool) == Some(true)
 }
 
@@ -1241,44 +1638,47 @@ fn encryptedPreferenceSyncPayloadAad(operation: &SyncOperation) -> String {
     )
 }
 
-/// Compacts replaceable entity states while preserving every transaction operation.
+/// Identifies one independently compactable state within its origin's operation log.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(non_snake_case)]
-pub fn compactSyncOperations(operations: Vec<SyncOperation>) -> Vec<SyncOperation> {
-    let mut latestStateOperations = BTreeMap::<(String, String, String, String), i64>::new();
-    for operation in &operations {
-        if operation.semantics == SyncOperationSemantics::EntityState {
-            let key = syncEntityKey(operation);
-            let sequence = latestStateOperations
-                .entry(key)
-                .or_insert(operation.sequence);
-            if operation.sequence > *sequence {
-                *sequence = operation.sequence;
-            }
-        }
-    }
-
-    let mut compacted = Vec::with_capacity(operations.len());
-    for operation in operations {
-        if operation.semantics == SyncOperationSemantics::EntityState {
-            let key = syncEntityKey(&operation);
-            if latestStateOperations.get(&key).copied() != Some(operation.sequence) {
-                continue;
-            }
-        }
-        compacted.push(operation);
-    }
-    compacted
+struct SyncEntityKey {
+    originDeviceId: String,
+    domain: String,
+    entityType: String,
+    entityId: String,
 }
 
+/// Preserves preference history for identity replay and compacts other replaceable entity states.
 #[allow(non_snake_case)]
+pub fn compactSyncOperations(operations: Vec<SyncOperation>) -> Vec<SyncOperation> {
+    let mut latestSequences = BTreeMap::<SyncEntityKey, i64>::new();
+    for operation in &operations {
+        if operation.semantics == SyncOperationSemantics::EntityState {
+            latestSequences
+                .entry(syncEntityKey(operation))
+                .and_modify(|sequence| *sequence = (*sequence).max(operation.sequence))
+                .or_insert(operation.sequence);
+        }
+    }
+    operations
+        .into_iter()
+        .filter(|operation| {
+            operation.domain == "preferences"
+                || operation.semantics == SyncOperationSemantics::Transaction
+                || latestSequences.get(&syncEntityKey(operation)) == Some(&operation.sequence)
+        })
+        .collect()
+}
+
 /// Builds the origin-scoped identity used for operation-log compaction.
-fn syncEntityKey(operation: &SyncOperation) -> (String, String, String, String) {
-    (
-        operation.originDeviceId.clone(),
-        operation.domain.clone(),
-        operation.entityType.clone(),
-        operation.entityId.clone(),
-    )
+#[allow(non_snake_case)]
+fn syncEntityKey(operation: &SyncOperation) -> SyncEntityKey {
+    SyncEntityKey {
+        originDeviceId: operation.originDeviceId.clone(),
+        domain: operation.domain.clone(),
+        entityType: operation.entityType.clone(),
+        entityId: operation.entityId.clone(),
+    }
 }
 
 /// Encodes one entity identity without relying on path or delimiter parsing.

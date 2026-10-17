@@ -139,7 +139,7 @@ event payloads.
 Every router owns a `SharedWatchHub`. A `SnapshotShared` entry is keyed by:
 
 ```text
-(spaceId, targetNodeId, routeKind, targetObjectId, propertyName,
+(spaceId, targetNodeId, routeKind, target, propertyName,
  canonicalArguments, topologyGeneration)
 ```
 
@@ -187,7 +187,7 @@ upstream stream and two B-to-consumer streams. A source event crosses A-B once.
 The control plane remains individual and authenticated:
 
 ```text
-WatchOpen, WatchClose, route errors, and LinkAdvertisement
+CoreLinkWatchRequest::Open, CoreLinkWatchRequest::Close, route errors, and LinkAdvertisement
 ```
 
 The data plane may be shared only after the `SnapshotShared` declaration has
@@ -204,7 +204,7 @@ The original source order is retained within every consumer stream.
 
 | Module | Responsibility |
 | --- | --- |
-| `operit-access-runtime/CoreNodePeerLink` | Heartbeat echo, local measurements, bounded frame queues, per-consumer event delivery. |
+| `operit-peer-link/connection` | Heartbeat echo, local measurements, bounded frame queues, per-consumer event delivery. |
 | `operit-store/CoreSpaceStore` | One persisted topology record containing direct peers and link metrics, expiry filtering, directed Dijkstra, deterministic route decisions. |
 | `operit-node-runtime/CoreNodeRouter` | Select a route for new operations and own the `SharedWatchHub`. |
 | `operit-link` and route code generation | Declare `Unicast` or `SnapshotShared` for each true Core Watch route. |

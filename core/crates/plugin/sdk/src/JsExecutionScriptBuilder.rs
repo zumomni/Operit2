@@ -44,7 +44,8 @@ pub fn buildExecutionPreludeSource() -> String {
         var getLang = function() { return __operitInvokeCallRuntime('getLang', arguments); };
         var getCallerName = function() { return __operitInvokeCallRuntime('getCallerName', arguments); };
         var getChatId = function() { return __operitInvokeCallRuntime('getChatId', arguments); };
-        var getCallerCardId = function() { return __operitInvokeCallRuntime('getCallerCardId', arguments); };
+        /** Returns only the opaque execution participant injected by the authenticated native tool context. */
+        var getCallerParticipantId = function() { return __operitInvokeCallRuntime('getCallerParticipantId', arguments); };
         var __handleAsync = function() { return __operitInvokeCallRuntime('handleAsync', arguments); };
         var console = {
             log: function() { return __operitInvokeCallRuntimeConsole('log', arguments); },
@@ -76,6 +77,7 @@ pub fn buildExecutionPreludeSource() -> String {
         var _ = globalThis._;
         var dataUtils = globalThis.dataUtils;
         var toolCall = globalThis.toolCall;
+        var getToolCatalog = globalThis.getToolCatalog;
     "#
     .to_string()
 }

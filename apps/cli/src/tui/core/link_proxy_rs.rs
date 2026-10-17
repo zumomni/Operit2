@@ -4,17 +4,19 @@ use std::sync::Arc;
 
 use crate::core_proxy::SharedLocalCore;
 use operit_link::{
-    CoreEvent, CoreLinkClient, CoreLinkError, CoreRequestId, CoreStreamDescriptor, CoreValue,
-    CoreWatchRequest,
+    CoreEvent, CoreEventKind, CoreLinkClient, CoreLinkError, CoreRequestId, CoreStreamDescriptor,
+    CoreValue, CoreWatchRequest,
 };
 use operit_model::ChatMessage::ChatMessage;
 use operit_proxy_local::{GeneratedCoreProxy, LocalCoreProxy};
 use operit_util::AppLogger::AppLogger;
+use serde::de::DeserializeOwned;
 
 pub(super) struct TuiCore {
     proxy: GeneratedCoreProxy<SharedLocalCore>,
     eventSender: tokio::sync::mpsc::UnboundedSender<CoreEvent>,
     eventReceiver: tokio::sync::mpsc::UnboundedReceiver<CoreEvent>,
+    stateFlowValues: TuiStateFlowValues,
     messageWatchTask: Option<tokio::task::JoinHandle<()>>,
     messageWatchChatId: Option<String>,
     messageWatchRequestId: Option<CoreRequestId>,
@@ -25,6 +27,55 @@ pub(super) struct TuiCore {
     stateWatchGeneration: u64,
     contentStreamWatches: BTreeMap<String, TuiContentStreamWatch>,
     contentStreamGeneration: u64,
+}
+
+type TuiStateFlowKey = (Option<CoreRequestId>, String, String);
+
+/// Retains complete wire values independently for each StateFlow subscription.
+#[derive(Default)]
+struct TuiStateFlowValues {
+    values: BTreeMap<TuiStateFlowKey, CoreValue>,
+}
+
+impl TuiStateFlowValues {
+    /// Applies one ordered StateFlow event before decoding its complete typed value.
+    fn decode<T: DeserializeOwned>(&mut self, event: &CoreEvent) -> Result<Option<T>, String> {
+        let key = (
+            event.requestId.clone(),
+            event.target.clone(),
+            event.propertyName.clone(),
+        );
+        let context = format!(
+            "requestId={:?} target={} property={} kind={:?}",
+            event.requestId.as_ref().map(|id| id.0.as_str()),
+            event.target,
+            event.propertyName,
+            event.kind,
+        );
+        let value = match event.kind {
+            CoreEventKind::Snapshot | CoreEventKind::Changed => event.value.clone(),
+            CoreEventKind::Delta => self
+                .values
+                .get(&key)
+                .ok_or_else(|| format!("TUI StateFlow delta has no complete base: {context}"))?
+                .applyIncrementalDelta(&event.value)
+                .map_err(|error| format!("TUI StateFlow delta failed: {context}: {error}"))?,
+            CoreEventKind::Completed => {
+                self.values.remove(&key);
+                return Ok(None);
+            }
+        };
+        let decoded = operit_link::fromCoreValue(value.clone())
+            .map_err(|error| format!("TUI StateFlow decode failed: {context}: {error}"))?;
+        self.values.insert(key, value);
+        Ok(Some(decoded))
+    }
+
+    /// Removes the retained values owned by a cancelled StateFlow subscription.
+    fn clear_request(&mut self, requestId: &CoreRequestId) {
+        self.values
+            .retain(|(id, _, _), _| id.as_ref() != Some(requestId));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +98,7 @@ pub(super) fn tui_core(client: Arc<LocalCoreProxy>) -> TuiCore {
         proxy: GeneratedCoreProxy::new(SharedLocalCore(client)),
         eventSender,
         eventReceiver,
+        stateFlowValues: TuiStateFlowValues::default(),
         messageWatchTask: None,
         messageWatchChatId: None,
         messageWatchRequestId: None,
@@ -61,6 +113,21 @@ pub(super) fn tui_core(client: Arc<LocalCoreProxy>) -> TuiCore {
 }
 
 impl TuiCore {
+    /// Gives a persistent session command future its own generated proxy over the same local Core.
+    pub(super) fn composeCommandProxy(&mut self) -> GeneratedCoreProxy<SharedLocalCore> {
+        let client = self.proxy.application().generatedClientMut().0.clone();
+        GeneratedCoreProxy::new(SharedLocalCore(client))
+    }
+
+    /// Decodes an ordered StateFlow event without treating embedded stream events as state.
+    #[allow(non_snake_case)]
+    pub(super) fn decodeStateFlowEvent<T: DeserializeOwned>(
+        &mut self,
+        event: &CoreEvent,
+    ) -> Result<Option<T>, String> {
+        self.stateFlowValues.decode(event)
+    }
+
     #[allow(non_snake_case)]
     /// Watches every zero-argument state flow exposed by the main chat runtime.
     pub(super) async fn watchMainChatGeneratedStateFlows(&mut self) -> Result<(), CoreLinkError> {
@@ -93,7 +160,7 @@ impl TuiCore {
             ),
         );
         let mut chatProxy = self.proxy.chat_runtime_holder_main();
-        let targetObjectId = LocalCoreProxy::generatedObjectIdForSchema("chatRuntimeHolderMain")
+        let target = LocalCoreProxy::generatedTargetForSchema("chatRuntimeHolderMain")
             .ok_or_else(|| CoreLinkError::internal("chat runtime object id is not generated"))?;
         let mut args = std::collections::BTreeMap::new();
         args.insert(
@@ -105,7 +172,7 @@ impl TuiCore {
             .generatedClientMut()
             .watch(CoreWatchRequest::new(
                 requestId.0.clone(),
-                targetObjectId,
+                target,
                 "chatMessagesFlow",
                 CoreValue::Map(args),
             ))
@@ -233,7 +300,7 @@ impl TuiCore {
             .generatedClientMut()
             .watch(CoreWatchRequest::new(
                 requestId.0.clone(),
-                descriptor.targetObjectId,
+                descriptor.target,
                 descriptor.propertyName,
                 descriptor.args,
             ))
@@ -302,7 +369,7 @@ impl TuiCore {
             ),
         );
         let mut chatProxy = self.proxy.chat_runtime_holder_main();
-        let targetObjectId = LocalCoreProxy::generatedObjectIdForSchema("chatRuntimeHolderMain")
+        let target = LocalCoreProxy::generatedTargetForSchema("chatRuntimeHolderMain")
             .ok_or_else(|| CoreLinkError::internal("chat runtime object id is not generated"))?;
         let mut args = std::collections::BTreeMap::new();
         args.insert(
@@ -314,7 +381,7 @@ impl TuiCore {
             .generatedClientMut()
             .watch(CoreWatchRequest::new(
                 requestId.0.clone(),
-                targetObjectId,
+                target,
                 "chatStateFlow",
                 CoreValue::Map(args),
             ))
@@ -354,6 +421,9 @@ impl TuiCore {
     #[allow(non_snake_case)]
     /// Stops the active main chat state watch.
     pub(super) fn clearMainChatStateWatch(&mut self) {
+        if let Some(requestId) = self.stateWatchRequestId.as_ref() {
+            self.stateFlowValues.clear_request(requestId);
+        }
         if let Some(task) = self.stateWatchTask.take() {
             AppLogger::trace(
                 "TuiStreamTrace",
@@ -372,6 +442,22 @@ impl TuiCore {
     }
 
     #[allow(non_snake_case)]
+    /// Answers one pending chat tool permission request through the owning
+    /// chat route, so the response reaches whichever node hosts the chat.
+    pub(super) async fn respondToolPermission(
+        &mut self,
+        chatId: String,
+        requestId: String,
+        result: String,
+    ) -> Result<(), String> {
+        let mut chatProxy = self.proxy.chat_runtime_holder_main();
+        chatProxy
+            .respondChatToolPermission(chatId, requestId, result)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(non_snake_case)]
     /// Reports whether an event belongs to the active main chat state watch.
     pub(super) fn isActiveMainChatStateEvent(&self, event: &CoreEvent) -> bool {
         event.propertyName == "chatStateFlow"
@@ -381,6 +467,9 @@ impl TuiCore {
     #[allow(non_snake_case)]
     /// Stops the active main chat message watch.
     pub(super) fn clearMainChatMessagesWatch(&mut self) {
+        if let Some(requestId) = self.messageWatchRequestId.as_ref() {
+            self.stateFlowValues.clear_request(requestId);
+        }
         if let Some(task) = self.messageWatchTask.take() {
             AppLogger::trace(
                 "TuiStreamTrace",
@@ -480,7 +569,7 @@ mod tests {
         NativeHostJavaScriptRuntimeHost, NativeHostRuntimeTaskSchedulerHost,
         NativeRuntimeStorageHost,
     };
-    use operit_link::{CoreEventKind, CORE_STREAM_POOL_OBJECT_ID};
+    use operit_link::{CoreEventKind, CORE_STREAM_TARGET};
     use operit_runtime::core::application::OperitApplication::OperitApplication;
     use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
     use operit_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
@@ -490,6 +579,316 @@ mod tests {
     use std::time::Duration;
 
     static TEST_RUNTIME_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    /// Constructs a state event with explicit subscription identity for decoder tests.
+    fn state_flow_event(
+        request_id: &str,
+        property: &str,
+        kind: CoreEventKind,
+        value: CoreValue,
+    ) -> CoreEvent {
+        CoreEvent {
+            requestId: Some(CoreRequestId::new(request_id)),
+            target: "chat-runtime".to_string(),
+            propertyName: property.to_string(),
+            kind,
+            value,
+        }
+    }
+
+    /// Produces a large stable value whose counter updates are encoded as deltas.
+    fn state_flow_value(label: &str, counter: u64) -> CoreValue {
+        CoreValue::Map(BTreeMap::from([
+            (
+                "background".to_string(),
+                CoreValue::String(label.repeat(500)),
+            ),
+            ("counter".to_string(), CoreValue::Unsigned(counter)),
+        ]))
+    }
+
+    /// Verifies successive message deltas add, update, complete, and remove messages.
+    #[test]
+    fn tui_state_flow_reconstructs_message_deltas() {
+        let mut values = TuiStateFlowValues::default();
+        let initial = vec![ChatMessage::new_with_markdown_timestamp(
+            "user".to_string(),
+            "stable history ".repeat(200),
+            1,
+        )];
+        let mut receiving = initial.clone();
+        receiving.push(ChatMessage::new_with_markdown_timestamp(
+            "ai".to_string(),
+            "B is continuing".to_string(),
+            2,
+        ));
+        let mut completed = receiving.clone();
+        completed[1].replace_with_markdown("B completed the task".to_string());
+        completed[1].completedAt = 3;
+        let mut previous = None;
+        for (index, expected) in [initial.clone(), receiving, completed, initial]
+            .into_iter()
+            .enumerate()
+        {
+            let (kind, value) = CoreValue::incrementalEvent(
+                &mut previous,
+                operit_link::toCoreValue(expected.clone()).unwrap(),
+            );
+            assert_eq!(
+                kind,
+                if index == 0 {
+                    CoreEventKind::Snapshot
+                } else {
+                    CoreEventKind::Delta
+                }
+            );
+            let event = state_flow_event("messages-1", "chatMessagesFlow", kind, value);
+            let decoded = values.decode::<Vec<ChatMessage>>(&event).unwrap().unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                decoded.last().unwrap().completedAt,
+                expected.last().unwrap().completedAt
+            );
+        }
+    }
+
+    /// Verifies a routed completion delta clears loading and replaces the connecting state.
+    #[test]
+    fn tui_state_flow_completion_delta_clears_loading() {
+        use operit_model::InputProcessingState::InputProcessingState;
+        use operit_runtime::services::ChatServiceCore::ChatState;
+
+        let initial = ChatState {
+            currentChatId: "handoff-chat".to_string(),
+            currentChatTitle: "stable chat title ".repeat(100),
+            currentWorkspacePath: Some("/workspace/b".to_string()),
+            isLoading: true,
+            inputProcessingState: InputProcessingState::Connecting {
+                message: "connecting".to_string(),
+            },
+            hasOlderDisplayHistory: false,
+            hasNewerDisplayHistory: false,
+            isLoadingDisplayWindow: false,
+            pendingQueueMessages: Vec::new(),
+            isPendingQueueExpanded: false,
+            toolPermissionRequests: Vec::new(),
+        };
+        let mut completed = initial.clone();
+        completed.isLoading = false;
+        completed.inputProcessingState = InputProcessingState::Completed;
+        let mut values = TuiStateFlowValues::default();
+        let mut previous = None;
+        for (index, expected) in [initial, completed].into_iter().enumerate() {
+            let (kind, value) = CoreValue::incrementalEvent(
+                &mut previous,
+                operit_link::toCoreValue(expected.clone()).unwrap(),
+            );
+            assert_eq!(
+                kind,
+                if index == 0 {
+                    CoreEventKind::Snapshot
+                } else {
+                    CoreEventKind::Delta
+                }
+            );
+            let event = state_flow_event("state-1", "chatStateFlow", kind, value);
+            let decoded = values.decode::<ChatState>(&event).unwrap().unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    /// Verifies pending chat tool permission requests survive the chat state
+    /// round-trip, so the approval modal can be driven from chat state.
+    #[test]
+    fn tui_state_flow_decodes_tool_permission_requests() {
+        use operit_model::InputProcessingState::InputProcessingState;
+        use operit_runtime::services::ChatServiceCore::ChatState;
+        use operit_runtime::services::RuntimeHostInteractionService::{
+            RuntimeHostInteractionToolPermissionRequest,
+            RuntimeHostInteractionToolPermissionTool,
+            RuntimeHostInteractionToolPermissionToolParameter,
+        };
+
+        let request = RuntimeHostInteractionToolPermissionRequest {
+            requestId: "permission-1".to_string(),
+            chatId: "handoff-chat".to_string(),
+            tool: RuntimeHostInteractionToolPermissionTool {
+                name: "Tools.Terminal.execute".to_string(),
+                parameters: vec![RuntimeHostInteractionToolPermissionToolParameter {
+                    name: "command".to_string(),
+                    value: "cargo test".to_string(),
+                }],
+            },
+            description: "Run a terminal command".to_string(),
+            requestedAtMillis: 42_000,
+        };
+        let mut state = ChatState {
+            currentChatId: "handoff-chat".to_string(),
+            currentChatTitle: "title".to_string(),
+            currentWorkspacePath: None,
+            isLoading: false,
+            inputProcessingState: InputProcessingState::Completed,
+            hasOlderDisplayHistory: false,
+            hasNewerDisplayHistory: false,
+            isLoadingDisplayWindow: false,
+            pendingQueueMessages: Vec::new(),
+            isPendingQueueExpanded: false,
+            toolPermissionRequests: vec![request],
+        };
+        let mut values = TuiStateFlowValues::default();
+        let mut previous = None;
+        let (kind, value) = CoreValue::incrementalEvent(
+            &mut previous,
+            operit_link::toCoreValue(state.clone()).unwrap(),
+        );
+        assert_eq!(kind, CoreEventKind::Snapshot);
+        let event = state_flow_event("state-1", "chatStateFlow", kind, value);
+        let decoded = values.decode::<ChatState>(&event).unwrap().unwrap();
+        assert_eq!(decoded.toolPermissionRequests.len(), 1);
+        assert_eq!(decoded.toolPermissionRequests[0].requestId, "permission-1");
+        assert_eq!(
+            decoded.toolPermissionRequests[0].tool.name,
+            "Tools.Terminal.execute"
+        );
+
+        state.toolPermissionRequests.clear();
+        let cleared = operit_link::toCoreValue(state).unwrap();
+        let event = state_flow_event("state-1", "chatStateFlow", CoreEventKind::Snapshot, cleared);
+        let decoded = values.decode::<ChatState>(&event).unwrap().unwrap();
+        assert!(decoded.toolPermissionRequests.is_empty());
+    }
+
+    /// Verifies replacement snapshots and changed values become the next delta base.
+    #[test]
+    fn tui_state_flow_replaces_base_at_route_snapshot() {
+        let mut values = TuiStateFlowValues::default();
+        for (label, kind) in [
+            ("A", CoreEventKind::Snapshot),
+            ("B", CoreEventKind::Snapshot),
+            ("C", CoreEventKind::Changed),
+        ] {
+            let base = state_flow_value(label, 0);
+            let event = state_flow_event("state-1", "chatStateFlow", kind, base.clone());
+            assert_eq!(
+                values.decode::<CoreValue>(&event).unwrap(),
+                Some(base.clone())
+            );
+            let expected = state_flow_value(label, 1);
+            let (kind, value) = CoreValue::incrementalEvent(&mut Some(base), expected.clone());
+            assert_eq!(kind, CoreEventKind::Delta);
+            let event = state_flow_event("state-1", "chatStateFlow", kind, value);
+            assert_eq!(values.decode::<CoreValue>(&event).unwrap(), Some(expected));
+        }
+    }
+
+    /// Verifies request, target, and property identities cannot share incremental bases.
+    #[test]
+    fn tui_state_flow_isolates_subscription_keys() {
+        let mut values = TuiStateFlowValues::default();
+        let subscriptions = [
+            ("request-a", "target-a", "chatStateFlow", "A"),
+            ("request-b", "target-a", "chatStateFlow", "B"),
+            ("request-a", "target-b", "chatStateFlow", "C"),
+            ("request-a", "target-a", "chatHistoriesFlow", "D"),
+        ];
+        for (request, target, property, label) in subscriptions {
+            let mut event = state_flow_event(
+                request,
+                property,
+                CoreEventKind::Snapshot,
+                state_flow_value(label, 0),
+            );
+            event.target = target.to_string();
+            values.decode::<CoreValue>(&event).unwrap();
+        }
+        for (request, target, property, label) in subscriptions {
+            let expected = state_flow_value(label, 1);
+            let (kind, value) = CoreValue::incrementalEvent(
+                &mut Some(state_flow_value(label, 0)),
+                expected.clone(),
+            );
+            assert_eq!(kind, CoreEventKind::Delta);
+            let mut event = state_flow_event(request, property, kind, value);
+            event.target = target.to_string();
+            assert_eq!(values.decode::<CoreValue>(&event).unwrap(), Some(expected));
+        }
+        assert_eq!(values.values.len(), subscriptions.len());
+    }
+
+    /// Verifies cancelling one request leaves other live subscription bases intact.
+    #[test]
+    fn tui_state_flow_cancellation_removes_request_base() {
+        let mut values = TuiStateFlowValues::default();
+        let base = state_flow_value("history", 0);
+        for request in ["old-watch", "live-watch"] {
+            let event = state_flow_event(
+                request,
+                "chatMessagesFlow",
+                CoreEventKind::Snapshot,
+                base.clone(),
+            );
+            values.decode::<CoreValue>(&event).unwrap();
+        }
+        values.clear_request(&CoreRequestId::new("old-watch"));
+        assert_eq!(values.values.len(), 1);
+        let expected = state_flow_value("history", 1);
+        let (kind, delta) = CoreValue::incrementalEvent(&mut Some(base), expected.clone());
+        let old = state_flow_event("old-watch", "chatMessagesFlow", kind.clone(), delta.clone());
+        assert!(values.decode::<CoreValue>(&old).is_err());
+        let live = state_flow_event("live-watch", "chatMessagesFlow", kind, delta);
+        assert_eq!(values.decode::<CoreValue>(&live).unwrap(), Some(expected));
+    }
+
+    /// Verifies terminal events remove the base without decoding their empty payload.
+    #[test]
+    fn tui_state_flow_completed_event_removes_base() {
+        let mut values = TuiStateFlowValues::default();
+        let base = state_flow_value("history", 0);
+        let snapshot = state_flow_event(
+            "watch",
+            "chatHistoriesFlow",
+            CoreEventKind::Snapshot,
+            base.clone(),
+        );
+        values.decode::<CoreValue>(&snapshot).unwrap();
+        let completed = state_flow_event(
+            "watch",
+            "chatHistoriesFlow",
+            CoreEventKind::Completed,
+            CoreValue::Null,
+        );
+        assert_eq!(values.decode::<CoreValue>(&completed).unwrap(), None);
+        assert!(values.values.is_empty());
+        let (kind, delta) =
+            CoreValue::incrementalEvent(&mut Some(base), state_flow_value("history", 1));
+        let event = state_flow_event("watch", "chatHistoriesFlow", kind, delta);
+        assert!(values.decode::<CoreValue>(&event).is_err());
+    }
+
+    /// Verifies missing snapshots, invalid patches, and typed decode errors are surfaced.
+    #[test]
+    fn tui_state_flow_rejects_invalid_events() {
+        let mut values = TuiStateFlowValues::default();
+        let event = state_flow_event(
+            "watch",
+            "chatStateFlow",
+            CoreEventKind::Delta,
+            CoreValue::Null,
+        );
+        assert_eq!(values.decode::<CoreValue>(&event).unwrap_err(),
+            "TUI StateFlow delta has no complete base: requestId=Some(\"watch\") target=chat-runtime property=chatStateFlow kind=Delta");
+        let snapshot = state_flow_event(
+            "watch",
+            "chatStateFlow",
+            CoreEventKind::Snapshot,
+            state_flow_value("base", 0),
+        );
+        assert!(values.decode::<i64>(&snapshot).is_err());
+        assert!(values.values.is_empty());
+        values.decode::<CoreValue>(&snapshot).unwrap();
+        assert!(values.decode::<CoreValue>(&event).is_err());
+        assert_eq!(values.values.len(), 1);
+    }
 
     /// Provides file-system access for isolated TUI runtime initialization tests.
     #[derive(Clone, Debug, Default)]
@@ -796,11 +1195,40 @@ mod tests {
         panic!("TUI embedded content stream did not complete; observed={observed:?}");
     }
 
+    /// Verifies TUI route permission errors retain the caller-facing diagnostics.
+    #[test]
+    fn tui_route_permission_error_keeps_structured_diagnostics() {
+        let error = CoreLinkError::withDetails(
+            "ROUTE_PERMISSION_DENIED",
+            "Space route switch_core target tui-client lacks runtime.execute",
+            CoreValue::Map(BTreeMap::from([
+                (
+                    "subject".to_string(),
+                    CoreValue::String("caller".to_string()),
+                ),
+                (
+                    "requiredCapability".to_string(),
+                    CoreValue::String("runtime.execute".to_string()),
+                ),
+                (
+                    "callerNodeId".to_string(),
+                    CoreValue::String("tui-client".to_string()),
+                ),
+            ])),
+        );
+        let message = error.to_string();
+        assert!(error.isRoutePermissionDenied());
+        assert!(message.contains("ROUTE_PERMISSION_DENIED"));
+        assert!(message.contains("caller"));
+        assert!(message.contains("runtime.execute"));
+        assert!(message.contains("tui-client"));
+    }
+
     /// Verifies TUI opens ChatMessage.contentStream through the embedded Link protocol.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tui_core_opens_embedded_content_stream_from_message_flow() {
         let mut tui = tui_core(test_local_proxy());
-        let target_object_id = LocalCoreProxy::generatedObjectIdForSchema("chatRuntimeHolderMain")
+        let target_route = LocalCoreProxy::generatedTargetForSchema("chatRuntimeHolderMain")
             .expect("chat runtime object id must be generated");
         let chat_id = "tui-embedded-route-probe".to_string();
         let flow_args = CoreValue::Map(BTreeMap::from([
@@ -815,7 +1243,7 @@ mod tests {
             .generatedClientMut()
             .watch(CoreWatchRequest::new(
                 "tui-embedded-flow",
-                target_object_id,
+                target_route,
                 "routeProbeChatMessagesFlow",
                 flow_args,
             ))
@@ -835,7 +1263,7 @@ mod tests {
             .expect("message Flow must expose a content stream")
             .descriptor
             .clone();
-        assert_eq!(descriptor.targetObjectId, CORE_STREAM_POOL_OBJECT_ID);
+        assert_eq!(descriptor.target, CORE_STREAM_TARGET);
         assert_eq!(descriptor.propertyName, "openCoreStream");
 
         tui.syncMainChatContentStreams(&messages)

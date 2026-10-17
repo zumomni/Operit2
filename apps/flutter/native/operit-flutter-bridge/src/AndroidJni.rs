@@ -1,7 +1,12 @@
-use crate::*;
+use crate::BridgeExports::*;
+use crate::BridgeExports::{last_create_error, panic_payload_message, set_last_create_error};
+use crate::OperitFlutterBridge;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
+use std::ffi::CStr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Accepts the borrowed pipe descriptors delivered by the Android Binder endpoint.
 #[no_mangle]
@@ -16,6 +21,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_acceptPluginSd
     }
 }
 
+/// Decodes an exact JNI boolean literal and rejects invalid owner input.
 fn jni_bool_arg(env: &mut JNIEnv, value: &JString, name: &str) -> Result<bool, String> {
     let value = env
         .get_string(value)
@@ -39,6 +45,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
     _class: JClass,
     runtime_root: JString,
     workspace_root: JString,
+    device_model: JString,
     host: JObject,
 ) -> jlong {
     let runtime_root = match env.get_string(&runtime_root) {
@@ -55,6 +62,17 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
             return 0;
         }
     };
+    let device_model: String = match env.get_string(&device_model) {
+        Ok(value) => value.into(),
+        Err(error) => {
+            set_last_create_error(format!("Android startup device model is invalid: {error}"));
+            return 0;
+        }
+    };
+    if device_model.trim().is_empty() {
+        set_last_create_error("Android startup device model must not be empty".to_string());
+        return 0;
+    }
     let java_vm = match env.get_java_vm() {
         Ok(value) => value,
         Err(error) => {
@@ -74,7 +92,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
         return 0;
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root)
+        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root, device_model)
     })) {
         Ok(Ok(bridge)) => Arc::into_raw(Arc::new(bridge)) as jlong,
         Ok(Err(error)) => {
@@ -130,7 +148,9 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_runtimeBootstr
     };
     new_java_string(
         env,
-        &crate::RuntimeBootstrapStore::readNativeRuntimeBootstrapConfig(default_runtime_root),
+        &crate::PlatformRuntimeAbi::RuntimeBootstrapStore::readNativeRuntimeBootstrapConfig(
+            default_runtime_root,
+        ),
     )
 }
 
@@ -170,7 +190,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_runtimeBootstr
     };
     new_java_string(
         env,
-        &crate::RuntimeBootstrapStore::writeNativeRuntimeBootstrapConfig(
+        &crate::PlatformRuntimeAbi::RuntimeBootstrapStore::writeNativeRuntimeBootstrapConfig(
             default_runtime_root,
             &content,
         ),
@@ -194,172 +214,12 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_connectCoreFfi
     _class: JClass,
     handle: jlong,
 ) -> jstring {
-    let descriptor = crate::PlatformRuntimeFactory::FfiTransport::operit_flutter_bridge_ffi_connect(
+    let descriptor = crate::PlatformRuntimeAbi::FfiTransport::operit_flutter_bridge_ffi_connect(
         handle as *const OperitFlutterBridge,
     );
     let result = new_java_string(env, CStr::from_ptr(descriptor).to_str().expect("FFI JSON"));
     operit_flutter_bridge_free_string(descriptor);
     result
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_startWebAccessServer(
-    mut env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    bindAddress: JString,
-    token: JString,
-    shutdownToken: JString,
-    webRoot: JString,
-    deviceInfoJson: JString,
-    enableWebAccess: JString,
-    enableDiscovery: JString,
-) -> jstring {
-    let Some(bridge) = (handle as *mut OperitFlutterBridge).as_ref() else {
-        return new_java_string(
-            env,
-            &serde_json::to_string(&CoreLinkError::internal(
-                "runtime bridge is not initialized",
-            ))
-            .expect("CoreLinkError must serialize"),
-        );
-    };
-    let bindAddress = match env.get_string(&bindAddress) {
-        Ok(value) => String::from(value),
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("invalid JNI bindAddress: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let token = match env.get_string(&token) {
-        Ok(value) => String::from(value),
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("invalid JNI token: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let shutdownToken = match env.get_string(&shutdownToken) {
-        Ok(value) => String::from(value),
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("invalid JNI shutdownToken: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let webRoot = match env.get_string(&webRoot) {
-        Ok(value) => String::from(value),
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("invalid JNI webRoot: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let deviceInfoJson = match env.get_string(&deviceInfoJson) {
-        Ok(value) => String::from(value),
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("invalid JNI deviceInfoJson: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let deviceInfo = match serde_json::from_str::<RemoteDeviceInfo>(&deviceInfoJson) {
-        Ok(value) => value,
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new(
-                    "INVALID_ARGS",
-                    format!("deviceInfoJson is invalid: {error}"),
-                ))
-                .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let enableWebAccess = match jni_bool_arg(&mut env, &enableWebAccess, "enableWebAccess") {
-        Ok(value) => value,
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new("INVALID_ARGS", error))
-                    .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    let enableDiscovery = match jni_bool_arg(&mut env, &enableDiscovery, "enableDiscovery") {
-        Ok(value) => value,
-        Err(error) => {
-            return new_java_string(
-                env,
-                &serde_json::to_string(&CoreLinkError::new("INVALID_ARGS", error))
-                    .expect("CoreLinkError must serialize"),
-            );
-        }
-    };
-    match bridge.startWebAccessServer(
-        bindAddress,
-        token,
-        shutdownToken,
-        PathBuf::from(webRoot),
-        deviceInfo,
-        enableWebAccess,
-        enableDiscovery,
-    ) {
-        Ok(deviceId) => new_java_string(
-            env,
-            &serde_json::json!({"ok": true, "deviceId": deviceId}).to_string(),
-        ),
-        Err(error) => new_java_string(
-            env,
-            &serde_json::to_string(&CoreLinkError::internal(error))
-                .expect("CoreLinkError must serialize"),
-        ),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_stopWebAccessServer(
-    env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-) -> jstring {
-    let Some(bridge) = (handle as *mut OperitFlutterBridge).as_ref() else {
-        return new_java_string(
-            env,
-            &serde_json::to_string(&CoreLinkError::internal(
-                "runtime bridge is not initialized",
-            ))
-            .expect("CoreLinkError must serialize"),
-        );
-    };
-    bridge.stopWebAccessServer();
-    new_java_string(env, "{\"ok\":true}")
 }
 
 #[no_mangle]
@@ -420,4 +280,31 @@ fn new_java_string(mut env: JNIEnv, value: &str) -> jstring {
     env.new_string(value)
         .expect("JNI string allocation must succeed")
         .into_raw()
+}
+
+/// Runs offline maintenance with only the Android secret-store bridge installed.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_dataRescue(
+    mut env: JNIEnv,
+    _class: JClass,
+    default_runtime_root: JString,
+    request: JString,
+    host: JObject,
+) -> jstring {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (|| -> Result<String, String> {
+            let root = PathBuf::from(String::from(env.get_string(&default_runtime_root).map_err(|error| error.to_string())?));
+            let request = String::from(env.get_string(&request).map_err(|error| error.to_string())?);
+            let vm = env.get_java_vm().map_err(|error| error.to_string())?;
+            let host = env.new_global_ref(host).map_err(|error| error.to_string())?;
+            operit_host_android_native::setAndroidHostSecretStoreBridge(vm, host).map_err(|error| error.to_string())?;
+            Ok(crate::PlatformRuntimeAbi::NativeDataRescue::execute(root, &request))
+        })()
+    }));
+    let response = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => serde_json::json!({"ok": false, "error": error}).to_string(),
+        Err(payload) => serde_json::json!({"ok": false, "error": panic_payload_message(payload)}).to_string(),
+    };
+    new_java_string(env, &response)
 }

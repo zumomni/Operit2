@@ -22,7 +22,8 @@ use operit_model::ModelParameter::ParameterValueType;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::stream::RevisableTextStream::{
-    with_event_channel, RevisableTextStreamLike, TextStreamEventCarrier,
+    with_event_channel_and_failure, RevisableTextStream, RevisableTextStreamLike,
+    TerminalFailureState, TextStreamEventCarrier,
 };
 use operit_util::stream::Stream::{FnStream, Stream};
 use operit_util::AppLogger::AppLogger;
@@ -385,6 +386,27 @@ impl DeepseekProvider {
         }
     }
 
+    /// Reuses the same rich-content and transport behavior as Kotlin's OpenAI parent.
+    fn open_ai_parent(&self, use_responses_api: bool) -> OpenAIProvider {
+        OpenAIProvider::new_with_capabilities(
+            self.api_endpoint.clone(),
+            self.api_key.clone(),
+            self.model_name.clone(),
+            self.provider_type.clone(),
+            self.custom_headers.clone(),
+            self.supports_vision,
+            self.supports_audio,
+            self.supports_video,
+            self.enable_tool_call,
+        )
+        .with_responses_api(use_responses_api)
+        .with_responses_stream_protocol(if use_responses_api {
+            ResponsesStreamProtocol::Deepseek
+        } else {
+            ResponsesStreamProtocol::OpenAi
+        })
+    }
+
     pub fn create_request_body(
         &self,
         request: &SendMessageRequest,
@@ -401,17 +423,7 @@ impl DeepseekProvider {
                     })
                     .collect()
             };
-            let parent = OpenAIProvider::new_with_capabilities(
-                self.api_endpoint.clone(),
-                self.api_key.clone(),
-                self.model_name.clone(),
-                self.provider_type.clone(),
-                self.custom_headers.clone(),
-                self.supports_vision,
-                self.supports_audio,
-                self.supports_video,
-                self.enable_tool_call,
-            );
+            let parent = self.open_ai_parent(true);
             let request_object = parent
                 .create_request_body_without_thinking_for_history(request, &protocol_history)?;
             let mut responses_request =
@@ -539,7 +551,10 @@ impl DeepseekProvider {
             }
         }
 
-        Ok(Value::Array(messagesArray))
+        let mut messages = Value::Array(messagesArray);
+        self.open_ai_parent(false)
+            .rewrite_message_media_content(&mut messages);
+        Ok(messages)
     }
 
     pub fn resolve_deepseek_thinking_effort(&self) -> Result<Option<&'static str>, AiServiceError> {
@@ -560,6 +575,7 @@ impl DeepseekProvider {
         provider_ready_history: &[PromptTurn],
         tools_json: Option<&str>,
         preserve_think_in_history: bool,
+        update_state: bool,
     ) -> i64 {
         let comparableHistory = provider_ready_history
             .iter()
@@ -586,10 +602,12 @@ impl DeepseekProvider {
             let tokenCount = state.tokenCacheManager.calculate_input_tokens(
                 &comparableHistory,
                 tools_json,
-                true,
+                update_state,
             );
-            state.inputTokenCount = state.tokenCacheManager.total_input_token_count();
-            state.cachedInputTokenCount = state.tokenCacheManager.cached_input_token_count();
+            if update_state {
+                state.inputTokenCount = state.tokenCacheManager.total_input_token_count();
+                state.cachedInputTokenCount = state.tokenCacheManager.cached_input_token_count();
+            }
             tokenCount
         } else {
             0
@@ -697,406 +715,8 @@ fn deepseek_uses_responses_protocol(endpoint: &str) -> Result<bool, AiServiceErr
 }
 
 #[cfg(test)]
-mod responses_tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use serde_json::{json, Value};
-
-    use super::DeepseekProvider;
-    use super::DeepseekResponsesPayloadAdapter;
-    use crate::chat::llmprovider::AIService::SendMessageRequest;
-    use crate::chat::llmprovider::OpenAIResponsesProvider::OpenAIResponsesPayloadAdapter;
-    use crate::runtime_support::{
-        ProviderCharacterPromptContext, ProviderFunctionModelBinding,
-        ProviderMemoryAutoSaveMessage, ProviderMessageTiming, ProviderPackageInfo,
-        ProviderRuntimeContext, ProviderRuntimeSupport, ProviderToolPkgAiProviderRegistration,
-    };
-    use operit_model::FunctionType::FunctionType;
-    use operit_model::MemorySearchConfig::MemorySearchConfig;
-    use operit_model::ModelConfigData::{ProviderProfile, ResolvedModelConfig};
-    use operit_model::PromptFunctionType::PromptFunctionType;
-    use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
-    use operit_model::ToolPrompt::ToolPrompt;
-
-    /// Supplies deterministic runtime capabilities for request-shape tests.
-    struct TestRuntimeSupport;
-
-    impl ProviderRuntimeSupport for TestRuntimeSupport {
-        /// Returns no filesystem root in the isolated test runtime.
-        fn dataDir(&self) -> Result<PathBuf, String> {
-            Err("test runtime does not expose a data directory".to_string())
-        }
-
-        /// Returns a stable thinking quality level for the test runtime.
-        fn thinkingQualityLevel(&self) -> Result<i32, String> {
-            Ok(2)
-        }
-
-        /// Accepts token updates without persisting them.
-        fn updateTokensForProviderModel(
-            &self,
-            _providerModel: &str,
-            _inputTokens: i64,
-            _outputTokens: i64,
-            _cachedInputTokens: i64,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        /// Returns no memory configuration in the isolated test runtime.
-        fn memorySearchConfig(&self, _ownerKey: &str) -> Result<MemorySearchConfig, String> {
-            Err("test runtime does not expose memory configuration".to_string())
-        }
-
-        /// Returns no memory owner in the isolated test runtime.
-        fn memoryOwnerKeyForCharacterCard(&self, _roleCardId: &str) -> Result<String, String> {
-            Err("test runtime does not expose memory owners".to_string())
-        }
-
-        /// Returns no memory owners in the isolated test runtime.
-        fn memoryAutoSaveOwnerKeys(&self) -> Result<Vec<String>, String> {
-            Ok(Vec::new())
-        }
-
-        /// Returns no chat messages in the isolated test runtime.
-        fn memoryAutoSaveMessagesBefore(
-            &self,
-            _chatId: &str,
-            _maxTimestampInclusive: i64,
-            _limit: usize,
-        ) -> Result<Vec<ProviderMemoryAutoSaveMessage>, String> {
-            Ok(Vec::new())
-        }
-
-        /// Returns no selected messages in the isolated test runtime.
-        fn memoryAutoSaveMessagesByTimestamps(
-            &self,
-            _chatId: &str,
-            _timestamps: &[i64],
-        ) -> Result<Vec<ProviderMemoryAutoSaveMessage>, String> {
-            Ok(Vec::new())
-        }
-
-        /// Returns no character prompt in the isolated test runtime.
-        fn characterPromptContext(
-            &self,
-            _roleCardId: &str,
-            _promptFunctionType: PromptFunctionType,
-        ) -> Result<ProviderCharacterPromptContext, String> {
-            Err("test runtime does not expose character prompts".to_string())
-        }
-
-        /// Returns no visible skill packages in the isolated test runtime.
-        fn aiVisibleSkillPackages(&self) -> Result<Vec<ProviderPackageInfo>, String> {
-            Ok(Vec::new())
-        }
-
-        /// Returns no function binding in the isolated test runtime.
-        fn modelBindingForFunction(
-            &self,
-            _rootDir: PathBuf,
-            _functionType: FunctionType,
-        ) -> Result<ProviderFunctionModelBinding, String> {
-            Err("test runtime does not expose model bindings".to_string())
-        }
-
-        /// Returns no model configuration in the isolated test runtime.
-        fn resolvedModelConfig(
-            &self,
-            _rootDir: PathBuf,
-            _providerId: &str,
-            _modelId: &str,
-        ) -> Result<ResolvedModelConfig, String> {
-            Err("test runtime does not expose model configuration".to_string())
-        }
-
-        /// Returns no provider profile in the isolated test runtime.
-        fn providerProfile(
-            &self,
-            _rootDir: PathBuf,
-            _providerId: &str,
-        ) -> Result<ProviderProfile, String> {
-            Err("test runtime does not expose provider profiles".to_string())
-        }
-
-        /// Reports that no package AI provider is registered in the test runtime.
-        fn hasToolPkgAiProvider(&self, _providerId: &str) -> bool {
-            false
-        }
-
-        /// Returns no package AI provider registration in the test runtime.
-        fn toolPkgAiProvider(
-            &self,
-            _providerId: &str,
-        ) -> Option<ProviderToolPkgAiProviderRegistration> {
-            None
-        }
-
-        /// Rejects package hook execution in the isolated test runtime.
-        fn runToolPkgAiProviderHook(
-            &self,
-            _containerPackageName: &str,
-            _functionName: &str,
-            _functionSource: Option<&str>,
-            _event: &str,
-            _tag: Option<String>,
-            _sourceKey: Option<String>,
-            _eventPayload: Value,
-            _runtimeContextKey: Option<String>,
-            _executionKind: Option<String>,
-            _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        ) -> Result<Option<String>, String> {
-            Err("test runtime does not execute package hooks".to_string())
-        }
-
-        /// Does not decode package hook output in the test runtime.
-        fn decodeToolPkgHookResult(&self, _raw: Option<String>) -> Option<Value> {
-            None
-        }
-
-        /// Returns a zero timestamp for deterministic timing assertions.
-        fn messageTimingNow(&self) -> ProviderMessageTiming {
-            ProviderMessageTiming { startedAtMs: 0 }
-        }
-
-        /// Ignores timing records in the isolated test runtime.
-        fn logMessageTiming(
-            &self,
-            _stage: &str,
-            _startTimeMs: ProviderMessageTiming,
-            _details: Option<String>,
-        ) {
-        }
-    }
-
-    /// Builds the isolated runtime context used by provider request tests.
-    fn test_runtime_context() -> ProviderRuntimeContext {
-        ProviderRuntimeContext::new(Arc::new(TestRuntimeSupport))
-    }
-
-    /// Builds a request carrying one assistant tool call and its result.
-    fn tool_continuation_request(reasoning_metadata: &str) -> SendMessageRequest {
-        let assistant_content = format!(
-            "<think>Inspect the workspace first.</think>visible\n{reasoning_metadata}\n<tool name=\"list_files\" call_id=\"call_1\"><param name=\"path\">/workspace</param></tool>"
-        );
-        SendMessageRequest {
-            chat_history: vec![
-                PromptTurn::new(PromptTurnKind::USER, "List the workspace files."),
-                PromptTurn::new(PromptTurnKind::ASSISTANT, assistant_content),
-                PromptTurn::new(
-                    PromptTurnKind::TOOL_RESULT,
-                    "<tool_result name=\"list_files\"><content>workspace result</content></tool_result>",
-                ),
-                PromptTurn::new(PromptTurnKind::USER, "Continue."),
-            ],
-            model_parameters: Vec::new(),
-            enable_thinking: true,
-            thinking_quality_level: 2,
-            thinking_configurations: "[]".to_string(),
-            thinking_option_id: String::new(),
-            stream: false,
-            available_tools: vec![ToolPrompt::new(
-                "list_files".to_string(),
-                "Lists workspace files".to_string(),
-            )],
-            preserve_think_in_history: true,
-            enable_retry: false,
-            on_non_fatal_error: None,
-            on_tool_invocation: None,
-        }
-    }
-
-    /// Builds the assistant/tool continuation used by Responses replay tests.
-    fn continuation_request(assistant_content: String, call_id: &str) -> Value {
-        json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": assistant_content,
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": "list_files",
-                            "arguments": "{\"path\":\"/workspace\"}"
-                        }
-                    }]
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": "workspace result"
-                }
-            ]
-        })
-    }
-
-    /// Verifies plaintext reasoning is replayed before the function call and result.
-    #[test]
-    fn plaintext_reasoning_replays_before_function_call() {
-        let reasoning_item = json!({
-            "type": "reasoning",
-            "id": "rs_plain_1",
-            "content": [{
-                "type": "reasoning_text",
-                "text": "Inspect the workspace first."
-            }]
-        });
-        let metadata =
-            DeepseekResponsesPayloadAdapter::create_reasoning_metadata_tag(&reasoning_item)
-                .expect("reasoning metadata");
-        let request = continuation_request(
-            format!("<think>Inspect the workspace first.</think>visible{metadata}"),
-            "call_plain_1",
-        );
-
-        let input = DeepseekResponsesPayloadAdapter::to_responses_request(request)["input"]
-            .as_array()
-            .expect("Responses input array")
-            .clone();
-        assert_eq!(input[0]["type"], "reasoning");
-        assert_eq!(input[0]["id"], "rs_plain_1");
-        assert_eq!(input[0]["content"][0]["type"], "reasoning_text");
-        assert_eq!(input[1]["type"], "message");
-        assert_eq!(input[1]["content"], "visible");
-        assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["call_id"], "call_plain_1");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(input[3]["call_id"], "call_plain_1");
-    }
-
-    /// Verifies encrypted reasoning is not sent through DeepSeek plaintext replay.
-    #[test]
-    fn encrypted_reasoning_is_not_replayed_as_plaintext() {
-        let parsed = DeepseekResponsesPayloadAdapter::parse_non_streaming_response(&json!({
-            "output": [{
-                "type": "reasoning",
-                "id": "rs_encrypted_1",
-                "encrypted_content": "encrypted"
-            }]
-        }));
-        assert!(parsed.reasoningMetadataTags.is_empty());
-    }
-
-    /// Verifies commentary continuation is encoded as DeepSeek reasoning text.
-    #[test]
-    fn commentary_replays_as_reasoning_text() {
-        let commentary_item = json!({
-            "type": "message",
-            "id": "msg_commentary_1",
-            "role": "assistant",
-            "phase": "commentary",
-            "content": [{
-                "type": "output_text",
-                "text": "Activate the package before calling its tool."
-            }]
-        });
-        let parsed = DeepseekResponsesPayloadAdapter::parse_non_streaming_response(&json!({
-            "output": [commentary_item]
-        }));
-        assert!(parsed.reasoningChunks.is_empty());
-        let metadata = parsed
-            .outputItemMetadataTags
-            .first()
-            .expect("commentary metadata")
-            .clone();
-        let input = DeepseekResponsesPayloadAdapter::to_responses_request(continuation_request(
-            metadata,
-            "call_commentary_1",
-        ))["input"]
-            .as_array()
-            .expect("Responses input array")
-            .clone();
-        assert_eq!(input[0]["type"], "reasoning");
-        assert_eq!(input[0]["content"][0]["type"], "reasoning_text");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            "Activate the package before calling its tool."
-        );
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[2]["type"], "function_call_output");
-    }
-
-    /// Verifies web-search metadata does not remove an unrelated thinking block.
-    #[test]
-    fn web_search_metadata_does_not_remove_thinking_content() {
-        let search_metadata = OpenAIResponsesPayloadAdapter::create_output_item_metadata_tag(
-            &json!({"type": "web_search_call", "id": "search_1"}),
-        )
-        .expect("search metadata");
-        let request = continuation_request(
-            format!("<think>raw thinking</think>visible{search_metadata}"),
-            "call_search_1",
-        );
-        let input = DeepseekResponsesPayloadAdapter::to_responses_request(request)["input"]
-            .as_array()
-            .expect("Responses input array")
-            .clone();
-        let message = input
-            .iter()
-            .find(|item| item["type"] == "message")
-            .expect("assistant message");
-        assert_eq!(message["content"], "<think>raw thinking</think>visible");
-        assert!(input.iter().any(|item| item["type"] == "function_call"));
-        assert!(input
-            .iter()
-            .any(|item| item["type"] == "function_call_output"));
-    }
-
-    /// Verifies the full DeepSeek request builder preserves replay order after tool bridging.
-    #[test]
-    fn request_builder_preserves_reasoning_tool_and_result_order() {
-        let reasoning_item = json!({
-            "type": "reasoning",
-            "id": "rs_request_1",
-            "content": [{
-                "type": "reasoning_text",
-                "text": "Inspect the workspace first."
-            }]
-        });
-        let reasoning_metadata =
-            DeepseekResponsesPayloadAdapter::create_reasoning_metadata_tag(&reasoning_item)
-                .expect("reasoning metadata");
-        let provider = DeepseekProvider::new(
-            "https://api.deepseek.com/v1/responses".to_string(),
-            String::new(),
-            "deepseek-reasoner".to_string(),
-            "DEEPSEEK".to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-            Vec::new(),
-            true,
-            test_runtime_context(),
-        );
-
-        let request = tool_continuation_request(&reasoning_metadata);
-        let body = provider
-            .create_request_body(&request)
-            .expect("DeepSeek Responses request must be buildable");
-        let input = body["input"].as_array().expect("Responses input array");
-
-        let reasoning_index = input
-            .iter()
-            .position(|item| item["type"] == "reasoning")
-            .expect("reasoning item must be replayed");
-        let function_call_index = input
-            .iter()
-            .position(|item| item["type"] == "function_call")
-            .expect("function call must be bridged");
-        let function_output_index = input
-            .iter()
-            .position(|item| item["type"] == "function_call_output")
-            .expect("function result must be bridged");
-        assert!(reasoning_index < function_call_index);
-        assert!(function_call_index < function_output_index);
-        assert_eq!(input[reasoning_index]["id"], "rs_request_1");
-        assert_eq!(input[function_call_index]["name"], "list_files");
-        assert_eq!(input[function_output_index]["output"], "workspace result");
-    }
-}
+#[path = "../../../../tests/DeepseekProviderResponsesTests.rs"]
+mod responses_tests;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1147,6 +767,7 @@ impl AIService for DeepseekProvider {
         }
     }
 
+    /// Sends a DeepSeek request while preserving parent-stream failures.
     async fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -1165,23 +786,7 @@ impl AIService for DeepseekProvider {
                     self.provider_model(),
                 ),
             );
-            let protocol = if self.uses_responses_protocol()? {
-                ResponsesStreamProtocol::Deepseek
-            } else {
-                ResponsesStreamProtocol::OpenAi
-            };
-            let mut parent = OpenAIProvider::new_with_capabilities(
-                self.api_endpoint.clone(),
-                self.api_key.clone(),
-                self.model_name.clone(),
-                self.provider_type.clone(),
-                self.custom_headers.clone(),
-                self.supports_vision,
-                self.supports_audio,
-                self.supports_video,
-                self.enable_tool_call,
-            )
-            .with_responses_stream_protocol(protocol);
+            let mut parent = self.open_ai_parent(self.uses_responses_protocol()?);
             let mut result = parent.send_prepared_request(request, request_body).await?;
             AppLogger::i(
                 PROVIDER_TRANSPORT_LOG_TAG,
@@ -1191,6 +796,8 @@ impl AIService for DeepseekProvider {
                 ),
             );
             let event_channel = result.event_channel().clone();
+            let terminalFailure = TerminalFailureState::new();
+            let producerTerminalFailure = terminalFailure.clone();
             let mut provider = self.clone();
             let activeParentGeneration = provider.setActiveParent(parent.clone());
             if provider.isCancelled() {
@@ -1209,8 +816,12 @@ impl AIService for DeepseekProvider {
                 let mut provider = ownedProvider
                     .take()
                     .expect("Deepseek parent stream must only be collected once");
+                let producerTerminalFailure = producerTerminalFailure.clone();
                 Box::pin(async move {
                     result.collect(emit).await;
+                    if let Some(error) = result.terminal_failure() {
+                        producerTerminalFailure.set(error);
+                    }
                     AppLogger::i(
                         PROVIDER_TRANSPORT_LOG_TAG,
                         &format!(
@@ -1222,14 +833,18 @@ impl AIService for DeepseekProvider {
                         ),
                     );
                     provider.apply_token_counts(TokenCounts {
-                        input: parent.input_token_count(),
+                        input: (parent.input_token_count() - parent.cached_input_token_count()).max(0),
                         cached_input: parent.cached_input_token_count(),
                         output: parent.output_token_count(),
                     });
                     provider.clearActiveParent(activeParentGeneration);
                 })
             });
-            return Ok(Box::new(with_event_channel(cold_stream, event_channel)));
+            return Ok(Box::new(with_event_channel_and_failure(
+                cold_stream,
+                event_channel,
+                terminalFailure,
+            )));
         }
 
         let client = reqwest::Client::new();
@@ -1370,6 +985,7 @@ impl AIService for DeepseekProvider {
                 &providerReadyHistory,
                 toolsJson.as_deref(),
                 true,
+                false,
             ),
         )
     }
@@ -1438,6 +1054,9 @@ fn parse_usage_counts(usage: &Value) -> TokenCounts {
     let cached_tokens = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0) as i64;
     let completion_tokens = usage
@@ -1489,19 +1108,9 @@ fn extract_tool_calls_xml_chunks(value: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::deepseek_uses_responses_protocol;
+#[path = "../../../../tests/DeepseekProviderTests.rs"]
+mod tests;
 
-    /// Selects Responses only from the final endpoint path segment.
-    #[test]
-    fn resolves_deepseek_endpoint_protocol() {
-        assert!(
-            deepseek_uses_responses_protocol("https://api.deepseek.com/v1/responses?trace=1")
-                .unwrap()
-        );
-        assert!(
-            !deepseek_uses_responses_protocol("https://api.deepseek.com/v1/chat/completions")
-                .unwrap()
-        );
-    }
-}
+#[cfg(test)]
+#[path = "../../../../tests/DeepseekProviderMediaRoleTests.rs"]
+mod media_role_tests;

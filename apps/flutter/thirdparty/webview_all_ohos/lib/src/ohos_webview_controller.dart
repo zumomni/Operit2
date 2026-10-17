@@ -604,6 +604,13 @@ class OhosWebViewController extends PlatformWebViewController {
       ohos_webview.WebView.api.instanceManager.getIdentifier(_webView)!;
 
   @override
+  String get localResourceScheme => 'https';
+
+  @override
+  Future<void> setLocalResourceHandler(WebViewLocalResourceHandler? handler) =>
+      WebViewLocalResourceBridge.setHandler(webViewIdentifier, handler);
+
+  @override
   Future<void> loadFile(String absoluteFilePath) async {
     final String url = absoluteFilePath.startsWith('file://')
         ? absoluteFilePath
@@ -743,29 +750,18 @@ class OhosWebViewController extends PlatformWebViewController {
   }
 
   @override
-  Future<Object> runJavaScriptReturningResult(String javaScript) async {
+  Future<Object?> runJavaScriptReturningResult(String javaScript) async {
     final String? result = await _webView.evaluateJavascript(javaScript);
-
-    if (result == null) {
-      throw ArgumentError(
-        'The JavaScript returned `null` or `undefined`, which is unsupported.',
-      );
-    }
+    if (result == null) return null;
 
     try {
-      final Object? decoded = jsonDecode(result);
-      if (decoded == null) {
-        throw ArgumentError(
-          'The JavaScript returned `null` or `undefined`, which is unsupported.',
-        );
-      }
-      return decoded;
+      return jsonDecode(result);
     } on FormatException {
       return num.tryParse(result) ?? result;
     }
   }
 
-  @override
+  /// Invokes an asynchronous script through this controller's ArkWeb bridge.
   Future<Object?> callAsyncJavaScript(JavaScriptInvocationParams params) async {
     final int generation = _navigationGeneration;
     final Stopwatch stopwatch = Stopwatch()..start();
@@ -930,14 +926,36 @@ ${params.functionBody}
     }
   }
 
+  /// Registers document-start code with ArkWeb's native script list.
   @override
-  Future<bool> isUserScriptInjectionSupported(
-    WebViewUserScriptInjectionTime injectionTime,
-  ) async {
-    // The current ArkWeb bridge does not expose deterministic document-start
-    // injection, so advertising it would create a race with page scripts.
-    return false;
+  Future<String> addUserScript(WebViewUserScript userScript) async {
+    final identifier = await const MethodChannel('operit/webview_user_scripts')
+        .invokeMethod<String>('add', {
+          'viewIdentifier': webViewIdentifier,
+          'source': buildUserScriptSource(
+            userScript,
+            platformHandlesMainFrameOnly: false,
+          ),
+        });
+    if (identifier == null) {
+      throw StateError('ArkWeb did not return a script handle');
+    }
+    return identifier;
   }
+
+  /// Removes a document-start registration after ArkWeb commits the new list.
+  @override
+  Future<void> removeUserScript(String identifier) =>
+      const MethodChannel('operit/webview_user_scripts').invokeMethod<void>(
+        'remove',
+        {'viewIdentifier': webViewIdentifier, 'identifier': identifier},
+      );
+
+  /// Removes application-owned document-start scripts without removing native proxies.
+  @override
+  Future<void> removeAllUserScripts() => const MethodChannel(
+    'operit/webview_user_scripts',
+  ).invokeMethod<void>('removeAll', {'viewIdentifier': webViewIdentifier});
 
   @override
   Future<void> addJavaScriptChannel(
@@ -1075,6 +1093,20 @@ ${params.functionBody}
   Future<void> setUseWideViewPort(bool use) {
     return _webView.settings.setUseWideViewPort(use);
   }
+
+  // The OHOS platform view already composes application paint zoom. Only page
+  // zoom is sent to ArkWeb; multiplying application zoom here would double it.
+  late final NativeWebViewZoom _pageZoom = NativeWebViewZoom(
+    applyZoom: (factor) => const MethodChannel('operit/webview_zoom')
+        .invokeMethod<void>('setPageZoom', <String, Object?>{
+          'viewIdentifier': webViewIdentifier,
+          'zoomFactor': factor,
+        }),
+  );
+
+  @override
+  Future<void> setZoomFactor(double zoomFactor) =>
+      _pageZoom.setPageZoomFactor(zoomFactor);
 
   /// Sets whether on-screen zoom controls are displayed.
   Future<void> setDisplayZoomControls(bool enabled) {

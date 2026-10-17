@@ -1,6 +1,10 @@
 #![allow(non_snake_case)]
 
+pub mod PeerRouter;
+pub mod peer;
+
 use std::sync::Arc;
+use operit_node_runtime::NodeServices::NodeServices;
 
 use async_trait::async_trait;
 pub use operit_edge_contract::{
@@ -13,41 +17,17 @@ use operit_link::{
     toCoreValue, CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream,
     CoreLinkError, CoreLinkSharedClient, CoreValue, CoreWatchRequest,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub mod service;
+
+pub use operit_edge_contract::{EdgeScreenSnapshot, EdgeScreenInputRequest, EdgeScreenInputState};
 
 pub use service::{
     createDeviceIoService, createRobotFaceService, DeviceIoService, DeviceIoStateStream,
     EdgeServiceError, HostDeviceIoService, HostRobotFaceService, RobotFaceService,
     RobotFaceStateStream,
 };
-
-/// One complete display snapshot transported through the standard Link value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EdgeScreenSnapshot {
-    pub width: u16,
-    pub height: u16,
-    pub format: String,
-    pub pixels: Vec<u8>,
-}
-
-/// A generic input event accepted by an Edge display service.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EdgeScreenInputRequest {
-    pub action: String,
-    pub x: u16,
-    pub y: u16,
-    pub endX: Option<u16>,
-    pub endY: Option<u16>,
-}
-
-/// Reports whether a display input event was accepted by the Edge service.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EdgeScreenInputState {
-    pub accepted: bool,
-    pub action: String,
-}
 
 /// Defines the minimal display operations shared by small embedded targets.
 pub trait ScreenService: Send + Sync {
@@ -58,12 +38,31 @@ pub trait ScreenService: Send + Sync {
     ) -> Result<EdgeScreenInputState, EdgeServiceError>;
 }
 
+/// Native service dispatch supplied by the device application. Returning None
+/// leaves built-in services to the node. There is no plugin registry or manifest.
+pub type EdgeCallHandler = dyn Fn(CoreCallRequest)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CoreCallResponse>>>>
+    + Send + Sync;
+
+/// Native output stream supplied by the device application (Stream / Watch).
+pub type EdgeWatchHandler = dyn Fn(CoreWatchRequest)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CoreEventStream, CoreLinkError>>>>
+    + Send + Sync;
+/// Native input stream supplied by the device application (ReverseStream / Push).
+pub type EdgePushHandler = dyn Fn(operit_link::CorePushRequest)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn operit_link::CoreLinkPushSession>, CoreLinkError>>>>
+    + Send + Sync;
+
 /// Owns the lightweight device-side Core services for one Edge Node.
 #[derive(Clone)]
 pub struct EdgeNode {
     deviceIoService: Arc<dyn DeviceIoService>,
     robotFaceService: Option<Arc<dyn RobotFaceService>>,
     screenService: Option<Arc<dyn ScreenService>>,
+    callHandler: Option<Arc<EdgeCallHandler>>,
+    watchHandler: Option<Arc<EdgeWatchHandler>>,
+    pushHandler: Option<Arc<EdgePushHandler>>,
+    nodeServices: Option<NodeServices>,
 }
 
 impl EdgeNode {
@@ -73,7 +72,21 @@ impl EdgeNode {
             deviceIoService,
             robotFaceService: None,
             screenService: None,
+            callHandler: None,
+            watchHandler: None,
+            pushHandler: None,
+            nodeServices: None,
         }
+    }
+
+    /// Edge 和普通节点注入同一个外层接口，不自行实现配对或鉴权。
+    pub fn withNodeServices(mut self, services: NodeServices) -> Self {
+        self.nodeServices = Some(services);
+        self
+    }
+
+    pub fn nodeServices(&self) -> Result<NodeServices, EdgeServiceError> {
+        self.nodeServices.clone().ok_or_else(|| EdgeServiceError::new("RuntimePeerService has not been installed"))
     }
 
     /// Creates an Edge Node with device services supplied by one Host Manager.
@@ -93,10 +106,23 @@ impl EdgeNode {
         self
     }
 
+    /// Installs native request dispatch owned by this device application.
+    pub fn withCallHandler(mut self, handler: Arc<EdgeCallHandler>) -> Self {
+        self.callHandler = Some(handler);
+        self
+    }
+
+    /// Installs the device application's generic Stream and ReverseStream endpoints.
+    pub fn withStreamHandlers(mut self, output: Arc<EdgeWatchHandler>, input: Arc<EdgePushHandler>) -> Self {
+        self.watchHandler = Some(output);
+        self.pushHandler = Some(input);
+        self
+    }
+
     /// Dispatches one Link call to the registered Edge Service.
     pub fn dispatchCall(&self, request: CoreCallRequest) -> CoreCallResponse {
         let requestId = request.requestId.clone();
-        let result = match request.targetObjectId {
+        let result = match request.target.as_str() {
             EDGE_DEVICE_IO_OBJECT_ID => match request.methodName.as_str() {
                 "setDigitalOutput" => self.setDigitalOutput(request.args),
                 "getDigitalOutput" => self.getDigitalOutput(request.args),
@@ -112,6 +138,7 @@ impl EdgeNode {
                 "sendScreenInput" => self.sendScreenInput(request.args),
                 _ => Err(CoreLinkError::methodNotFound(&request.registryKey())),
             },
+
             _ => Err(CoreLinkError::methodNotFound(&request.registryKey())),
         };
         match result {
@@ -125,7 +152,7 @@ impl EdgeNode {
         &self,
         request: CoreWatchRequest,
     ) -> Result<CoreEvent, CoreLinkError> {
-        match request.targetObjectId {
+        match request.target.as_str() {
             EDGE_DEVICE_IO_OBJECT_ID => {
                 self.validateDeviceIoWatch(&request)?;
                 let pin = decodePin(request.args)?;
@@ -135,7 +162,7 @@ impl EdgeNode {
                     .map_err(serviceError)?;
                 Ok(CoreEvent {
                     requestId: Some(request.requestId),
-                    targetObjectId: request.targetObjectId,
+                    target: request.target.clone(),
                     propertyName: request.propertyName,
                     kind: CoreEventKind::Snapshot,
                     value: toCoreValue(state)
@@ -150,7 +177,7 @@ impl EdgeNode {
                     .map_err(serviceError)?;
                 Ok(CoreEvent {
                     requestId: Some(request.requestId),
-                    targetObjectId: request.targetObjectId,
+                    target: request.target.clone(),
                     propertyName: request.propertyName,
                     kind: CoreEventKind::Snapshot,
                     value: toCoreValue(state)
@@ -167,7 +194,7 @@ impl EdgeNode {
         &self,
         request: CoreWatchRequest,
     ) -> Result<CoreEventStream, CoreLinkError> {
-        match request.targetObjectId {
+        match request.target.as_str() {
             EDGE_DEVICE_IO_OBJECT_ID => self.dispatchDeviceIoWatch(request),
             EDGE_ROBOT_FACE_OBJECT_ID => self.dispatchRobotFaceWatch(request),
             _ => Err(CoreLinkError::watchNotFound(&request.registryKey())),
@@ -187,7 +214,7 @@ impl EdgeNode {
             .map_err(serviceError)?;
         let sourceClose = source.closeHandle();
         let requestId = request.requestId;
-        let targetObjectId = request.targetObjectId;
+        let target = request.target.clone();
         let propertyName = request.propertyName;
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         std::thread::spawn(move || {
@@ -200,7 +227,7 @@ impl EdgeNode {
                 if sender
                     .send(CoreEvent {
                         requestId: Some(requestId.clone()),
-                        targetObjectId,
+                        target: target.clone(),
                         propertyName: propertyName.clone(),
                         kind: kind.clone(),
                         value,
@@ -219,7 +246,7 @@ impl EdgeNode {
 
     /// Validates the Edge device watch address and property name.
     fn validateDeviceIoWatch(&self, request: &CoreWatchRequest) -> Result<(), CoreLinkError> {
-        if request.targetObjectId != EDGE_DEVICE_IO_OBJECT_ID
+        if request.target != EDGE_DEVICE_IO_OBJECT_ID
             || request.propertyName != EDGE_DEVICE_IO_STATE_PROPERTY
         {
             return Err(CoreLinkError::watchNotFound(&request.registryKey()));
@@ -239,7 +266,7 @@ impl EdgeNode {
             .map_err(serviceError)?;
         let sourceClose = source.closeHandle();
         let requestId = request.requestId;
-        let targetObjectId = request.targetObjectId;
+        let target = request.target.clone();
         let propertyName = request.propertyName;
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         std::thread::spawn(move || {
@@ -252,7 +279,7 @@ impl EdgeNode {
                 if sender
                     .send(CoreEvent {
                         requestId: Some(requestId.clone()),
-                        targetObjectId,
+                        target: target.clone(),
                         propertyName: propertyName.clone(),
                         kind: kind.clone(),
                         value,
@@ -271,7 +298,7 @@ impl EdgeNode {
 
     /// Validates the Edge robot face watch address and property name.
     fn validateRobotFaceWatch(&self, request: &CoreWatchRequest) -> Result<(), CoreLinkError> {
-        if request.targetObjectId != EDGE_ROBOT_FACE_OBJECT_ID
+        if request.target != EDGE_ROBOT_FACE_OBJECT_ID
             || request.propertyName != EDGE_ROBOT_FACE_STATE_PROPERTY
         {
             return Err(CoreLinkError::watchNotFound(&request.registryKey()));
@@ -336,6 +363,15 @@ impl EdgeNode {
         encodeValue(service.getScreenSnapshot().map_err(serviceError)?)
     }
 
+    async fn dispatchAsyncCall(&self, request: CoreCallRequest) -> CoreCallResponse {
+        if let Some(handler) = &self.callHandler {
+            if let Some(response) = handler(request.clone()).await {
+                return response;
+            }
+        }
+        self.dispatchCall(request)
+    }
+
     fn sendScreenInput(&self, args: CoreValue) -> Result<CoreValue, CoreLinkError> {
         let service = self
             .screenService
@@ -350,7 +386,7 @@ impl EdgeNode {
 impl CoreLinkSharedClient for EdgeNode {
     /// Dispatches one local Edge Core call through the shared Link interface.
     async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-        self.dispatchCall(request)
+        self.dispatchAsyncCall(request).await
     }
 
     /// Reads one local Edge Core watch snapshot through the shared Link interface.
@@ -360,7 +396,43 @@ impl CoreLinkSharedClient for EdgeNode {
 
     /// Opens one local Edge Core watch through the shared Link interface.
     async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        if let Some(handler) = &self.watchHandler {
+            if !matches!(request.target.as_str(), EDGE_DEVICE_IO_OBJECT_ID | EDGE_ROBOT_FACE_OBJECT_ID | EDGE_SCREEN_OBJECT_ID) {
+                return handler(request).await;
+            }
+        }
         self.dispatchWatch(request)
+    }
+
+    /// Opens the native application's ReverseStream endpoint.
+    async fn openPush(
+        &self,
+        request: operit_link::CorePushRequest,
+    ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+        match &self.pushHandler {
+            Some(handler) => handler(request).await,
+            None => Err(CoreLinkError::methodNotFound(&format!("{}.{}", request.target, request.methodName))),
+        }
+    }
+}
+
+/// The lightweight node accepts the same Link interface as a full node.
+/// Board capabilities are selected by services through HostManager, not by transport.
+#[async_trait(?Send)]
+impl operit_link::CoreLinkClient for EdgeNode {
+    async fn call(&mut self, request: CoreCallRequest) -> CoreCallResponse {
+        self.dispatchAsyncCall(request).await
+    }
+    async fn watchSnapshot(&mut self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        self.dispatchWatchSnapshot(request)
+    }
+    async fn watch(&mut self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        CoreLinkSharedClient::watch(self, request).await
+    }
+    /// Opens an input stream through the shared Edge service capability boundary.
+    async fn openPush(&mut self, request: operit_link::CorePushRequest)
+        -> Result<Box<dyn operit_link::CoreLinkPushSession>, CoreLinkError> {
+        CoreLinkSharedClient::openPush(self, request).await
     }
 }
 
@@ -402,6 +474,233 @@ mod tests {
     use super::*;
     use crate::service::{DeviceIoService, RobotFaceService, RobotFaceStateStream};
     use operit_host_api::RobotFaceState;
+
+    #[tokio::test]
+    async fn native_service_dispatch_is_async_and_has_no_plugin_envelope() {
+        let node = testNodeWithRobotFace().withCallHandler(Arc::new(|request| Box::pin(async move {
+            if request.target != "edge.ui" { return None; }
+            tokio::task::yield_now().await;
+            Some(if request.methodName == "screen" {
+                CoreCallResponse::ok(request.requestId, request.args)
+            } else {
+                CoreCallResponse::err(request.requestId.clone(), CoreLinkError::methodNotFound(&request.registryKey()))
+            })
+        })));
+        let value = CoreValue::String("main-thread-snapshot".into());
+        let response = CoreLinkSharedClient::call(&node, CoreCallRequest::new("native", "edge.ui", "screen", value.clone())).await;
+        assert_eq!(response.result.unwrap(), value);
+        let response = CoreLinkSharedClient::call(&node, CoreCallRequest::new("native", "edge.ui", "unknown", CoreValue::Null)).await;
+        assert!(response.result.is_err());
+        let response = CoreLinkSharedClient::call(&node, CoreCallRequest::new("old", "edge.plugins", "list", CoreValue::Null)).await;
+        assert!(response.result.is_err());
+        let response = CoreLinkSharedClient::call(&node, CoreCallRequest::new("built-in", EDGE_ROBOT_FACE_OBJECT_ID, "getExpression", CoreValue::Null)).await;
+        assert!(response.result.is_ok(), "native dispatch must leave built-in services available");
+    }
+
+    #[tokio::test]
+    async fn standard_link_dispatches_to_board_host_and_publishes_watch() {
+        use operit_host_api::{DeviceDigitalOutputRequest, DeviceDigitalOutputState, DeviceIoHost, HostResult};
+        struct Board(std::sync::Mutex<bool>);
+        impl DeviceIoHost for Board {
+            fn setDigitalOutput(&self, request: DeviceDigitalOutputRequest) -> HostResult<DeviceDigitalOutputState> {
+                *self.0.lock().unwrap() = request.level;
+                Ok(DeviceDigitalOutputState { pin: request.pin, level: request.level })
+            }
+            fn getDigitalOutput(&self, pin: u8) -> HostResult<DeviceDigitalOutputState> {
+                Ok(DeviceDigitalOutputState { pin, level: *self.0.lock().unwrap() })
+            }
+        }
+        let board = Arc::new(Board(std::sync::Mutex::new(false)));
+        let mut node = EdgeNode::fromHostManager(HostManager::new().withDeviceIoHost(board.clone()));
+        let args = || toCoreValue(DeviceDigitalOutputRequest { pin: 2, level: true }).unwrap();
+        let mut watch = operit_link::CoreLinkClient::watch(&mut node,
+            CoreWatchRequest::new("watch", EDGE_DEVICE_IO_OBJECT_ID, EDGE_DEVICE_IO_STATE_PROPERTY, args()))
+            .await.unwrap();
+        assert_eq!(watch.recv().await.unwrap().kind, CoreEventKind::Snapshot);
+        let response = operit_link::CoreLinkClient::call(&mut node,
+            CoreCallRequest::new("write", EDGE_DEVICE_IO_OBJECT_ID, "setDigitalOutput", args())).await;
+        assert!(response.result.is_ok());
+        assert!(*board.0.lock().unwrap());
+        let event = watch.recv().await.unwrap();
+        assert_eq!(event.kind, CoreEventKind::Changed);
+        assert!(operit_link::fromCoreValue::<DeviceDigitalOutputState>(event.value).unwrap().level);
+        drop(watch);
+        let push = operit_link::CoreLinkClient::openPush(&mut node,
+            operit_link::CorePushRequest::new("push", EDGE_DEVICE_IO_OBJECT_ID, "notDeclared")).await;
+        assert!(push.is_err());
+    }
+
+    /// Executes the existing Edge service and Host path through standard Link ingress.
+    #[tokio::test]
+    async fn standard_wire_session_executes_edge_service_and_host() {
+        use operit_host_api::{DeviceDigitalOutputRequest, DeviceDigitalOutputState, DeviceIoHost, HostResult};
+        use operit_link::{CoreLinkSession, CoreLinkRequest, CoreLinkResponse, CoreLinkWatchRequest,
+            CoreLinkWatchResponse, CoreLinkPushRequestMessage, CorePushRequest, encodeLink, decodeLink};
+        struct Board(std::sync::Mutex<bool>);
+        impl DeviceIoHost for Board {
+            fn setDigitalOutput(&self, request: DeviceDigitalOutputRequest) -> HostResult<DeviceDigitalOutputState> {
+                *self.0.lock().unwrap() = request.level;
+                Ok(DeviceDigitalOutputState { pin: request.pin, level: request.level })
+            }
+            fn getDigitalOutput(&self, pin: u8) -> HostResult<DeviceDigitalOutputState> {
+                Ok(DeviceDigitalOutputState { pin, level: *self.0.lock().unwrap() })
+            }
+        }
+        async fn exchange(session: &mut CoreLinkSession<EdgeNode>, request: CoreLinkRequest) -> CoreLinkResponse {
+            let request = decodeLink(&encodeLink(&request).unwrap()).unwrap();
+            let response = session.dispatch(request).await;
+            decodeLink(&encodeLink(&response).unwrap()).unwrap()
+        }
+        let board = Arc::new(Board(std::sync::Mutex::new(false)));
+        let node = EdgeNode::fromHostManager(HostManager::new().withDeviceIoHost(board.clone()));
+        let mut session = CoreLinkSession::new(node, 4);
+        let args = || toCoreValue(DeviceDigitalOutputRequest { pin: 2, level: true }).unwrap();
+        let watch = || CoreWatchRequest::new("watch", EDGE_DEVICE_IO_OBJECT_ID, EDGE_DEVICE_IO_STATE_PROPERTY, args());
+        assert!(matches!(exchange(&mut session, CoreLinkRequest::Watch(CoreLinkWatchRequest::Open(watch()))).await,
+            CoreLinkResponse::Watch { result: Ok(CoreLinkWatchResponse::Opened), .. }));
+        assert!(matches!(session.nextWatchEvent().await,
+            Some(CoreLinkResponse::Watch { result: Ok(CoreLinkWatchResponse::Event(CoreEvent { kind: CoreEventKind::Snapshot, .. })), .. })));
+        assert!(matches!(exchange(&mut session, CoreLinkRequest::Call(CoreCallRequest::new(
+            "write", EDGE_DEVICE_IO_OBJECT_ID, "setDigitalOutput", args()))).await,
+            CoreLinkResponse::Call(CoreCallResponse { result: Ok(_), .. })));
+        assert!(*board.0.lock().unwrap());
+        let Some(CoreLinkResponse::Watch { result: Ok(CoreLinkWatchResponse::Event(event)), .. }) = session.nextWatchEvent().await else {
+            panic!("Expected service event after Host write");
+        };
+        assert_eq!(event.kind, CoreEventKind::Changed);
+        assert!(operit_link::fromCoreValue::<DeviceDigitalOutputState>(event.value).unwrap().level);
+        assert!(matches!(exchange(&mut session, CoreLinkRequest::Watch(CoreLinkWatchRequest::Snapshot(watch()))).await,
+            CoreLinkResponse::Watch { result: Ok(CoreLinkWatchResponse::Snapshot(_)), .. }));
+        let expected = operit_link::CoreLinkError::methodNotFound("unused").code;
+        assert!(matches!(exchange(&mut session, CoreLinkRequest::Push(CoreLinkPushRequestMessage::Open(
+            CorePushRequest::new("push", EDGE_DEVICE_IO_OBJECT_ID, "notDeclared")))).await,
+            CoreLinkResponse::Push { pushId, result: Err(error) } if pushId == "push" && error.code == expected));
+        exchange(&mut session, CoreLinkRequest::Watch(CoreLinkWatchRequest::Close {
+            requestId: operit_link::CoreRequestId::new("watch"),
+        })).await;
+        assert!(!session.hasWatches());
+    }
+
+    /// Exercises the shared runtime adapter, not a second Edge wire registry.
+    #[tokio::test]
+    async fn shared_peer_router_reuses_local_call_and_watch() {
+        use crate::PeerRouter::EdgePeerRouter;
+        use operit_link::{RoutedCoreRequest, RoutedCoreRequestKind};
+        use operit_node_runtime::PeerRouter::PeerRouter;
+        let router = EdgePeerRouter::new("edge-test".into());
+        router
+            .install(Arc::new(EdgeNode::new(Arc::new(TestDeviceIoService))))
+            .unwrap();
+        assert!(router
+            .install(Arc::new(EdgeNode::new(Arc::new(TestDeviceIoService))))
+            .is_err());
+        assert_eq!(router.localNodeId(), "edge-test");
+        assert_eq!(router.spaceChannelScope("paired-core").unwrap(), None);
+        let route = |payload| RoutedCoreRequest {
+            spaceId: String::new(),
+            originNodeId: "paired-core".into(),
+            targetNodeId: "edge-test".into(),
+            ttl: 1,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload,
+        };
+        let args = toCoreValue(operit_host_api::DeviceDigitalOutputRequest {
+            pin: 2,
+            level: true,
+        })
+        .unwrap();
+        let call = CoreCallRequest::new(
+            "write",
+            EDGE_DEVICE_IO_OBJECT_ID,
+            "setDigitalOutput",
+            args.clone(),
+        );
+        let response = router.routedCall("paired-core".into(), route(call)).await;
+        assert_eq!(response.requestId, operit_link::CoreRequestId::new("write"));
+        let state: operit_host_api::DeviceDigitalOutputState =
+            operit_link::fromCoreValue(response.result.unwrap()).unwrap();
+        assert!(state.level);
+        assert_eq!(state.pin, 2);
+        let request = RoutedCoreRequest {
+            spaceId: String::new(),
+            originNodeId: "paired-core".into(),
+            targetNodeId: "edge-test".into(),
+            ttl: 1,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload: CoreWatchRequest::new(
+                "watch",
+                EDGE_DEVICE_IO_OBJECT_ID,
+                EDGE_DEVICE_IO_STATE_PROPERTY,
+                args,
+            ),
+        };
+        assert_eq!(
+            router
+                .routedWatchSnapshot("paired-core".into(), request.clone())
+                .await
+                .unwrap()
+                .kind,
+            CoreEventKind::Snapshot
+        );
+        let mut stream = router
+            .routedWatch("paired-core".into(), request)
+            .await
+            .unwrap();
+        assert_eq!(stream.recv().await.unwrap().kind, CoreEventKind::Snapshot);
+    }
+
+    #[tokio::test]
+    async fn shared_peer_router_rejects_other_nodes_and_space_routes() {
+        use crate::PeerRouter::EdgePeerRouter;
+        use operit_link::{RoutedCoreRequest, RoutedCoreRequestKind};
+        use operit_node_runtime::PeerRouter::PeerRouter;
+        let router = EdgePeerRouter::new("edge-test".into());
+        let request = RoutedCoreRequest {
+            spaceId: String::new(),
+            originNodeId: "paired-core".into(),
+            targetNodeId: "other-node".into(),
+            ttl: 1,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload: CoreCallRequest::new(
+                "call",
+                EDGE_DEVICE_IO_OBJECT_ID,
+                "getDigitalOutput",
+                CoreValue::Null,
+            ),
+        };
+        assert_eq!(
+            router
+                .routedCall("paired-core".into(), request.clone())
+                .await
+                .result
+                .unwrap_err()
+                .code,
+            "EDGE_ROUTE_TARGET_MISMATCH"
+        );
+        let mut request = request;
+        request.targetNodeId = "edge-test".into();
+        for kind in [
+            RoutedCoreRequestKind::SpaceRoute,
+            RoutedCoreRequestKind::SpaceBinding,
+        ] {
+            request.routeKind = kind;
+            assert_eq!(
+                router
+                    .routedCall("paired-core".into(), request.clone())
+                    .await
+                    .result
+                    .unwrap_err()
+                    .code,
+                "EDGE_ROUTE_UNSUPPORTED"
+            );
+        }
+        request.routeKind = RoutedCoreRequestKind::Target;
+        assert!(router
+            .routedCall("paired-core".into(), request)
+            .await
+            .result
+            .is_err());
+    }
 
     /// Provides a deterministic typed service for Edge Node tests.
     struct TestDeviceIoService;
@@ -578,3 +877,7 @@ mod tests {
         assert_eq!(state.expression, "neutral");
     }
 }
+
+#[cfg(test)]
+#[path = "space_admission_tests.rs"]
+mod space_admission_tests;

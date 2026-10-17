@@ -5,16 +5,15 @@ use operit_host_api::PluginSdkIpcEndpoint;
 use operit_host_native_plugin_sdk_ipc::MemoryPluginSdkIpcHost;
 use operit_link::{
     CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream,
-    CoreLinkError, CoreLinkPushSession, CorePushRequest, CoreValue, CoreWatchRequest,
+    CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CorePushRequest, CoreValue, CoreWatchRequest,
 };
-use operit_plugin_sdk_ipc::{PluginSdkClient, PluginSdkIpcServer, PluginSdkLinkTarget};
+use operit_plugin_sdk_ipc::{PluginSdkClient, PluginSdkIpcServer};
 
-/// Provides deterministic Core Link behavior for the cross-process conformance test.
-#[derive(Clone)]
+/// Provides deterministic shared Link behavior without mutable ownership or client cloning.
 struct TestCoreLinkTarget;
 
 #[async_trait(?Send)]
-impl PluginSdkLinkTarget for TestCoreLinkTarget {
+impl CoreLinkSharedClient for TestCoreLinkTarget {
     /// Returns the input argument through the canonical call response.
     async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
         CoreCallResponse::ok(request.requestId, request.args)
@@ -24,7 +23,7 @@ impl PluginSdkLinkTarget for TestCoreLinkTarget {
     async fn watchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
         Ok(CoreEvent {
             requestId: Some(request.requestId.clone()),
-            targetObjectId: request.targetObjectId,
+            target: request.target.clone(),
             propertyName: request.propertyName,
             kind: CoreEventKind::Snapshot,
             value: request.args,
@@ -34,13 +33,13 @@ impl PluginSdkLinkTarget for TestCoreLinkTarget {
     /// Produces an ordered snapshot, changed, and completed event stream.
     async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
         let (sender, stream) = CoreEventStream::channel();
-        let targetObjectId = request.targetObjectId;
+        let target = request.target.clone();
         let propertyName = request.propertyName;
         let requestId = request.requestId;
         sender
             .send(CoreEvent {
                 requestId: Some(requestId.clone()),
-                targetObjectId,
+                target: target.clone(),
                 propertyName: propertyName.clone(),
                 kind: CoreEventKind::Snapshot,
                 value: CoreValue::String("snapshot".to_string()),
@@ -49,7 +48,7 @@ impl PluginSdkLinkTarget for TestCoreLinkTarget {
         sender
             .send(CoreEvent {
                 requestId: Some(requestId.clone()),
-                targetObjectId,
+                target: target.clone(),
                 propertyName: propertyName.clone(),
                 kind: CoreEventKind::Changed,
                 value: CoreValue::String("changed".to_string()),
@@ -58,7 +57,7 @@ impl PluginSdkLinkTarget for TestCoreLinkTarget {
         sender
             .send(CoreEvent {
                 requestId: Some(requestId),
-                targetObjectId,
+                target: target.clone(),
                 propertyName,
                 kind: CoreEventKind::Completed,
                 value: CoreValue::Null,
@@ -105,9 +104,9 @@ fn pair() -> (
         Arc::new(TestCoreLinkTarget),
         {
             let mut surface = operit_plugin_sdk_ipc::PluginSdkSurface::new();
-            surface.expose(7, "echo");
-            surface.expose(7, "state");
-            surface.expose(7, "input");
+            surface.expose("core/test", "echo");
+            surface.expose("core/test", "state");
+            surface.expose("core/test", "input");
             surface
         },
     );
@@ -116,6 +115,7 @@ fn pair() -> (
     (host, client, server)
 }
 
+/// Exercises all Link families through a shared client and a shared-only IPC target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forwards_call_watch_snapshot_watch_and_push() {
     let (_host, client, server) = pair();
@@ -123,7 +123,7 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
     let call = client
         .call(CoreCallRequest::new(
             "call-1",
-            7,
+            "core/test",
             "echo",
             CoreValue::String("value".to_string()),
         ))
@@ -133,7 +133,7 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
     let snapshot = client
         .watchSnapshot(CoreWatchRequest::new(
             "snapshot-1",
-            7,
+            "core/test",
             "state",
             CoreValue::String("initial".to_string()),
         ))
@@ -144,7 +144,7 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
     let mut stream = client
         .watch(CoreWatchRequest::new(
             "watch-1",
-            7,
+            "core/test",
             "state",
             CoreValue::emptyMap(),
         ))
@@ -155,8 +155,9 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
     assert_eq!(stream.recv().await.expect("completed event").kind, CoreEventKind::Completed);
     drop(stream);
 
-    let mut push = client
-        .openPush(CorePushRequest::new("push-1", 7, "input"))
+    let shared: &dyn CoreLinkSharedClient = &client;
+    let mut push = shared
+        .openPush(CorePushRequest::new("push-1", "core/test", "input"))
         .await
         .expect("push opens");
     push.send(CoreValue::String("item".to_string()))
@@ -172,7 +173,7 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
 async fn rejects_unexposed_route() {
     let (_host, client, server) = pair();
     let response = client
-        .call(CoreCallRequest::new("blocked-1", 7, "privateMethod", CoreValue::Null))
+        .call(CoreCallRequest::new("blocked-1", "core/test", "privateMethod", CoreValue::Null))
         .await;
     assert_eq!(response.result.expect_err("route must be rejected").code, "PLUGIN_SDK_ROUTE_NOT_EXPOSED");
     server.stop().expect("server stops");

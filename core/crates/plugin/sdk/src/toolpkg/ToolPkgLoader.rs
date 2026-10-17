@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::javascript::JsExecutionEngine;
+use crate::javascript::{JsExecutionEngine, ToolPkgConfigScope};
 use crate::toolpkg::ToolPkgParser::{
     ToolPkgArchiveParser, ToolPkgLoadResult, ToolPkgMainRegistrationParseResult, ToolPkgSourceType,
 };
@@ -17,6 +17,7 @@ impl ToolPkgLoader {
     pub fn loadToolPkgFromExternalFile<FReportPackageLoadError>(
         fileSystemHost: &dyn FileSystemHost,
         sourcePath: &str,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
@@ -31,6 +32,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::EXTERNAL,
             sourcePath,
             false,
+            configScope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -47,11 +49,16 @@ impl ToolPkgLoader {
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
+        let scope = match ToolPkgArchiveParser::readInstallationScope(bytes)? {
+            Some(scope) => scope,
+            None => ToolPkgConfigScope::Device,
+        };
         Self::loadToolPkgFromArchiveBytes(
             bytes,
             ToolPkgSourceType::EXTERNAL,
             assetName,
             false,
+            scope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -73,6 +80,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::ASSET,
             assetName,
             true,
+            ToolPkgConfigScope::Device,
             jsEngine,
             reportPackageLoadError,
         )
@@ -83,6 +91,7 @@ impl ToolPkgLoader {
     pub fn loadToolPkgFromMarketFile<FReportPackageLoadError>(
         fileSystemHost: &dyn FileSystemHost,
         sourcePath: &str,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
@@ -97,6 +106,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::MARKET,
             sourcePath,
             false,
+            configScope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -109,12 +119,22 @@ impl ToolPkgLoader {
         sourceType: ToolPkgSourceType,
         sourcePath: &str,
         isBuiltIn: bool,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
+        let requiredScope = ToolPkgArchiveParser::readInstallationScope(archiveBytes)?;
+        let configScope = match (isBuiltIn, requiredScope) {
+            (true, Some(scope)) => scope,
+            (false, Some(scope)) if scope != configScope => {
+                return Err(format!("ToolPkg requires {} installation scope, not {}", scope.as_str(), configScope.as_str()));
+            }
+            _ => configScope,
+        };
+        ToolPkgArchiveParser::readThemeTemplates(archiveBytes)?;
         let cursor = Cursor::new(archiveBytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|error| error.to_string())?;
         let entryIndex = ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
@@ -146,6 +166,7 @@ impl ToolPkgLoader {
                     toolPkgId,
                     mainScriptPath,
                     apiVersion,
+                    configScope,
                     jsEngine,
                     textResources.clone(),
                 )
@@ -162,6 +183,7 @@ fn parseMainRegistration(
     toolPkgId: &str,
     mainScriptPath: &str,
     apiVersion: &str,
+    configScope: ToolPkgConfigScope,
     jsEngine: &dyn JsExecutionEngine,
     textResources: Arc<std::collections::BTreeMap<String, String>>,
 ) -> ToolPkgMainRegistrationParseResult {
@@ -170,6 +192,7 @@ fn parseMainRegistration(
         toolPkgId,
         mainScriptPath,
         apiVersion,
+        configScope,
         jsEngine,
         Some(textResources),
     )

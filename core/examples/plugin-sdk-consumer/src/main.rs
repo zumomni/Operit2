@@ -32,8 +32,10 @@ impl JsExecutionEngine for ExampleExecutionEngine {
         _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         _dispatch_intermediate_on_main: bool,
         _timeout_sec: u64,
-    ) -> JsExecutionResult<Option<String>> {
-        Ok(Some(format!("executed:{function_name}")))
+    ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>>
+    {
+        let result = (|| Ok(Some(format!("executed:{function_name}"))))();
+        Box::pin(std::future::ready(result))
     }
 
     /// Executes one JavaScript function with an exact millisecond deadline in the example runtime.
@@ -46,8 +48,10 @@ impl JsExecutionEngine for ExampleExecutionEngine {
         _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         _dispatch_intermediate_on_main: bool,
         _timeout_millis: u64,
-    ) -> JsExecutionResult<Option<String>> {
-        Ok(Some(format!("executed:{function_name}")))
+    ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>>
+    {
+        let result = (|| Ok(Some(format!("executed:{function_name}"))))();
+        Box::pin(std::future::ready(result))
     }
 
     /// Executes one JavaScript function through the example asynchronous contract.
@@ -75,50 +79,25 @@ impl JsExecutionEngine for ExampleExecutionEngine {
         Ok(ToolPkgMainRegistrationCapture::default())
     }
 
-    /// Renders one Compose DSL script.
-    fn execute_compose_dsl_script(
-        &self,
-        _script: &str,
-        _runtime_options: &BTreeMap<String, Value>,
-        _env_overrides: &BTreeMap<String, String>,
-        _text_resources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionResult<Option<String>> {
-        Ok(Some(r#"{"tree":{"type":"Text"}}"#.to_string()))
-    }
-
-    /// Renders one Compose DSL script through the example asynchronous contract.
-    fn execute_compose_dsl_script_async(
-        &self,
-        _script: String,
-        _runtime_options: BTreeMap<String, Value>,
-        _env_overrides: BTreeMap<String, String>,
-        _text_resources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        Box::pin(async { Ok(Some(r#"{"tree":{"type":"Text"}}"#.to_string())) })
-    }
-
-    /// Dispatches one Compose DSL action.
-    fn dispatch_compose_dsl_action(
-        &self,
-        action_id: &str,
-        _payload: Option<Value>,
-        _runtime_options: &BTreeMap<String, Value>,
-        _env_overrides: &BTreeMap<String, String>,
-        _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionResult<Option<String>> {
-        Ok(Some(format!("action:{action_id}")))
+    /// Rejects live-session rendering in this recording-only engine.
+    fn execute_compose_dsl_script_stream_async(
+        &self, _script: String, _runtime_options: BTreeMap<String, Value>,
+        _env_overrides: BTreeMap<String, String>, _text_resources: Arc<BTreeMap<String, String>>,
+        _on_response: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> operit_plugin_sdk::javascript::JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+        Box::pin(async { Err(operit_plugin_sdk::execution_result::JsExecutionError::invalid_request("This recording engine does not execute live Compose sessions")) })
     }
 
     /// Dispatches one Compose DSL action through the example asynchronous contract.
-    fn dispatch_compose_dsl_action_result_async(
+    fn dispatch_compose_dsl_action_stream_async(
         &self,
         action_id: String,
         _payload: Option<Value>,
         _runtime_options: BTreeMap<String, Value>,
         _env_overrides: BTreeMap<String, String>,
-        _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        Box::pin(async move { Ok(Some(format!("action:{action_id}"))) })
+        _on_intermediate_result: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+        Box::pin(async move { Ok(Some(Value::String(format!("action:{action_id}")))) })
     }
 
     /// Releases resources owned by this example engine.
@@ -130,16 +109,25 @@ struct ExampleExecutionEngineFactory;
 
 impl ToolPkgExecutionEngineFactory for ExampleExecutionEngineFactory {
     /// Creates one execution engine without a ToolPkg package environment.
-    fn createExecutionEngine(&self) -> Arc<dyn JsExecutionEngine> {
-        Arc::new(ExampleExecutionEngine)
+    fn createExecutionEngine(&self) -> Result<Arc<dyn JsExecutionEngine>, String> {
+        Ok(Arc::new(ExampleExecutionEngine))
     }
 
     /// Creates one execution engine for a ToolPkg runtime.
     fn createToolPkgExecutionEngine(
         &self,
         _context: ToolPkgExecutionContext,
-    ) -> Arc<dyn JsExecutionEngine> {
-        Arc::new(ExampleExecutionEngine)
+    ) -> Result<Arc<dyn JsExecutionEngine>, String> {
+        Ok(Arc::new(ExampleExecutionEngine))
+    }
+
+    /// Completes the asynchronous factory contract with this consumer's explicit engine implementation.
+    #[allow(non_snake_case)]
+    fn acquireToolPkgExecutionEngine(
+        &self, context: ToolPkgExecutionContext,
+    ) -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Arc<dyn JsExecutionEngine>, String>> {
+        let result = self.createToolPkgExecutionEngine(context);
+        Box::pin(async move { result })
     }
 }
 

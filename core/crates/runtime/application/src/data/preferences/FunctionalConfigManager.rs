@@ -1,3 +1,6 @@
+use operit_store::PreferenceMerge::{
+    PreferenceMergePathSegment, PreferenceMergeReference, PreferenceMergeStore,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -62,7 +65,32 @@ pub struct FunctionalConfigManager {
 }
 
 impl FunctionalConfigManager {
-    const PREFERENCES_VERSION: u32 = 2;
+    /// Opens this owner's versioned store through the supplied runtime storage host.
+    pub(crate) fn preferenceStore(
+        storage: std::sync::Arc<dyn operit_host_api::RuntimeStorageHost>,
+        path: impl Into<String>,
+    ) -> PreferencesDataStore {
+        PreferencesDataStore::newWithStorage(storage, path)
+            .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences)
+    }
+
+    /// Declares provider UUIDs in the owned function-binding map without supplying executable merge code.
+    pub(crate) fn spaceMergeReference() -> PreferenceMergeReference {
+        PreferenceMergeReference {
+            store: PreferenceMergeStore {
+                path: operit_util::RuntimeStorageLayout::FUNCTIONAL_CONFIGS_PREFERENCES_PATH,
+                encrypted: false,
+            },
+            key: "function_model_binding",
+            path: &[
+                PreferenceMergePathSegment::ObjectValues,
+                PreferenceMergePathSegment::Field("providerId"),
+            ],
+            target: ModelConfigManager::spaceMergeCatalog().store.path,
+        }
+    }
+
+    const PREFERENCES_VERSION: u32 = 3;
 
     /// Returns the preference key that stores function-to-model bindings.
     pub fn FUNCTION_MODEL_BINDING() -> operit_store::PreferencesDataStore::PreferencesKey {
@@ -76,8 +104,10 @@ impl FunctionalConfigManager {
             operit_util::RuntimeStorageLayout::FUNCTIONAL_CONFIGS_PREFERENCES_PATH,
         );
         Self {
-            functionalConfigDataStore: PreferencesDataStore::new(path)
-                .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences),
+            functionalConfigDataStore: Self::preferenceStore(
+                operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
+                operit_store::RuntimeStorageHost::runtimeStoragePath(&path),
+            ),
             modelConfigManager: ModelConfigManager::new(root_dir),
         }
     }
@@ -97,17 +127,16 @@ impl FunctionalConfigManager {
             .mapResult(|preferences| Self::readFunctionModelBinding(&preferences)))
     }
 
+    /// Reads native JSON function bindings using their declared function identities.
     fn readFunctionModelBinding(
         preferences: &Preferences,
     ) -> Result<HashMap<FunctionType, FunctionModelBinding>, PreferencesDataStoreError> {
         let Some(bindingJson) = preferences.get(&Self::FUNCTION_MODEL_BINDING()) else {
             return Ok(HashMap::new());
         };
-        if bindingJson.is_empty() {
-            return Ok(HashMap::new());
-        }
 
-        let rawMap: HashMap<String, FunctionModelBinding> = serde_json::from_str(bindingJson)?;
+        let rawMap: HashMap<String, FunctionModelBinding> =
+            serde_json::from_value(bindingJson.clone())?;
         let mut binding = HashMap::new();
         for (key, value) in rawMap {
             let functionType = Self::parseFunctionType(&key)
@@ -170,7 +199,7 @@ impl FunctionalConfigManager {
             .into_iter()
             .map(|(functionType, value)| (Self::functionTypeName(functionType).to_string(), value))
             .collect();
-        let encoded = serde_json::to_string(&stringBinding)?;
+        let encoded = serde_json::to_value(&stringBinding)?;
         preferences.set(&Self::FUNCTION_MODEL_BINDING(), encoded);
         Ok(())
     }
@@ -182,19 +211,58 @@ impl FunctionalConfigManager {
     ) -> Result<(), PreferencesDataStoreError> {
         match version {
             0 => {
-                let binding = Self::readFunctionModelBinding(preferences)?;
+                let binding = preferences
+                    .getTyped::<String>(&Self::FUNCTION_MODEL_BINDING())?
+                    .map(|encoded| {
+                        serde_json::from_str::<HashMap<String, FunctionModelBinding>>(&encoded)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
                 if binding.is_empty() {
-                    Self::writeFunctionModelBinding(preferences, Self::defaultBinding())?;
+                    let defaults = Self::defaultBinding()
+                        .into_iter()
+                        .map(|(function, binding)| {
+                            (Self::functionTypeName(function).to_owned(), binding)
+                        })
+                        .collect::<HashMap<_, _>>();
+                    preferences.set(
+                        &Self::FUNCTION_MODEL_BINDING(),
+                        serde_json::to_string(&defaults)?,
+                    );
                 }
                 Ok(())
             }
             1 => {
-                let mut binding = Self::readFunctionModelBinding(preferences)?;
+                let encoded = preferences
+                    .getTyped::<String>(&Self::FUNCTION_MODEL_BINDING())?
+                    .ok_or_else(|| {
+                        PreferencesDataStoreError::Message(
+                            "Function bindings missing at schema version 1".into(),
+                        )
+                    })?;
+                let mut binding: HashMap<String, FunctionModelBinding> =
+                    serde_json::from_str(&encoded)?;
                 binding.insert(
-                    FunctionType::TITLE_GENERATION,
+                    Self::functionTypeName(FunctionType::TITLE_GENERATION).to_owned(),
                     FunctionModelBinding::default(),
                 );
-                Self::writeFunctionModelBinding(preferences, binding)
+                preferences.set(
+                    &Self::FUNCTION_MODEL_BINDING(),
+                    serde_json::to_string(&binding)?,
+                );
+                Ok(())
+            }
+            2 => {
+                if let Some(value) = preferences.get(&Self::FUNCTION_MODEL_BINDING()) {
+                    let encoded = serde_json::from_value::<String>(value.clone())?;
+                    let binding: HashMap<String, FunctionModelBinding> =
+                        serde_json::from_str(&encoded)?;
+                    preferences.set(
+                        &Self::FUNCTION_MODEL_BINDING(),
+                        serde_json::to_value(binding)?,
+                    );
+                }
+                Ok(())
             }
             from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
         }

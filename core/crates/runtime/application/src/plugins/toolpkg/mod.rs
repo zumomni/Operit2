@@ -4,6 +4,9 @@ pub mod ToolPkgCommonBridgePlugin;
 #[path = "ToolPkgAppLifecycleHookBridge.rs"]
 pub mod ToolPkgAppLifecycleHookBridge;
 
+#[path = "ToolPkgManifestExtensionBridge.rs"]
+pub mod ToolPkgManifestExtensionBridge;
+
 #[path = "ToolPkgHookBridgeSupport.rs"]
 pub mod ToolPkgHookBridgeSupport;
 
@@ -45,3 +48,10 @@ pub mod ToolPkgChatRuntimeHookBridge;
 
 #[path = "ToolPkgInputMenuToggleBridge.rs"]
 pub mod ToolPkgInputMenuToggleBridge;
+
+#[path = "ToolPkgChatComposerSlotBridge.rs"]
+pub mod ToolPkgChatComposerSlotBridge;
+
+/// Exposes the strict awaited generic chat creation lifecycle bridge.
+#[path = "ToolPkgChatLifecycleHookBridge.rs"]
+pub mod ToolPkgChatLifecycleHookBridge;

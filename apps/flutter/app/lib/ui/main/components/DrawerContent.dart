@@ -1,27 +1,36 @@
 // ignore_for_file: file_names
 
-import 'dart:math' as math;
+import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:operit_ui/operit_ui.dart';
 
 import '../../../core/bridge/OperitRuntimeBridge.dart';
 import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../core/logging/ClientLogger.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../l10n/generated/app_localizations.dart';
-import '../../common/CharacterAvatar.dart';
-import '../../features/chat/components/NewChatIntro.dart';
+import '../../common/contributions/ChatSidebarTabHost.dart';
 import '../../features/chat/viewmodel/ChatSelectionTransition.dart';
+import '../../features/chat/components/NewChatIntro.dart';
+import '../../features/chat/components/workspace/WorkspaceUnbindDialog.dart';
 import '../navigation/AppNavigationModels.dart';
+import '../layout/SidebarDockController.dart';
+import '../layout/NavigationLayoutMetrics.dart';
 import '../screens/ScreenRouteRegistry.dart';
 import '../../theme/OperitTheme.dart';
 import '../../window/DetachedChatWindowLauncher.dart';
 import '../../window/OperitWindowPlatform.dart';
 import 'CollapsedDrawerContent.dart';
+import '../../common/components/M3LoadingIndicator.dart';
 import 'DrawerContentDialogs.dart';
 import 'NavigationDrawerAppearance.dart';
 
+part 'DrawerContentGroups.dart';
+
 class DrawerContent extends StatefulWidget {
+  /// Receives generic chat metadata; plugin tabs own all subject-specific views.
   const DrawerContent({
     super.key,
     required this.navigationEntries,
@@ -30,8 +39,6 @@ class DrawerContent extends StatefulWidget {
     required this.appearance,
     required this.histories,
     required this.activeStreamingChatIds,
-    required this.characterGroupNamesById,
-    required this.characterCardAvatarUrisByName,
     required this.currentChatId,
     required this.errorMessage,
     required this.loading,
@@ -46,8 +53,6 @@ class DrawerContent extends StatefulWidget {
   final NavigationDrawerAppearance appearance;
   final List<core_proxy.ChatHistoryListItem> histories;
   final Set<String> activeStreamingChatIds;
-  final Map<String, String> characterGroupNamesById;
-  final Map<String, String> characterCardAvatarUrisByName;
   final String? currentChatId;
   final String? errorMessage;
   final bool loading;
@@ -55,247 +60,135 @@ class DrawerContent extends StatefulWidget {
   final VoidCallback onConversationActivated;
   final OperitRuntimeBridge bridge;
 
+  /// Creates the native workspace consumer and real registered-tab surface.
   @override
   State<DrawerContent> createState() => _DrawerContentState();
 }
 
 class _DrawerContentState extends State<DrawerContent> {
-  static const int _collapsedHistoryLimit = 4;
-  static const double _contentEndPadding = 12;
-  static final Set<String> _rememberedCollapsedCharacterSections = <String>{};
-  static final Set<String> _rememberedCollapsedGroupSections = <String>{};
-
+  static const int _previewLimit = 4;
+  static final Set<String> _rememberedCollapsedWorkspaces = <String>{};
   final ScrollController _historyScrollController = ScrollController();
   final TextEditingController _searchController = TextEditingController();
-  final Set<String> _collapsedCharacterSections = Set<String>.of(
-    _rememberedCollapsedCharacterSections,
+  final Set<String> _collapsedWorkspaces = Set<String>.of(
+    _rememberedCollapsedWorkspaces,
   );
-  final Set<String> _collapsedGroupSections = Set<String>.of(
-    _rememberedCollapsedGroupSections,
-  );
-  String? _errorMessage;
-  List<core_proxy.ChatHistoryListItem>? _pendingOrderedHistories;
-  int _historyRenderLimit = _collapsedHistoryLimit;
+  final Set<String> _expandedWorkspaces = <String>{};
   bool _searchExpanded = false;
-  _HistoryGroupingMode _groupingMode = _HistoryGroupingMode.character;
+  String? _errorMessage;
+  final Set<String> _collapsedGroups = {};
+  bool _groupMutationPending = false;
 
+  /// Uses the actual receiving bridge for native conversation operations.
+  GeneratedCoreProxyClients get _clients =>
+      GeneratedCoreProxyClients(widget.bridge);
+
+  /// Returns the shared canonical chat runtime without creating business managers.
   GeneratedChatRuntimeHolderMainCoreProxy get _chatCoreProxy =>
-      GeneratedCoreProxyClients(widget.bridge).chatRuntimeHolderMain;
+      _clients.chatRuntimeHolderMain;
 
-  List<core_proxy.ChatHistoryListItem> get _histories =>
-      _pendingOrderedHistories ?? widget.histories;
-
-  String? get _visibleErrorMessage => _errorMessage ?? widget.errorMessage;
-
+  /// Observes native workspace search independently of plugin-owned tab state.
   @override
   void initState() {
     super.initState();
     _searchController.addListener(_onSearchChanged);
   }
 
+  /// Clears local errors only after fresh canonical drawer state arrives.
   @override
   void didUpdateWidget(covariant DrawerContent oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final pending = _pendingOrderedHistories;
-    if (pending != null && _sameHistoryOrder(pending, widget.histories)) {
-      _pendingOrderedHistories = null;
-    }
-    if (oldWidget.errorMessage != widget.errorMessage &&
-        _errorMessage != null) {
-      _errorMessage = null;
-    }
+    if (oldWidget.errorMessage != widget.errorMessage) _errorMessage = null;
   }
 
+  /// Releases native controllers without modifying persisted plugin tab selection.
   @override
   void dispose() {
-    _historyScrollController.dispose();
     _searchController.removeListener(_onSearchChanged);
     _searchController.dispose();
+    _historyScrollController.dispose();
     super.dispose();
   }
 
-  bool _sameHistoryOrder(
-    List<core_proxy.ChatHistoryListItem> left,
-    List<core_proxy.ChatHistoryListItem> right,
-  ) {
-    if (left.length != right.length) {
-      return false;
-    }
-    for (var index = 0; index < left.length; index += 1) {
-      final leftItem = left[index];
-      final rightItem = right[index];
-      if (leftItem.id != rightItem.id ||
-          leftItem.group != rightItem.group ||
-          leftItem.displayOrder != rightItem.displayOrder) {
-        return false;
-      }
-    }
-    return true;
-  }
+  /// Rebuilds the native workspace projection when the search query changes.
+  void _onSearchChanged() => setState(() {});
 
-  void _onSearchChanged() {
-    if (mounted) {
-      setState(() {});
-    }
-  }
+  /// Toggles only the native search control, not plugin registration parameters.
+  void _toggleSearchExpanded() =>
+      setState(() => _searchExpanded = !_searchExpanded);
 
-  void _openPackageManager() {
-    for (final entry in widget.navigationEntries) {
-      if (entry.entryId == 'main.package_manager') {
-        widget.onNavigationEntrySelected(entry);
-        return;
-      }
-    }
-    throw StateError('Unknown navigation entry: main.package_manager');
-  }
-
-  void _openSettings() {
-    for (final entry in widget.navigationEntries) {
-      if (entry.entryId == 'main.settings') {
-        widget.onNavigationEntrySelected(entry);
-        return;
-      }
-    }
-    throw StateError('Unknown navigation entry: main.settings');
-  }
-
-  void _toggleSearchExpanded() {
-    setState(() {
-      _searchExpanded = !_searchExpanded;
-    });
-  }
-
-  /// Switches the conversation list between character-card and workspace grouping.
-  void _toggleGroupingMode() {
-    setState(() {
-      _groupingMode = _groupingMode == _HistoryGroupingMode.character
-          ? _HistoryGroupingMode.workspace
-          : _HistoryGroupingMode.character;
-    });
-  }
-
-  Future<void> _createConversation() async {
-    setState(() {
-      _errorMessage = null;
-    });
-    // Arm before creating so the intro overlay sees the flag when the new
-    // chat id arrives; disarmed again if creation fails.
-    newChatIntroArmed.value = true;
-    try {
-      await _chatCoreProxy.createNewChat(
-        characterCardName: null,
-        group: null,
-        inheritGroupFromCurrent: true,
-        setAsCurrentChat: true,
-        characterGroupId: null,
-      );
-      widget.onConversationActivated();
-    } catch (error, stackTrace) {
-      newChatIntroArmed.value = false;
-      debugPrint('Failed to create chat: $error\n$stackTrace');
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _errorMessage = error.toString();
-      });
-    }
-  }
-
-  Future<void> _showCreateGroupDialog() async {
-    final groupName = await showDialog<String>(
-      context: context,
-      builder: (context) {
-        return const CreateGroupDialog();
-      },
+  /// Opens an existing navigation entry using its exact registered host identity.
+  void _openNavigation(String id) {
+    final matches = widget.navigationEntries.where(
+      (entry) => entry.entryId == id,
     );
-    final normalizedGroupName = groupName?.trim();
-    if (normalizedGroupName == null || normalizedGroupName.isEmpty) {
-      return;
+    if (matches.length != 1) {
+      throw StateError('Unknown or ambiguous navigation entry: $id');
     }
-    await _createGroup(normalizedGroupName);
+    widget.onNavigationEntrySelected(matches.single);
   }
 
-  Future<void> _createGroup(String groupName) async {
-    setState(() {
-      _errorMessage = null;
-    });
-    newChatIntroArmed.value = true;
+  /// Runs the original switch, navigation and drawer-close chain after tab validation.
+  Future<void> _activateChat(String chatId) async {
+    final switchStartedAt = Stopwatch()..start();
+    if (mounted) setState(() => _errorMessage = null);
     try {
-      final binding = await _activePromptBindingForCreate();
-      await GeneratedCoreProxyClients(
-        widget.bridge,
-      ).chatRuntimeHolderMain.createNewChat(
-        characterCardName: binding.characterCardName,
-        group: groupName,
-        inheritGroupFromCurrent: false,
-        setAsCurrentChat: true,
-        characterGroupId: binding.characterGroupId,
-      );
+      if (chatId != widget.currentChatId) ChatSelectionTransition.begin(chatId);
       widget.onConversationActivated();
+      await _chatCoreProxy.switchChat(chatId: chatId);
+      ClientLogger.i(
+        'chat_switch.command_completed chatId=$chatId elapsedMs=${switchStartedAt.elapsedMilliseconds}',
+        tag: 'ChatSwitchTrace',
+      );
     } catch (error, stackTrace) {
+      ChatSelectionTransition.complete(chatId);
+      debugPrint('Failed to switch chat: $error\n$stackTrace');
+      if (mounted) setState(() => _errorMessage = error.toString());
+      rethrow;
+    }
+  }
+
+  /// Creates through the generic hook using the displayed chat as the nullable source.
+  Future<void> _createConversation() async {
+    final sourceChatId = widget.currentChatId;
+    final chatCore = _chatCoreProxy;
+    final onActivated = widget.onConversationActivated;
+    newChatIntroArmed.value = true;
+    if (mounted) setState(() => _errorMessage = null);
+    try {
+      await chatCore.createNewChat(
+        setAsCurrentChat: true,
+        sourceChatId: sourceChatId,
+        input: null,
+      );
+      onActivated();
+    } catch (error) {
       newChatIntroArmed.value = false;
-      debugPrint('Failed to create group: $error\n$stackTrace');
-      if (!mounted) {
-        return;
+      if (mounted) {
+        setState(() => _errorMessage = error.toString());
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
       }
-      setState(() {
-        _errorMessage = error.toString();
-      });
     }
   }
 
-  Future<_ChatBindingForCreate> _activePromptBindingForCreate() async {
-    final clients = GeneratedCoreProxyClients(widget.bridge);
-    final prompt = await clients.preferencesActivePromptManager
-        .getActivePrompt();
-    if (prompt.tag == 'CharacterGroup' && prompt.id.trim().isNotEmpty) {
-      return _ChatBindingForCreate(
-        characterCardName: null,
-        characterGroupId: prompt.id.trim(),
-      );
-    }
-    if (prompt.tag == 'CharacterCard' && prompt.id.trim().isNotEmpty) {
-      final id = prompt.id.trim();
-      final clients = GeneratedCoreProxyClients(widget.bridge);
-      final card = await clients.preferencesCharacterCardManager
-          .getCharacterCard(id: id);
-      return _ChatBindingForCreate(
-        characterCardName: card.name,
-        characterGroupId: null,
-      );
-    }
-    throw StateError('Unknown active prompt: $prompt');
-  }
-
+  /// Reports native row failures while keeping the selected registered tab intact.
   Future<void> _switchConversation(
     core_proxy.ChatHistoryListItem history,
   ) async {
-    setState(() {
-      _errorMessage = null;
-    });
     try {
-      if (history.id != widget.currentChatId) {
-        ChatSelectionTransition.begin(history.id);
+      await _activateChat(history.id);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
       }
-      widget.onConversationActivated();
-      await WidgetsBinding.instance.endOfFrame;
-      if (!mounted) {
-        return;
-      }
-      await _chatCoreProxy.switchChat(chatId: history.id);
-    } catch (error, stackTrace) {
-      ChatSelectionTransition.complete(history.id);
-      debugPrint('Failed to switch chat: $error\n$stackTrace');
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _errorMessage = error.toString();
-      });
     }
   }
 
+  /// Presents the retained generic conversation-title editor.
   Future<void> _showRenameConversationDialog(
     core_proxy.ChatHistoryListItem history,
   ) async {
@@ -312,13 +205,10 @@ class _DrawerContentState extends State<DrawerContent> {
     await _updateConversationTitle(history, title);
   }
 
+  /// Confirms a swipe deletion before calling the canonical conversation API.
   Future<void> _showDeleteConversationDialog(
     core_proxy.ChatHistoryListItem history,
   ) async {
-    if (history.locked) {
-      await _deleteConversation(history);
-      return;
-    }
     final confirmed = await showDialog<bool>(
       context: context,
       useRootNavigator: true,
@@ -332,7 +222,7 @@ class _DrawerContentState extends State<DrawerContent> {
     await _deleteConversation(history);
   }
 
-  /// Shows conversation actions enabled within the current character section.
+  /// Presents native workspace actions for a canonical conversation row.
   Future<void> _showConversationActionDialog(
     core_proxy.ChatHistoryListItem history,
   ) async {
@@ -372,9 +262,34 @@ class _DrawerContentState extends State<DrawerContent> {
         await _updateConversationPinned(history);
       case ConversationAction.toggleLocked:
         await _updateConversationLocked(history);
+      case ConversationAction.unbindWorkspace:
+        await _showUnbindConversationWorkspaceDialog(history);
       case ConversationAction.delete:
-        await _showDeleteConversationDialog(history);
+        await _deleteConversation(history);
     }
+  }
+
+  /// Lets a conversation detach an exact workspace binding even when its record is missing.
+  Future<void> _showUnbindConversationWorkspaceDialog(
+    core_proxy.ChatHistoryListItem history,
+  ) async {
+    await showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => WorkspaceUnbindDialog(
+        onUnbindWorkspace: () async {
+          final currentHistory = widget.histories
+              .where((chat) => chat.id == history.id)
+              .single;
+          if (currentHistory.workspaceId != history.workspaceId) {
+            throw StateError(
+              AppLocalizations.of(dialogContext)!.workspaceUnbindChanged,
+            );
+          }
+          await _chatCoreProxy.unbindChatFromWorkspace(chatId: history.id);
+        },
+      ),
+    );
   }
 
   /// Deletes a conversation and reports a policy refusal in the drawer.
@@ -406,6 +321,7 @@ class _DrawerContentState extends State<DrawerContent> {
     }
   }
 
+  /// Commits only the native conversation title through its existing runtime operation.
   Future<void> _updateConversationTitle(
     core_proxy.ChatHistoryListItem history,
     String title,
@@ -477,673 +393,422 @@ class _DrawerContentState extends State<DrawerContent> {
     }
   }
 
-  /// Moves a conversation by one position within its character section.
-  Future<void> _moveConversationRelative(
-    core_proxy.ChatHistoryListItem history,
-    int delta,
-  ) async {
-    final currentIndex = _histories.indexWhere((item) => item.id == history.id);
-    final targetIndex = currentIndex + delta;
-    if (!_canMoveConversationRelative(history, delta)) {
-      return;
-    }
-    final reordered = List<core_proxy.ChatHistoryListItem>.of(_histories);
-    final moved = reordered.removeAt(currentIndex);
-    reordered.insert(targetIndex, moved);
-    await _updateConversationOrder(
-      reordered,
-      moved,
-      moved.group,
-      optimistic: true,
-    );
+  /// Groups unbound conversations together and preserves bound workspace identities.
+  String _workspaceKey(core_proxy.ChatHistoryListItem history) {
+    final id = history.workspaceId?.trim();
+    return id == null || id.isEmpty ? 'workspace:unbound' : 'workspace:$id';
   }
 
-  /// Moves a conversation to another position within its character section.
-  Future<void> _moveConversationTo(
-    core_proxy.ChatHistoryListItem moved,
-    core_proxy.ChatHistoryListItem target,
-  ) async {
-    if (moved.id == target.id || !_isInSameCharacterSection(moved, target)) {
-      return;
+  /// Distinguishes missing workspace records from conversations without a binding.
+  String _workspaceLabel(core_proxy.ChatHistoryListItem history) {
+    final id = history.workspaceId?.trim();
+    if (id == null || id.isEmpty) {
+      return '未绑定工作区';
     }
-    final reordered = List<core_proxy.ChatHistoryListItem>.of(_histories);
-    final fromIndex = reordered.indexWhere((item) => item.id == moved.id);
-    final toIndex = reordered.indexWhere((item) => item.id == target.id);
-    if (fromIndex < 0 || toIndex < 0) {
-      return;
+    final name = history.workspaceName?.trim();
+    if (name == null || name.isEmpty) {
+      return '工作区缺失';
     }
-    final removed = reordered.removeAt(fromIndex);
-    final insertIndex = toIndex > reordered.length ? reordered.length : toIndex;
-    reordered.insert(insertIndex, removed);
-    await _updateConversationOrder(
-      reordered,
-      removed,
-      target.group,
-      optimistic: true,
-    );
+    return name;
   }
 
-  /// Determines whether the conversation can move without leaving its character section.
+  /// Projects the full canonical order into native workspace sections and search matches.
+  List<_WorkspaceSection> _workspaceSections({bool filter = true}) {
+    final query = _searchController.text.trim().toLowerCase();
+    final sections = <String, _WorkspaceSection>{};
+    for (final history in widget.histories) {
+      final label = _workspaceLabel(history);
+      if (filter &&
+          query.isNotEmpty &&
+          !history.title.toLowerCase().contains(query) &&
+          !label.toLowerCase().contains(query) &&
+          !(history.group ?? '未分组').toLowerCase().contains(query)) {
+        continue;
+      }
+      final key = _workspaceKey(history);
+      final section = sections.putIfAbsent(
+        key,
+        () => _WorkspaceSection(key: key, label: label),
+      );
+      section.histories.add(history);
+    }
+    return sections.values.toList(growable: false);
+  }
+
+  void _showGroupError(Object error) =>
+      setState(() => _errorMessage = error.toString());
+
+  /// Remembers workspace expansion without retaining deleted domain grouping state.
+  void _toggleWorkspace(String key) => setState(() {
+    if (!_collapsedWorkspaces.remove(key)) _collapsedWorkspaces.add(key);
+    _rememberedCollapsedWorkspaces
+      ..clear()
+      ..addAll(_collapsedWorkspaces);
+  });
+
+  /// Expands the native preview independently of its workspace header collapse state.
+  void _togglePreview(String key) => setState(() {
+    if (!_expandedWorkspaces.remove(key)) _expandedWorkspaces.add(key);
+  });
+
+  /// Limits native reordering to conversations within the same workspace.
   bool _canMoveConversationRelative(
     core_proxy.ChatHistoryListItem history,
     int delta,
   ) {
-    final currentIndex = _histories.indexWhere((item) => item.id == history.id);
-    final targetIndex = currentIndex + delta;
-    return currentIndex >= 0 &&
-        targetIndex >= 0 &&
-        targetIndex < _histories.length &&
-        _isInSameCharacterSection(history, _histories[targetIndex]);
+    final index = widget.histories.indexWhere((item) => item.id == history.id);
+    final target = index + delta;
+    return index >= 0 &&
+        target >= 0 &&
+        target < widget.histories.length &&
+        _workspaceKey(history) == _workspaceKey(widget.histories[target]);
   }
 
-  /// Returns whether two conversations belong to the same character section.
-  bool _isInSameCharacterSection(
-    core_proxy.ChatHistoryListItem first,
-    core_proxy.ChatHistoryListItem second,
-  ) {
-    return _characterSectionKey(first) == _characterSectionKey(second);
+  /// Moves a native workspace row without reading a role or plugin selection field.
+  Future<void> _moveConversationRelative(
+    core_proxy.ChatHistoryListItem history,
+    int delta,
+  ) async {
+    if (!_canMoveConversationRelative(history, delta)) return;
+    final index = widget.histories.indexWhere((item) => item.id == history.id);
+    final reordered = List<core_proxy.ChatHistoryListItem>.of(widget.histories);
+    reordered.insert(index + delta, reordered.removeAt(index));
+    await _saveOrder(reordered, history);
   }
 
-  Future<void> _updateConversationOrder(
+  /// Accepts native row drops only inside the same workspace projection.
+  Future<void> _moveConversationTo(
+    core_proxy.ChatHistoryListItem moved,
+    core_proxy.ChatHistoryListItem target,
+  ) async {
+    if (moved.id == target.id ||
+        _workspaceKey(moved) != _workspaceKey(target)) {
+      return;
+    }
+    if (moved.group != target.group) {
+      await _moveWorkspaceGroup(moved, target.group);
+    }
+    final from = widget.histories.indexWhere((item) => item.id == moved.id);
+    final to = widget.histories.indexWhere((item) => item.id == target.id);
+    if (from < 0 || to < 0) {
+      throw StateError('The reordered conversation is no longer present.');
+    }
+    final reordered = List<core_proxy.ChatHistoryListItem>.of(widget.histories);
+    reordered.insert(to, reordered.removeAt(from));
+    await _saveOrder(reordered, moved);
+  }
+
+  /// Persists native ordering through the generic canonical conversation operation.
+  Future<void> _saveOrder(
     List<core_proxy.ChatHistoryListItem> reordered,
     core_proxy.ChatHistoryListItem moved,
-    String? targetGroup, {
-    required bool optimistic,
-  }) async {
-    final updatedHistories = <core_proxy.ChatHistoryListItem>[];
-    for (var index = 0; index < reordered.length; index += 1) {
-      final history = reordered[index];
-      updatedHistories.add(
-        core_proxy.ChatHistoryListItem(
-          id: history.id,
-          title: history.title,
-          updatedAt: history.updatedAt,
-          group: history.id == moved.id ? targetGroup : history.group,
-          displayOrder: index,
-          workspaceId: history.workspaceId,
-          workspaceName: history.workspaceName,
-          characterCardName: history.characterCardName,
-          characterGroupId: history.characterGroupId,
-          locked: history.locked,
-          pinned: history.pinned,
-        ),
-      );
-    }
-    final updatedMoved = updatedHistories.firstWhere(
-      (history) => history.id == moved.id,
-    );
-    if (optimistic) {
-      setState(() {
-        _pendingOrderedHistories = updatedHistories;
-      });
-    }
+  ) async {
     try {
-      await _chatCoreProxy.updateChatOrderAndGroup(
-        reorderedHistories: updatedHistories,
-        movedItem: updatedMoved,
-        targetGroup: targetGroup,
+      await _chatCoreProxy.updateChatOrder(
+        reorderedHistories: reordered,
+        movedItem: moved,
       );
-    } catch (error, stackTrace) {
-      debugPrint('Failed to update chat order: $error\n$stackTrace');
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _errorMessage = error.toString();
-      });
+    } catch (error) {
+      if (mounted) setState(() => _errorMessage = error.toString());
     }
   }
 
-  List<core_proxy.ChatHistoryListItem> get _visibleHistories {
-    final query = _searchController.text.trim().toLowerCase();
-    if (query.isEmpty) {
-      return List<core_proxy.ChatHistoryListItem>.unmodifiable(_histories);
-    }
-    return _histories
-        .where((history) => _historyMatchesQuery(history, query))
-        .toList(growable: false);
-  }
-
-  bool _historyMatchesQuery(
-    core_proxy.ChatHistoryListItem history,
-    String query,
-  ) {
-    return history.title.toLowerCase().contains(query) ||
-        _bindingLabel(history).toLowerCase().contains(query) ||
-        _groupLabel(history).toLowerCase().contains(query);
-  }
-
-  List<_CharacterHistorySection> _buildCharacterSections(
-    List<core_proxy.ChatHistoryListItem> histories,
-  ) {
-    final sections = <_CharacterHistorySection>[];
-    final sectionIndexes = <String, int>{};
-    for (final history in histories) {
-      final sectionKey = _characterSectionKey(history);
-      final sectionIndex = sectionIndexes[sectionKey];
-      final groupKey = _groupSectionKey(sectionKey, history);
-      final groupLabel = _groupLabel(history);
-      if (sectionIndex == null) {
-        sectionIndexes[sectionKey] = sections.length;
-        sections.add(
-          _CharacterHistorySection(
-            key: sectionKey,
-            label: _bindingLabel(history),
-            kind: _bindingKind(history),
-            avatarUri: _characterAvatarUri(history),
-            groups: <_HistoryGroupSection>[
-              _HistoryGroupSection(
-                key: groupKey,
-                label: groupLabel,
-                histories: <core_proxy.ChatHistoryListItem>[history],
-              ),
-            ],
-          ),
-        );
-        continue;
-      }
-
-      final section = sections[sectionIndex];
-      final groupIndex = section.groups.indexWhere(
-        (group) => group.key == groupKey,
-      );
-      if (groupIndex == -1) {
-        section.groups.add(
-          _HistoryGroupSection(
-            key: groupKey,
-            label: groupLabel,
-            histories: <core_proxy.ChatHistoryListItem>[history],
-          ),
-        );
-      } else {
-        section.groups[groupIndex].histories.add(history);
-      }
-    }
-    return sections;
-  }
-
-  _VisibleHistoryPlan _buildVisibleHistoryPlan(
-    List<_CharacterHistorySection> sections,
-    int renderLimit,
-  ) {
-    var remaining = renderLimit;
-    var hiddenCount = 0;
-    final plannedSections = <_CharacterHistorySection>[];
-
-    for (final section in sections) {
-      if (_collapsedCharacterSections.contains(section.key)) {
-        plannedSections.add(section);
-        continue;
-      }
-
-      final plannedGroups = <_HistoryGroupSection>[];
-      for (final group in section.groups) {
-        if (_collapsedGroupSections.contains(group.key)) {
-          plannedGroups.add(group);
-          continue;
-        }
-
-        final visibleCount = math.min(remaining, group.histories.length);
-        final visibleHistories = group.histories
-            .take(visibleCount)
-            .toList(growable: false);
-        hiddenCount += group.histories.length - visibleCount;
-        remaining -= visibleCount;
-        plannedGroups.add(
-          _HistoryGroupSection(
-            key: group.key,
-            label: group.label,
-            histories: visibleHistories,
-            historyCount: group.historyCount,
-          ),
-        );
-      }
-
-      plannedSections.add(
-        _CharacterHistorySection(
-          key: section.key,
-          label: section.label,
-          kind: section.kind,
-          avatarUri: section.avatarUri,
-          groups: plannedGroups,
+  /// Builds a native row with the original pin, lock, title, delete and detached-window actions.
+  Widget _historyRow(core_proxy.ChatHistoryListItem history) =>
+      ConversationDrawerItem(
+        key: ValueKey('workspace-chat:${history.id}'),
+        history: history,
+        title: history.title,
+        selected:
+            widget.selectedRouteId ==
+                ScreenRouteRegistry.routeIdOf(ScreenRouteRegistry.aiChat) &&
+            widget.currentChatId == history.id,
+        isRunning: widget.activeStreamingChatIds.contains(history.id),
+        appearance: widget.appearance,
+        nested: true,
+        workspaceStyle: true,
+        onClick: () => unawaited(_switchConversation(history)),
+        onRename: () => unawaited(_showRenameConversationDialog(history)),
+        onTogglePinned: () => unawaited(_updateConversationPinned(history)),
+        onToggleLocked: () => unawaited(_updateConversationLocked(history)),
+        onDelete: () => unawaited(_deleteConversation(history)),
+        onSwipeDelete: () => unawaited(_showDeleteConversationDialog(history)),
+        onLongPress: () => unawaited(_showConversationActionDialog(history)),
+        canDetach: operitSupportsDesktopMultiWindow,
+        onDetach: () => unawaited(
+          DetachedChatWindowLauncher.openChat(
+            chatId: history.id,
+            title: history.title,
+            themePreferenceSnapshot: OperitTheme.of(
+              context,
+            ).themePreferenceSnapshot,
+          ).catchError((Object error, StackTrace stackTrace) {
+            if (mounted) setState(() => _errorMessage = error.toString());
+          }),
         ),
+        onMoveTo: (moved) => unawaited(
+          _runGroupMutation(() => _moveConversationTo(moved, history)),
+        ),
+        canAcceptDrop: (moved) =>
+            _workspaceKey(moved) == _workspaceKey(history),
       );
-    }
 
-    return _VisibleHistoryPlan(
-      sections: plannedSections,
-      hiddenCount: hiddenCount,
+  Widget _sidebarHeader(Widget tabs) => Padding(
+    padding: const EdgeInsets.only(top: 26, right: 12),
+    child: SidebarInfoCard(
+      brandName: 'Operit',
+      appearance: widget.appearance,
+      trailing: tabs,
+    ),
+  );
+
+  /// Adds plugin navigation to the native workspace's existing scrolling surface.
+  List<Widget> _pluginNavigationSlivers() => <Widget>[
+    if (widget.pluginEntries.isNotEmpty)
+      SliverToBoxAdapter(child: _pluginNavigationContent()),
+  ];
+
+  /// Sizes plugin navigation to its content for the owning sidebar scroll.
+  Widget _pluginNavigationContent() => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: <Widget>[
+      const SizedBox(height: 10),
+      for (final entry in widget.pluginEntries)
+        PluginNavigationDrawerItem(
+          entry: entry,
+          selected: widget.selectedRouteId == entry.routeId,
+          appearance: widget.appearance,
+          onClick: () => widget.onNavigationEntrySelected(entry),
+        ),
+      SidebarDockEndDropTarget(
+        controller:
+            MediaQuery.sizeOf(context).width >= navigationTabletBreakpoint
+            ? SidebarDockScope.maybeOf(context)
+            : null,
+        location: SidebarDockLocation.primary,
+        height: 18,
+      ),
+    ],
+  );
+
+  /// The workspace is always native; resolving membership never replaces its widgets.
+  Widget _workspaceHistory(_WorkspaceSection section, bool searching) {
+    final groups = _nativeGroups(section);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final group in groups) ...[
+          _GroupSectionHeader(
+            key: ValueKey('workspace-group:${group.key}'),
+            label: group.label,
+            pinned:
+                group.histories.isNotEmpty &&
+                group.histories.every((chat) => chat.pinned),
+            workspaceStyle: true,
+            expanded: !_collapsedGroups.contains(group.key),
+            appearance: widget.appearance,
+            onToggleExpanded: () => setState(() {
+              if (!_collapsedGroups.remove(group.key))
+                _collapsedGroups.add(group.key);
+            }),
+            onCreateChat: () => unawaited(
+              _runGroupMutation(
+                () => _createGroupedConversation(section, group.name),
+              ),
+            ),
+            onRename: () => unawaited(_renameWorkspaceGroup(section, group)),
+            onTogglePinned: () => unawaited(
+              _runGroupMutation(() async {
+                final pinned =
+                    group.histories.isNotEmpty &&
+                    group.histories.every((chat) => chat.pinned);
+                for (final chat in group.histories) {
+                  await _chatCoreProxy.updateChatPinned(
+                    chatId: chat.id,
+                    pinned: !pinned,
+                  );
+                }
+              }),
+            ),
+            onDelete: () => unawaited(_deleteWorkspaceGroup(group)),
+            canAcceptDrop: (chat) => _workspaceKey(chat) == section.key,
+            onMoveToGroup: (chat) => unawaited(
+              _runGroupMutation(() => _moveWorkspaceGroup(chat, group.name)),
+            ),
+          ),
+          if (!_collapsedGroups.contains(group.key)) ...[
+            for (final chat
+                in searching || _expandedWorkspaces.contains(group.key)
+                    ? group.histories
+                    : _groupPreview(group.histories))
+              _historyRow(chat),
+            if (!searching &&
+                _groupPreview(group.histories).length < group.histories.length)
+              _HistoryLimitButton(
+                key: ValueKey('history-limit:${group.key}'),
+                icon: _expandedWorkspaces.contains(group.key)
+                    ? Icons.expand_less
+                    : Icons.expand_more,
+                label: _expandedWorkspaces.contains(group.key)
+                    ? '收起'
+                    : '展开更多 ${group.histories.length - _groupPreview(group.histories).length}',
+                workspaceStyle: true,
+                appearance: widget.appearance,
+                onClick: () => _togglePreview(group.key),
+              ),
+          ],
+        ],
+      ],
     );
   }
 
-  /// Builds the key used to place a conversation in a top-level section.
-  String _characterSectionKey(core_proxy.ChatHistoryListItem history) {
-    if (_groupingMode == _HistoryGroupingMode.workspace) {
-      final workspaceId = history.workspaceId?.trim();
-      return workspaceId == null || workspaceId.isEmpty
-          ? 'workspace:unbound'
-          : 'workspace:$workspaceId';
-    }
-    final characterGroupId = history.characterGroupId?.trim();
-    if (characterGroupId != null && characterGroupId.isNotEmpty) {
-      return 'character-group:$characterGroupId';
-    }
-    final name = history.characterCardName?.trim();
-    return name == null || name.isEmpty
-        ? 'character:unbound'
-        : 'character:$name';
+  /// Uses the original native sliver layout, with no plugin UI route or loading substitution.
+  Widget _workspaceContent(BuildContext context, {Widget? tabs}) {
+    final sections = _workspaceSections();
+    final searching = _searchController.text.trim().isNotEmpty;
+    final error = _errorMessage ?? widget.errorMessage;
+    return Stack(
+      children: <Widget>[
+        CustomScrollView(
+          controller: _historyScrollController,
+          key: const PageStorageKey<String>('drawer-history-scroll'),
+          primary: false,
+          slivers: <Widget>[
+            if (tabs != null) ...<Widget>[
+              SliverToBoxAdapter(child: _sidebarHeader(tabs)),
+              const SliverToBoxAdapter(child: SizedBox(height: 12)),
+            ],
+            SliverToBoxAdapter(
+              child: RepaintBoundary(
+                key: const ValueKey('workspace-create-toolbar'),
+                child: Padding(
+                  padding: const EdgeInsetsDirectional.only(
+                    start: 14,
+                    end: 12,
+                    bottom: 8,
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: _WorkspaceCreateBar(
+                          onCreateGroup: () =>
+                              unawaited(_createWorkspaceGroup()),
+                          onCreateConversation: () =>
+                              unawaited(_createConversation()),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _ToolbarIconButton(
+                        icon: _searchExpanded
+                            ? Icons.search_off_rounded
+                            : Icons.search_rounded,
+                        tooltip: _searchExpanded ? '收起搜索' : '搜索对话',
+                        appearance: widget.appearance,
+                        active: _searchExpanded || searching,
+                        onClick: _toggleSearchExpanded,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: AnimatedSize(
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOutCubic,
+                child: _searchExpanded
+                    ? Padding(
+                        padding: const EdgeInsetsDirectional.only(
+                          start: 12,
+                          end: 12,
+                          bottom: 12,
+                        ),
+                        child: ConversationSearchField(
+                          controller: _searchController,
+                          appearance: widget.appearance,
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ),
+            if (error != null)
+              SliverToBoxAdapter(
+                child: SidebarStatusText(
+                  text: error,
+                  appearance: widget.appearance,
+                ),
+              ),
+            for (final section in sections) ...<Widget>[
+              SliverToBoxAdapter(
+                child: _WorkspaceHeader(
+                  key: ValueKey('workspace-header:${section.key}'),
+                  label: section.label,
+                  count: section.histories.length,
+                  expanded: !_collapsedWorkspaces.contains(section.key),
+                  appearance: widget.appearance,
+                  onToggleExpanded: () => _toggleWorkspace(section.key),
+                ),
+              ),
+              if (!_collapsedWorkspaces.contains(section.key)) ...<Widget>[
+                SliverToBoxAdapter(
+                  child: _workspaceHistory(section, searching),
+                ),
+              ],
+            ],
+            if (sections.isEmpty && !widget.loading)
+              SliverToBoxAdapter(
+                child: SidebarStatusText(
+                  text: searching ? '没有匹配的会话' : '暂无会话',
+                  appearance: widget.appearance,
+                ),
+              ),
+            ..._pluginNavigationSlivers(),
+            const SliverToBoxAdapter(child: SizedBox(height: 16)),
+          ],
+        ),
+        if (widget.loading && widget.histories.isEmpty && error == null)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Center(
+                child: M3LoadingIndicator(
+                  color: widget.appearance.statusAvailableColor,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
   }
 
-  /// Resolves the visual section kind for the active history grouping.
-  _HistoryBindingKind _bindingKind(core_proxy.ChatHistoryListItem history) {
-    if (_groupingMode == _HistoryGroupingMode.workspace) {
-      return _HistoryBindingKind.workspace;
-    }
-    final characterGroupId = history.characterGroupId?.trim();
-    if (characterGroupId != null && characterGroupId.isNotEmpty) {
-      return _HistoryBindingKind.characterGroup;
-    }
-    final name = history.characterCardName?.trim();
-    return name == null || name.isEmpty
-        ? _HistoryBindingKind.unbound
-        : _HistoryBindingKind.characterCard;
-  }
-
-  String _bindingLabel(core_proxy.ChatHistoryListItem history) {
-    if (_groupingMode == _HistoryGroupingMode.workspace) {
-      final workspaceName = history.workspaceName?.trim();
-      return workspaceName == null || workspaceName.isEmpty
-          ? '未绑定工作区'
-          : workspaceName;
-    }
-    final characterGroupId = history.characterGroupId?.trim();
-    if (characterGroupId != null && characterGroupId.isNotEmpty) {
-      return widget.characterGroupNamesById[characterGroupId] ??
-          _shortIdentifier(characterGroupId);
-    }
-    final name = history.characterCardName?.trim();
-    return name == null || name.isEmpty ? '未绑定' : name;
-  }
-
-  /// Resolves the runtime avatar path for a character-card history section.
-  String? _characterAvatarUri(core_proxy.ChatHistoryListItem history) {
-    if (_bindingKind(history) != _HistoryBindingKind.characterCard) {
-      return null;
-    }
-    final name = history.characterCardName!.trim();
-    return widget.characterCardAvatarUrisByName[name];
-  }
-
-  String _groupSectionKey(
-    String sectionKey,
-    core_proxy.ChatHistoryListItem history,
-  ) {
-    final group = history.group?.trim();
-    final groupPart = group == null || group.isEmpty ? 'ungrouped' : group;
-    return 'group::$sectionKey::$groupPart';
-  }
-
-  String _groupLabel(core_proxy.ChatHistoryListItem history) {
-    final group = history.group?.trim();
-    return group == null || group.isEmpty ? '未分组' : group;
-  }
-
-  void _toggleCharacterSection(String sectionKey) {
-    setState(() {
-      if (_collapsedCharacterSections.contains(sectionKey)) {
-        _collapsedCharacterSections.remove(sectionKey);
-      } else {
-        _collapsedCharacterSections.add(sectionKey);
-      }
-      _rememberExpansionState();
-    });
-  }
-
-  void _toggleGroupSection(String sectionKey) {
-    setState(() {
-      if (_collapsedGroupSections.contains(sectionKey)) {
-        _collapsedGroupSections.remove(sectionKey);
-      } else {
-        _collapsedGroupSections.add(sectionKey);
-      }
-      _rememberExpansionState();
-    });
-  }
-
-  void _showMoreHistories(int hiddenCount) {
-    setState(() {
-      _historyRenderLimit += hiddenCount;
-    });
-  }
-
-  void _rememberExpansionState() {
-    _rememberedCollapsedCharacterSections
-      ..clear()
-      ..addAll(_collapsedCharacterSections);
-    _rememberedCollapsedGroupSections
-      ..clear()
-      ..addAll(_collapsedGroupSections);
-  }
-
-  List<_HistoryListEntry> _buildHistoryEntries(
-    List<_CharacterHistorySection> sections,
-  ) {
-    final entries = <_HistoryListEntry>[];
-    for (final section in sections) {
-      entries.add(_CharacterHeaderEntry(section));
-      if (_collapsedCharacterSections.contains(section.key)) {
-        continue;
-      }
-      for (final group in section.groups) {
-        entries.add(_GroupHeaderEntry(group));
-        if (_collapsedGroupSections.contains(group.key)) {
-          continue;
-        }
-        for (final history in group.histories) {
-          entries.add(_HistoryRowEntry(history));
-        }
-      }
-    }
-    return entries;
-  }
-
+  /// Keeps global navigation outside plugin content while embedding the real tab host.
   @override
   Widget build(BuildContext context) {
-    final visibleHistories = _visibleHistories;
-    final errorMessage = _visibleErrorMessage;
-    final showInitialLoading =
-        widget.loading && _histories.isEmpty && errorMessage == null;
-    final searching = _searchController.text.trim().isNotEmpty;
-    final allCharacterSections = _buildCharacterSections(visibleHistories);
-    final historyPlan = searching
-        ? _VisibleHistoryPlan(sections: allCharacterSections, hiddenCount: 0)
-        : _buildVisibleHistoryPlan(allCharacterSections, _historyRenderLimit);
-    final characterSections = historyPlan.sections;
-    final hiddenHistoryCount = historyPlan.hiddenCount;
-    final historyEntries = _buildHistoryEntries(characterSections);
-    final aiChatRouteId = ScreenRouteRegistry.routeIdOf(
-      ScreenRouteRegistry.aiChat,
-    );
-    final packageManagerRouteId = ScreenRouteRegistry.routeIdOf(
-      ScreenRouteRegistry.packageManager,
-    );
-    final settingsRouteId = ScreenRouteRegistry.routeIdOf(
-      ScreenRouteRegistry.settings,
-    );
-    final conversationSelectionEnabled =
-        widget.selectedRouteId == aiChatRouteId;
-    final themeController = OperitTheme.of(context);
-    final darkThemeActive = themeController.isDark(context);
+    final theme = OperitTheme.of(context);
     return Column(
       children: <Widget>[
         Expanded(
-          child: Stack(
-            children: <Widget>[
-              CustomScrollView(
-                key: const PageStorageKey<String>('drawer-history-scroll'),
-                controller: _historyScrollController,
-                primary: false,
-                slivers: <Widget>[
-                  SliverPadding(
-                    padding: const EdgeInsets.fromLTRB(
-                      0,
-                      30,
-                      _contentEndPadding,
-                      0,
-                    ),
-                    sliver: SliverToBoxAdapter(
-                      child: SidebarInfoCard(
-                        brandName: 'Operit',
-                        appearance: widget.appearance,
-                      ),
-                    ),
-                  ),
-                  const SliverToBoxAdapter(child: SizedBox(height: 18)),
-                  SliverToBoxAdapter(
-                    child: Padding(
-                      padding: const EdgeInsetsDirectional.only(
-                        start: 28,
-                        end: _contentEndPadding,
-                        bottom: 2,
-                      ),
-                      child: Row(
-                        children: <Widget>[
-                          Expanded(
-                            child: Text(
-                              '会话',
-                              style: Theme.of(context).textTheme.titleSmall
-                                  ?.copyWith(
-                                    color: widget.appearance.titleColor
-                                        .withValues(alpha: 0.82),
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: _toggleGroupingMode,
-                            visualDensity: VisualDensity.compact,
-                            tooltip:
-                                _groupingMode == _HistoryGroupingMode.workspace
-                                ? '按角色卡分组'
-                                : '按工作区分组',
-                            icon: Icon(
-                              _groupingMode == _HistoryGroupingMode.workspace
-                                  ? Icons.badge_outlined
-                                  : Icons.work_outline,
-                              size: 20,
-                              color: widget.appearance.itemColor,
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: () => themeController.toggle(context),
-                            visualDensity: VisualDensity.compact,
-                            tooltip: darkThemeActive ? '切换白天模式' : '切换黑夜模式',
-                            icon: Icon(
-                              darkThemeActive
-                                  ? Icons.light_mode_outlined
-                                  : Icons.dark_mode_outlined,
-                              size: 20,
-                              color: widget.appearance.itemColor,
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: _toggleSearchExpanded,
-                            visualDensity: VisualDensity.compact,
-                            tooltip: _searchExpanded ? '收起搜索' : '搜索对话',
-                            icon: Icon(
-                              _searchExpanded ? Icons.search_off : Icons.search,
-                              size: 20,
-                              color: _searchController.text.trim().isNotEmpty
-                                  ? widget.appearance.statusAvailableColor
-                                  : widget.appearance.itemColor,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SliverToBoxAdapter(child: SizedBox(height: 6)),
-                  SliverToBoxAdapter(
-                    child: Padding(
-                      padding: const EdgeInsetsDirectional.only(
-                        start: 12,
-                        end: _contentEndPadding,
-                        bottom: 8,
-                      ),
-                      child: NewConversationButton(
-                        appearance: widget.appearance,
-                        onClick: _createConversation,
-                        onCreateGroup: _showCreateGroupDialog,
-                      ),
-                    ),
-                  ),
-                  SliverToBoxAdapter(
-                    child: AnimatedSize(
-                      duration: const Duration(milliseconds: 180),
-                      curve: Curves.easeOutCubic,
-                      child: _searchExpanded
-                          ? Padding(
-                              padding: const EdgeInsetsDirectional.only(
-                                start: 12,
-                                end: _contentEndPadding,
-                                bottom: 12,
-                              ),
-                              child: ConversationSearchField(
-                                controller: _searchController,
-                                appearance: widget.appearance,
-                              ),
-                            )
-                          : const SizedBox.shrink(),
-                    ),
-                  ),
-                  if (errorMessage != null)
-                    SliverToBoxAdapter(
-                      child: SidebarStatusText(
-                        text: errorMessage,
-                        appearance: widget.appearance,
-                      ),
-                    ),
-                  SliverList(
-                    delegate: SliverChildBuilderDelegate((context, index) {
-                      final entry = historyEntries[index];
-                      return switch (entry) {
-                        _CharacterHeaderEntry(:final section) =>
-                          _CharacterSectionHeader(
-                            label: section.label,
-                            kind: section.kind,
-                            avatarUri: section.avatarUri,
-                            count: section.historyCount,
-                            expanded: !_collapsedCharacterSections.contains(
-                              section.key,
-                            ),
-                            appearance: widget.appearance,
-                            onToggleExpanded: () =>
-                                _toggleCharacterSection(section.key),
-                          ),
-                        _GroupHeaderEntry(:final group) => _GroupSectionHeader(
-                          label: group.label,
-                          count: group.historyCount,
-                          workspaceStyle:
-                              _groupingMode == _HistoryGroupingMode.workspace,
-                          expanded: !_collapsedGroupSections.contains(
-                            group.key,
-                          ),
-                          appearance: widget.appearance,
-                          onToggleExpanded: () =>
-                              _toggleGroupSection(group.key),
-                        ),
-                        _HistoryRowEntry(:final history) =>
-                          ConversationDrawerItem(
-                            history: history,
-                            title: history.title,
-                            selected:
-                                conversationSelectionEnabled &&
-                                widget.currentChatId == history.id,
-                            isRunning: widget.activeStreamingChatIds.contains(
-                              history.id,
-                            ),
-                            appearance: widget.appearance,
-                            nested: true,
-                            workspaceStyle:
-                                _groupingMode == _HistoryGroupingMode.workspace,
-                            onClick: () => _switchConversation(history),
-                            onRename: () {
-                              _showRenameConversationDialog(history);
-                            },
-                            onDelete: () {
-                              _showDeleteConversationDialog(history);
-                            },
-                            onLongPress: () {
-                              _showConversationActionDialog(history);
-                            },
-                            canDetach: operitSupportsDesktopMultiWindow,
-                            onDetach: () {
-                              DetachedChatWindowLauncher.openChat(
-                                chatId: history.id,
-                                title: history.title,
-                                themePreferenceSnapshot: OperitTheme.of(
-                                  context,
-                                ).themePreferenceSnapshot,
-                              ).catchError((
-                                Object error,
-                                StackTrace stackTrace,
-                              ) {
-                                debugPrint(
-                                  'Failed to open detached chat window: $error\n$stackTrace',
-                                );
-                                return null;
-                              });
-                            },
-                            onMoveTo: (moved) =>
-                                _moveConversationTo(moved, history),
-                            canAcceptDrop: (moved) =>
-                                _isInSameCharacterSection(moved, history),
-                          ),
-                      };
-                    }, childCount: historyEntries.length),
-                  ),
-                  if (!searching && hiddenHistoryCount > 0)
-                    SliverToBoxAdapter(
-                      child: _HistoryLimitButton(
-                        icon: Icons.expand_more,
-                        label: '展开更多 $hiddenHistoryCount',
-                        appearance: widget.appearance,
-                        onClick: () => _showMoreHistories(hiddenHistoryCount),
-                      ),
-                    ),
-                  if (widget.pluginEntries.isNotEmpty) ...<Widget>[
-                    const SliverToBoxAdapter(child: SizedBox(height: 10)),
-                    SliverToBoxAdapter(
-                      child: Padding(
-                        padding: const EdgeInsetsDirectional.only(
-                          start: 28,
-                          end: _contentEndPadding,
-                          bottom: 2,
-                        ),
-                        child: Text(
-                          '插件',
-                          style: Theme.of(context).textTheme.titleSmall
-                              ?.copyWith(
-                                color: widget.appearance.titleColor.withValues(
-                                  alpha: 0.82,
-                                ),
-                                fontWeight: FontWeight.w600,
-                              ),
-                        ),
-                      ),
-                    ),
-                    const SliverToBoxAdapter(child: SizedBox(height: 6)),
-                    SliverList(
-                      delegate: SliverChildBuilderDelegate((context, index) {
-                        final entry = widget.pluginEntries[index];
-                        return PluginNavigationDrawerItem(
-                          entry: entry,
-                          selected: widget.selectedRouteId == entry.routeId,
-                          appearance: widget.appearance,
-                          onClick: () =>
-                              widget.onNavigationEntrySelected(entry),
-                        );
-                      }, childCount: widget.pluginEntries.length),
-                    ),
-                  ],
-                  const SliverToBoxAdapter(child: SizedBox(height: 16)),
-                ],
-              ),
-              if (showInitialLoading)
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: Center(
-                      child: CircularProgressIndicator(
-                        color: widget.appearance.statusAvailableColor,
-                      ),
-                    ),
-                  ),
-                ),
-            ],
+          child: ChatSidebarTabHost(
+            clients: _clients,
+            chats: widget.histories,
+            currentChatId: widget.currentChatId,
+            activeStreamingChatIds: widget.activeStreamingChatIds,
+            headerBuilder: (context, tabs) => Column(
+              children: <Widget>[
+                _sidebarHeader(tabs),
+                const SizedBox(height: 12),
+              ],
+            ),
+            workspaceBuilder: _workspaceContent,
+            workspaceWithTabsBuilder: (context, tabs) =>
+                _workspaceContent(context, tabs: tabs),
+            pluginFooter: widget.pluginEntries.isEmpty
+                ? null
+                : _pluginNavigationContent(),
+            onActivateChat: _activateChat,
           ),
         ),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 18),
+          padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
           child: Row(
             children: <Widget>[
               Expanded(
@@ -1151,18 +816,34 @@ class _DrawerContentState extends State<DrawerContent> {
                   icon: Icons.inventory_2_outlined,
                   label: '包管理',
                   appearance: widget.appearance,
-                  selected: widget.selectedRouteId == packageManagerRouteId,
-                  onClick: _openPackageManager,
+                  selected:
+                      widget.selectedRouteId ==
+                      ScreenRouteRegistry.routeIdOf(
+                        ScreenRouteRegistry.packageManager,
+                      ),
+                  onClick: () => _openNavigation('main.package_manager'),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
                 child: BottomSidebarAction(
                   icon: Icons.settings_outlined,
                   label: '设置',
                   appearance: widget.appearance,
-                  selected: widget.selectedRouteId == settingsRouteId,
-                  onClick: _openSettings,
+                  selected:
+                      widget.selectedRouteId ==
+                      ScreenRouteRegistry.routeIdOf(
+                        ScreenRouteRegistry.settings,
+                      ),
+                  onClick: () => _openNavigation('main.settings'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Builder(
+                builder: (buttonContext) => _BottomThemeToggleButton(
+                  appearance: widget.appearance,
+                  darkThemeActive: theme.isDark(context),
+                  onToggle: () => theme.toggle(buttonContext),
                 ),
               ),
             ],
@@ -1173,426 +854,172 @@ class _DrawerContentState extends State<DrawerContent> {
   }
 }
 
-class _CharacterHistorySection {
-  _CharacterHistorySection({
-    required this.key,
-    required this.label,
-    required this.kind,
-    required this.avatarUri,
-    required this.groups,
+class _WorkspaceCreateBar extends StatelessWidget {
+  const _WorkspaceCreateBar({
+    required this.onCreateConversation,
+    required this.onCreateGroup,
   });
+  final VoidCallback onCreateConversation;
+  final VoidCallback onCreateGroup;
 
-  final String key;
-  final String label;
-  final _HistoryBindingKind kind;
-  final String? avatarUri;
-  final List<_HistoryGroupSection> groups;
-
-  int get historyCount {
-    var count = 0;
-    for (final group in groups) {
-      count += group.historyCount;
-    }
-    return count;
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final contentColor = scheme.onPrimaryContainer;
+    return SizedBox(
+      height: 34,
+      child: Material(
+        color: scheme.primaryContainer,
+        shape: const StadiumBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: Row(
+          children: [
+            Expanded(
+              child: InkWell(
+                key: const ValueKey('workspace-create-chat'),
+                borderRadius: const BorderRadius.horizontal(
+                  left: Radius.circular(17),
+                ),
+                hoverColor: contentColor.withValues(alpha: 0.08),
+                focusColor: contentColor.withValues(alpha: 0.10),
+                splashColor: contentColor.withValues(alpha: 0.10),
+                highlightColor: contentColor.withValues(alpha: 0.10),
+                onTap: onCreateConversation,
+                child: Center(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(Icons.add_rounded, size: 17, color: contentColor),
+                      const SizedBox(width: 6),
+                      Text(
+                        '新建对话',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: contentColor,
+                          letterSpacing: -0.1,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            ...[
+              Container(
+                width: 1,
+                height: 16,
+                color: contentColor.withValues(alpha: 0.16),
+              ),
+              SizedBox(
+                width: 38,
+                height: 34,
+                child: InkWell(
+                  key: const ValueKey('workspace-create-group'),
+                  onTap: onCreateGroup,
+                  borderRadius: const BorderRadius.horizontal(
+                    right: Radius.circular(17),
+                  ),
+                  child: Tooltip(
+                    message: '新建分组',
+                    child: Center(
+                      child: Icon(
+                        Icons.create_new_folder_outlined,
+                        size: 16,
+                        color: contentColor,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
   }
 }
 
-enum _HistoryGroupingMode { character, workspace }
-
-enum _HistoryBindingKind { workspace, characterCard, characterGroup, unbound }
-
-class _HistoryGroupSection {
-  _HistoryGroupSection({
-    required this.key,
-    required this.label,
-    required this.histories,
-    int? historyCount,
-  }) : historyCount = historyCount ?? histories.length;
-
+class _WorkspaceSection {
+  /// Retains complete native conversation rows for count, collapse and search behavior.
+  _WorkspaceSection({required this.key, required this.label});
   final String key;
   final String label;
-  final List<core_proxy.ChatHistoryListItem> histories;
-  final int historyCount;
+  final List<core_proxy.ChatHistoryListItem> histories =
+      <core_proxy.ChatHistoryListItem>[];
 }
 
-class _VisibleHistoryPlan {
-  const _VisibleHistoryPlan({
-    required this.sections,
-    required this.hiddenCount,
-  });
-
-  final List<_CharacterHistorySection> sections;
-  final int hiddenCount;
-}
-
-sealed class _HistoryListEntry {
-  const _HistoryListEntry();
-}
-
-class _CharacterHeaderEntry extends _HistoryListEntry {
-  const _CharacterHeaderEntry(this.section);
-
-  final _CharacterHistorySection section;
-}
-
-class _GroupHeaderEntry extends _HistoryListEntry {
-  const _GroupHeaderEntry(this.group);
-
-  final _HistoryGroupSection group;
-}
-
-class _HistoryRowEntry extends _HistoryListEntry {
-  const _HistoryRowEntry(this.history);
-
-  final core_proxy.ChatHistoryListItem history;
-}
-
-class _ChatBindingForCreate {
-  const _ChatBindingForCreate({
-    required this.characterCardName,
-    required this.characterGroupId,
-  });
-
-  final String? characterCardName;
-  final String? characterGroupId;
-}
-
-String _shortIdentifier(String value) {
-  final text = value.trim();
-  if (text.length <= 12) {
-    return text;
-  }
-  return '${text.substring(0, 8)}...${text.substring(text.length - 4)}';
-}
-
-class _CharacterSectionHeader extends StatelessWidget {
-  const _CharacterSectionHeader({
+class _WorkspaceHeader extends StatelessWidget {
+  /// Displays the native workspace header without subject-specific icons or avatars.
+  const _WorkspaceHeader({
+    super.key,
     required this.label,
-    required this.kind,
-    required this.avatarUri,
     required this.count,
     required this.expanded,
     required this.appearance,
     required this.onToggleExpanded,
   });
-
   final String label;
-  final _HistoryBindingKind kind;
-  final String? avatarUri;
   final int count;
   final bool expanded;
   final NavigationDrawerAppearance appearance;
   final VoidCallback onToggleExpanded;
 
-  /// Builds the top-level history section header.
+  /// Preserves native workspace collapse and complete conversation counts.
   @override
-  Widget build(BuildContext context) {
-    final workspaceStyle = kind == _HistoryBindingKind.workspace;
-    if (workspaceStyle) {
-      return Padding(
-        padding: const EdgeInsetsDirectional.only(
-          start: 18,
-          end: 12,
-          top: 8,
-          bottom: 4,
-        ),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: onToggleExpanded,
-          child: Padding(
-            padding: const EdgeInsetsDirectional.fromSTEB(2, 3, 4, 3),
-            child: Row(
-              children: <Widget>[
-                Container(
-                  width: 3,
-                  height: 17,
-                  decoration: BoxDecoration(
-                    color: appearance.statusAvailableColor.withValues(
-                      alpha: 0.62,
-                    ),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                const SizedBox(width: 9),
-                Icon(
-                  Icons.work_outline,
-                  size: 15,
-                  color: appearance.itemColor.withValues(alpha: 0.82),
-                ),
-                const SizedBox(width: 7),
-                Expanded(
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                      color: appearance.titleColor,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                _HistoryCountBadge(count: count, appearance: appearance),
-                const SizedBox(width: 6),
-                Icon(
-                  expanded ? Icons.expand_less : Icons.expand_more,
-                  size: 18,
-                  color: appearance.itemColor.withValues(alpha: 0.70),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
-    final avatarContainerColor = appearance.buttonContainerColor;
-    return Padding(
-      padding: const EdgeInsetsDirectional.only(
-        start: 20,
-        end: 12,
-        top: 10,
-        bottom: 5,
-      ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(18),
-        onTap: onToggleExpanded,
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsetsDirectional.only(
+      start: 18,
+      end: 12,
+      top: 8,
+      bottom: 4,
+    ),
+    child: InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onToggleExpanded,
+      child: Padding(
+        padding: const EdgeInsetsDirectional.fromSTEB(2, 3, 4, 3),
         child: Row(
           children: <Widget>[
             Container(
-              width: 22,
-              height: 22,
+              width: 3,
+              height: 17,
               decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: avatarContainerColor,
+                color: appearance.statusAvailableColor.withValues(alpha: 0.62),
+                borderRadius: BorderRadius.circular(2),
               ),
-              alignment: Alignment.center,
-              child: kind == _HistoryBindingKind.characterCard
-                  ? ClipOval(
-                      child: CharacterAvatarImage(
-                        avatarUri: avatarUri,
-                        fit: BoxFit.cover,
-                      ),
-                    )
-                  : Icon(
-                      switch (kind) {
-                        _HistoryBindingKind.workspace =>
-                          Icons.workspaces_outline,
-                        _HistoryBindingKind.characterGroup =>
-                          Icons.groups_outlined,
-                        _HistoryBindingKind.unbound =>
-                          Icons.account_tree_outlined,
-                        _HistoryBindingKind.characterCard =>
-                          Icons.person_outline,
-                      },
-                      size: 14,
-                      color: appearance.itemColor,
-                    ),
             ),
-            const SizedBox(width: 8),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 170),
+            const SizedBox(width: 9),
+            Icon(
+              Icons.work_outline,
+              size: 15,
+              color: appearance.itemColor.withValues(alpha: 0.82),
+            ),
+            const SizedBox(width: 7),
+            Expanded(
               child: Text(
                 label,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
                   color: appearance.titleColor,
                   fontWeight: FontWeight.w700,
                 ),
               ),
             ),
             const SizedBox(width: 8),
-            Text(
-              count.toString(),
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: appearance.itemColor.withValues(alpha: 0.64),
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            Expanded(
-              child: Container(
-                height: 2,
-                margin: const EdgeInsetsDirectional.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: <Color>[
-                      appearance.dividerColor,
-                      Colors.transparent,
-                    ],
-                  ),
-                ),
-              ),
-            ),
+            _HistoryCountBadge(count: count, appearance: appearance),
+            const SizedBox(width: 6),
             Icon(
-              expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-              size: 23,
-              color: appearance.itemColor.withValues(alpha: 0.78),
+              expanded ? Icons.expand_less : Icons.expand_more,
+              size: 18,
+              color: appearance.itemColor.withValues(alpha: 0.70),
             ),
           ],
         ),
       ),
-    );
-  }
-}
-
-class _GroupSectionHeader extends StatelessWidget {
-  /// Creates a collapsible group header for history entries.
-  const _GroupSectionHeader({
-    required this.label,
-    required this.count,
-    required this.workspaceStyle,
-    required this.expanded,
-    required this.appearance,
-    required this.onToggleExpanded,
-  });
-
-  final String label;
-  final int count;
-  final bool workspaceStyle;
-  final bool expanded;
-  final NavigationDrawerAppearance appearance;
-  final VoidCallback onToggleExpanded;
-
-  static const double _endPadding = 12;
-
-  /// Builds a history group header in the current drawer style.
-  @override
-  Widget build(BuildContext context) {
-    if (workspaceStyle) {
-      return Padding(
-        padding: EdgeInsetsDirectional.only(
-          start: 28,
-          end: _endPadding,
-          top: 2,
-          bottom: expanded ? 2 : 0,
-        ),
-        child: Row(
-          children: <Widget>[
-            HistoryRail(
-              height: 25,
-              appearance: appearance,
-              width: 16,
-              thickness: 1,
-            ),
-            Expanded(
-              child: Material(
-                color: Colors.transparent,
-                borderRadius: BorderRadius.circular(8),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(8),
-                  onTap: onToggleExpanded,
-                  child: Padding(
-                    padding: const EdgeInsetsDirectional.fromSTEB(8, 5, 6, 5),
-                    child: Row(
-                      children: <Widget>[
-                        Icon(
-                          Icons.folder_outlined,
-                          size: 14,
-                          color: appearance.itemColor.withValues(alpha: 0.76),
-                        ),
-                        const SizedBox(width: 7),
-                        Expanded(
-                          child: Text(
-                            label,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall
-                                ?.copyWith(
-                                  color: appearance.titleColor.withValues(
-                                    alpha: 0.86,
-                                  ),
-                                  fontWeight: FontWeight.w600,
-                                ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        _HistoryCountBadge(
-                          count: count,
-                          appearance: appearance,
-                        ),
-                        const SizedBox(width: 3),
-                        Icon(
-                          expanded ? Icons.expand_less : Icons.expand_more,
-                          size: 17,
-                          color: appearance.itemColor.withValues(alpha: 0.62),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Padding(
-      padding: EdgeInsetsDirectional.only(
-        start: 22,
-        end: _endPadding,
-        top: 4,
-        bottom: expanded ? 3 : 0,
-      ),
-      child: Row(
-        children: <Widget>[
-          HistoryRail(height: 30, appearance: appearance),
-          Expanded(
-            child: Material(
-              color: appearance.buttonContainerColor,
-              borderRadius: BorderRadius.circular(12),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: onToggleExpanded,
-                child: Padding(
-                  padding: const EdgeInsetsDirectional.fromSTEB(12, 7, 10, 7),
-                  child: Row(
-                    children: <Widget>[
-                      Icon(
-                        Icons.folder_outlined,
-                        size: 16,
-                        color: appearance.itemColor,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.labelLarge
-                              ?.copyWith(
-                                color: appearance.titleColor,
-                                fontWeight: FontWeight.w700,
-                              ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        count.toString(),
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: appearance.itemColor.withValues(alpha: 0.72),
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Icon(
-                        expanded
-                            ? Icons.keyboard_arrow_up
-                            : Icons.keyboard_arrow_down,
-                        size: 20,
-                        color: appearance.itemColor.withValues(alpha: 0.68),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+    ),
+  );
 }
 
 class _HistoryCountBadge extends StatelessWidget {
@@ -1626,23 +1053,78 @@ class _HistoryCountBadge extends StatelessWidget {
   }
 }
 
+class _BottomThemeToggleButton extends StatelessWidget {
+  const _BottomThemeToggleButton({
+    required this.appearance,
+    required this.darkThemeActive,
+    required this.onToggle,
+  });
+
+  final NavigationDrawerAppearance appearance;
+  final bool darkThemeActive;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) => ThemeBottomThemeToggleButton(
+    appearance: appearance,
+    darkThemeActive: darkThemeActive,
+    onToggle: onToggle,
+  );
+}
+
+class _ToolbarIconButton extends StatelessWidget {
+  const _ToolbarIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.appearance,
+    required this.onClick,
+    this.active = false,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final NavigationDrawerAppearance appearance;
+  final VoidCallback onClick;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    return ThemeDrawerToolbarIconButton(
+      icon: icon,
+      tooltip: tooltip,
+      appearance: appearance,
+      onClick: onClick,
+      active: active,
+    );
+  }
+}
+
 class _HistoryLimitButton extends StatelessWidget {
+  /// Creates the inline control for a group's conversation preview.
   const _HistoryLimitButton({
+    super.key,
     required this.icon,
     required this.label,
+    required this.workspaceStyle,
     required this.appearance,
     required this.onClick,
   });
 
   final IconData icon;
   final String label;
+  final bool workspaceStyle;
   final NavigationDrawerAppearance appearance;
   final VoidCallback onClick;
 
+  /// Renders the reversible preview toggle inline with its conversation group.
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsetsDirectional.only(start: 24, end: 12, top: 2),
+      padding: EdgeInsetsDirectional.only(
+        start: workspaceStyle ? 51 : 56,
+        end: 12,
+        top: 2,
+      ),
       child: TextButton.icon(
         onPressed: onClick,
         icon: Icon(

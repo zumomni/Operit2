@@ -52,6 +52,9 @@ pub fn createRuntimeHostManager(
     )
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(WindowsHttpHost::new()))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
+    .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
     .withRuntimeStorageWriteHost(runtimeStorageWriteHost)
     .withAudioPlaybackHost(Arc::new(WindowsAudioPlaybackHost::new()))
@@ -62,6 +65,7 @@ pub fn createRuntimeHostManager(
     .withHostRuntimeEventSchedulerHost(Arc::new(WindowsHostRuntimeEventSchedulerHost::new()))
     .withPluginSdkIpcHost(Arc::new(WindowsPluginSdkIpcHost::new()))
     .withHostJavaScriptRuntimeHost(Arc::new(WindowsHostJavaScriptRuntimeHost::new()))
+    .withServiceDiscoveryHost(Arc::new(operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::default()))
     .withHostRuntimeTaskSchedulerHost(Arc::new(WindowsHostRuntimeTaskSchedulerHost::new()))
 }
 use std::path::PathBuf;

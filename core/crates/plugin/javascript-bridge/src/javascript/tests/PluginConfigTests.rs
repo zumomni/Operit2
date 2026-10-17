@@ -56,6 +56,7 @@ fn plugin_config_proxy_persists_and_reads_values() {
     );
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "plugin_config_roundtrip",
         &params,
@@ -67,7 +68,7 @@ fn plugin_config_proxy_persists_and_reads_values() {
     );
 
     assert_eq!(
-        expect_js_output(output, "plugin config roundtrip execution"),
-        "{\"count\":42,\"name\":\"saved\",\"beforeFlushWriteCount\":0,\"writeCount\":1}"
+        serde_json::from_str::<serde_json::Value>(&expect_js_output(output, "plugin config roundtrip execution")).unwrap(),
+        serde_json::json!({"count":42,"name":"saved","beforeFlushWriteCount":0,"writeCount":1})
     );
 }

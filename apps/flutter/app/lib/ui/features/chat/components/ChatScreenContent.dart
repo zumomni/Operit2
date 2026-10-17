@@ -5,9 +5,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import 'ChatToolPermissionPanel.dart';
 import '../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../l10n/generated/app_localizations.dart';
 import '../../../common/components/M3LoadingIndicator.dart';
+import '../../../common/contributions/ChatUiContributionModels.dart';
+import '../../../theme/OperitThemeAssets.dart';
+import '../../../common/interactions/DrawerGestureExclusion.dart';
 import '../../../theme/OperitTheme.dart';
 import '../viewmodel/ChatViewModel.dart';
 import '../tts/TtsPlaybackController.dart';
@@ -23,9 +27,12 @@ import 'share/ChatShareImagePreviewDialog.dart';
 import 'style/input/agent/AgentChatInputSection.dart';
 import 'style/input/classic/ClassicChatInputSection.dart';
 import 'style/input/common/InputProcessingStatusLane.dart';
+import 'style/input/common/ChatAttachmentMenuPopup.dart';
+import 'style/input/common/ChatRouteStatusHint.dart';
 import 'style/input/common/PendingQueueMessageItem.dart';
 
 class ChatScreenContent extends StatelessWidget {
+  /// Creates the native chat layout with plugin-provided display context.
   const ChatScreenContent({
     super.key,
     required this.messages,
@@ -38,8 +45,9 @@ class ChatScreenContent extends StatelessWidget {
     this.mentionSuggestionPanel,
     required this.viewModel,
     required this.currentChatId,
-    required this.currentCharacterCardName,
-    required this.currentCharacterCardAvatarUri,
+    required this.chatIdentity,
+    required this.backgroundUri,
+    required this.onIdentityTap,
     required this.autoScrollToBottomListenable,
     required this.hasOlderDisplayHistory,
     required this.hasNewerDisplayHistory,
@@ -73,6 +81,8 @@ class ChatScreenContent extends StatelessWidget {
     required this.onCancelMessage,
     required this.pendingQueueMessages,
     required this.isPendingQueueExpanded,
+    required this.toolPermissionRequests,
+    required this.onToolPermissionDecision,
     required this.onPendingQueueExpandedChange,
     required this.onDeletePendingQueueMessage,
     required this.onEditPendingQueueMessage,
@@ -80,7 +90,7 @@ class ChatScreenContent extends StatelessWidget {
     required this.attachments,
     required this.onAttachImage,
     required this.onTakePhoto,
-    required this.onAttachMemory,
+    required this.onPluginAttachment,
     required this.onAttachFile,
     required this.onAttachFiles,
     required this.onPasteImages,
@@ -110,8 +120,9 @@ class ChatScreenContent extends StatelessWidget {
   final Widget? mentionSuggestionPanel;
   final ChatViewModel viewModel;
   final String? currentChatId;
-  final String? currentCharacterCardName;
-  final String? currentCharacterCardAvatarUri;
+  final ChatUiIdentity? chatIdentity;
+  final String? backgroundUri;
+  final VoidCallback? onIdentityTap;
   final ValueListenable<bool> autoScrollToBottomListenable;
   final bool hasOlderDisplayHistory;
   final bool hasNewerDisplayHistory;
@@ -145,20 +156,28 @@ class ChatScreenContent extends StatelessWidget {
   final VoidCallback onCancelMessage;
   final List<PendingQueueMessageItem> pendingQueueMessages;
   final bool isPendingQueueExpanded;
+  final List<core_proxy.RuntimeHostInteractionToolPermissionRequest>
+  toolPermissionRequests;
+  final Future<void> Function(
+    String chatId,
+    String requestId,
+    ChatToolPermissionResult result,
+  )
+  onToolPermissionDecision;
   final ValueChanged<bool> onPendingQueueExpandedChange;
   final ValueChanged<int> onDeletePendingQueueMessage;
   final ValueChanged<int> onEditPendingQueueMessage;
   final ValueChanged<int> onSendPendingQueueMessage;
   final List<AttachmentInfo> attachments;
   final VoidCallback onAttachImage;
-  final VoidCallback onTakePhoto;
-  final VoidCallback onAttachMemory;
+  final VoidCallback? onTakePhoto;
+  final ChatAttachmentCompletion onPluginAttachment;
   final VoidCallback onAttachFile;
   final ValueChanged<List<String>> onAttachFiles;
   final ValueChanged<List<PastedImageAttachmentPayload>> onPasteImages;
-  final VoidCallback onAttachScreenContent;
-  final VoidCallback onAttachNotifications;
-  final VoidCallback onAttachLocation;
+  final VoidCallback? onAttachScreenContent;
+  final VoidCallback? onAttachNotifications;
+  final VoidCallback? onAttachLocation;
   final ValueChanged<String> onAttachPackage;
   final ValueChanged<String> onRemoveAttachment;
   final ValueChanged<AttachmentInfo> onInsertAttachment;
@@ -192,6 +211,15 @@ class ChatScreenContent extends StatelessWidget {
     return Stack(
       alignment: Alignment.topCenter,
       children: <Widget>[
+        if (backgroundUri != null)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: ThemeAssetImage(
+                storagePath: backgroundUri!,
+                fit: BoxFit.cover,
+              ),
+            ),
+          ),
         Positioned.fill(
           child: Column(
             children: <Widget>[
@@ -241,6 +269,28 @@ class ChatScreenContent extends StatelessWidget {
                   ],
                 ),
               ),
+              if (!isPreparingChatSwitch && toolPermissionRequests.isNotEmpty)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: themePreferenceSnapshot.bubbleWideLayoutEnabled
+                          ? chatWideContentMaxWidth
+                          : chatContentMaxWidth,
+                    ),
+                    child: Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: themePreferenceSnapshot.chatInputFloating
+                            ? 8
+                            : 0,
+                      ),
+                      child: ChatToolPermissionPanel(
+                        request: toolPermissionRequests.first,
+                        onRespond: onToolPermissionDecision,
+                      ),
+                    ),
+                  ),
+                ),
               // Keep the input subtree mounted during chat switches: tearing
               // it down deactivates tooltip states whose global pointer
               // routes then crash on ancestor lookups ("deactivated
@@ -273,7 +323,9 @@ class ChatScreenContent extends StatelessWidget {
                               ? null
                               : () => _confirmDeleteSelected(context),
                         )
-                      : _buildChatInputSection(inputStyle),
+                      : DrawerGestureExclusion(
+                          child: _buildChatInputSection(inputStyle),
+                        ),
                 ),
               ),
             ],
@@ -300,8 +352,18 @@ class ChatScreenContent extends StatelessWidget {
 
   /// Builds the chat input section selected by the saved input style.
   Widget _buildChatInputSection(String inputStyle) {
+    return ChatRouteStatusHint(
+      chatId: currentChatId,
+      viewModel: viewModel,
+      builder: (suffix) => _buildChatInputWithRouteHint(inputStyle, suffix),
+    );
+  }
+
+  /// Passes the same Core-provided route label to both composer styles.
+  Widget _buildChatInputWithRouteHint(String inputStyle, String suffix) {
     return switch (inputStyle) {
       UserPreferencesManager.INPUT_STYLE_AGENT => AgentChatInputSection(
+        hintSuffix: suffix,
         controller: messageController,
         focusNode: inputFocusNode,
         isLoading: loading,
@@ -309,8 +371,6 @@ class ChatScreenContent extends StatelessWidget {
         mentionSuggestionPanel: mentionSuggestionPanel,
         viewModel: viewModel,
         currentChatId: currentChatId,
-        currentCharacterCardName: currentCharacterCardName,
-        currentCharacterCardAvatarUri: currentCharacterCardAvatarUri,
         onSendMessage: onSendMessage,
         onQueueMessage: onQueueMessage,
         onCancelMessage: onCancelMessage,
@@ -323,7 +383,7 @@ class ChatScreenContent extends StatelessWidget {
         attachments: attachments,
         onAttachImage: onAttachImage,
         onTakePhoto: onTakePhoto,
-        onAttachMemory: onAttachMemory,
+        onPluginAttachment: onPluginAttachment,
         onAttachFile: onAttachFile,
         onAttachFiles: onAttachFiles,
         onPasteImages: onPasteImages,
@@ -338,6 +398,7 @@ class ChatScreenContent extends StatelessWidget {
         onSpeechInput: onSpeechInput,
       ),
       UserPreferencesManager.INPUT_STYLE_CLASSIC => ClassicChatInputSection(
+        hintSuffix: suffix,
         controller: messageController,
         focusNode: inputFocusNode,
         isLoading: loading,
@@ -345,8 +406,6 @@ class ChatScreenContent extends StatelessWidget {
         mentionSuggestionPanel: mentionSuggestionPanel,
         viewModel: viewModel,
         currentChatId: currentChatId,
-        currentCharacterCardName: currentCharacterCardName,
-        currentCharacterCardAvatarUri: currentCharacterCardAvatarUri,
         onSendMessage: onSendMessage,
         onQueueMessage: onQueueMessage,
         onCancelMessage: onCancelMessage,
@@ -359,7 +418,7 @@ class ChatScreenContent extends StatelessWidget {
         attachments: attachments,
         onAttachImage: onAttachImage,
         onTakePhoto: onTakePhoto,
-        onAttachMemory: onAttachMemory,
+        onPluginAttachment: onPluginAttachment,
         onAttachFile: onAttachFile,
         onAttachFiles: onAttachFiles,
         onPasteImages: onPasteImages,
@@ -388,7 +447,8 @@ class ChatScreenContent extends StatelessWidget {
       errorMessage: errorMessage,
       scrollController: scrollController,
       currentChatId: currentChatId,
-      currentCharacterCardAvatarUri: currentCharacterCardAvatarUri,
+      identityAvatarUri: chatIdentity?.avatarUri,
+      onIdentityTap: onIdentityTap,
       clients: viewModel.clients,
       packageManager: viewModel.clients.application.packageManager(),
       autoScrollToBottomListenable: autoScrollToBottomListenable,
@@ -457,38 +517,23 @@ class ChatScreenContent extends StatelessWidget {
     );
   }
 
-  /// Plays the selected message through the configured TTS voice.
+  /// Captures the displayed transcript and message variant before any asynchronous voice work.
   Future<void> _playVoice(BuildContext context, ChatUiMessage message) async {
     try {
-      final targetCharacterName = _voiceCharacterName(message);
-      if (targetCharacterName == null) {
-        _showTtsSnack(context, '当前消息没有可匹配的角色');
-        return;
-      }
-      final cards = await viewModel.clients.preferencesCharacterCardManager
-          .getAllCharacterCards();
-      if (!context.mounted) {
-        return;
-      }
-      final matchingCards = cards
-          .where((card) {
-            return card.name.trim() == targetCharacterName;
-          })
-          .toList(growable: false);
-      if (matchingCards.length != 1) {
-        _showTtsSnack(context, '角色卡匹配数量不是 1：$targetCharacterName');
-        return;
+      final chatId = currentChatId;
+      if (chatId == null || chatId.trim().isEmpty) {
+        throw StateError('The displayed message has no conversation ID.');
       }
       final text = cleanMessageContent(message.displayText);
-      if (text.isEmpty) {
-        _showTtsSnack(context, '消息内容为空，无法生成语音');
-        return;
+      if (text.trim().isEmpty) {
+        throw StateError('The selected message has no speech content.');
       }
-      await TtsPlaybackController.instance.speakForCharacter(
+      await TtsPlaybackController.instance.speakForMessage(
         bridge: viewModel.bridge,
-        characterCardId: matchingCards.first.id,
+        chatId: chatId,
+        messageTimestamp: message.timestamp,
+        variantIndex: message.selectedVariantIndex,
         text: text,
-        title: targetCharacterName,
       );
     } catch (error) {
       if (!context.mounted) {
@@ -496,12 +541,6 @@ class ChatScreenContent extends StatelessWidget {
       }
       _showTtsSnack(context, '生成/播放语音失败：$error');
     }
-  }
-
-  /// Resolves the character name used for message TTS playback.
-  String? _voiceCharacterName(ChatUiMessage message) {
-    final roleName = message.roleName.trim();
-    return roleName.isEmpty ? null : roleName;
   }
 
   /// Shows a snackbar for TTS status and errors.
@@ -603,6 +642,7 @@ class ChatScreenContent extends StatelessWidget {
       final image = await ChatShareImageGenerator.generate(
         context: context,
         messages: _selectedVisibleMessages,
+        splitMarkdownContent: viewModel.splitMarkdownContent,
       );
       if (!context.mounted) {
         return;

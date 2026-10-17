@@ -8,6 +8,8 @@ pub mod ApiKeyPoolAvailabilityTester;
 pub mod ApiKeyProvider;
 #[path = "ClaudeProvider.rs"]
 pub mod ClaudeProvider;
+#[path = "CodexOAuth.rs"]
+pub mod CodexOAuth;
 #[path = "DeepseekProvider.rs"]
 pub mod DeepseekProvider;
 #[path = "DoubaoAIProvider.rs"]
@@ -44,6 +46,8 @@ pub mod OllamaProvider;
 pub mod OpenAIProvider;
 #[path = "OpenAIResponsesProvider.rs"]
 pub mod OpenAIResponsesProvider;
+#[path = "OpenCodeProvider.rs"]
+pub mod OpenCodeProvider;
 #[path = "OpenRouterProvider.rs"]
 pub mod OpenRouterProvider;
 #[path = "QwenAIProvider.rs"]
@@ -56,6 +60,8 @@ pub mod RateLimiterRegistry;
 pub mod RequestConcurrencyRegistry;
 #[path = "SlidingWindowRateLimiter.rs"]
 pub mod SlidingWindowRateLimiter;
+#[path = "StreamingResponseLines.rs"]
+mod StreamingResponseLines;
 #[path = "StructuredToolCallBridge.rs"]
 pub mod StructuredToolCallBridge;
 #[path = "ThinkingConfiguration.rs"]
@@ -64,3 +70,7 @@ pub mod ThinkingConfiguration;
 pub mod ToolPkgJsAiProviderService;
 #[path = "UnsafeModelSsl.rs"]
 pub mod UnsafeModelSsl;
+
+#[cfg(test)]
+#[path = "../../../../tests/ProviderMediaTestSupport.rs"]
+mod ProviderMediaTestSupport;

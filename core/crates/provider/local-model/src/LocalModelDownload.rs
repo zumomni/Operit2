@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::LocalModelManifest::{
     LocalModelArchive, LocalModelArchiveFormat, LocalModelFile, LocalModelInstallSource,
-    LocalModelManifest,
+    LocalModelManifest, LocalModelSourceKind,
 };
 use crate::LocalModelRegistry::{InstalledLocalModel, LocalModelRegistrySnapshot};
 #[cfg(test)]
@@ -64,6 +64,8 @@ impl From<LocalModelStorageError> for LocalModelDownloadError {
 pub struct LocalModelInstallRequest {
     pub manifest: LocalModelManifest,
     pub installedAtMs: i64,
+    #[serde(default)]
+    pub preferredSourceKind: Option<LocalModelSourceKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +207,7 @@ impl LocalModelInstaller {
             LocalModelInstallSource::Files => self.installFileSource(
                 &request.manifest,
                 request.installedAtMs,
+                request.preferredSourceKind,
                 &installDir,
                 control,
                 onProgress.clone(),
@@ -212,6 +215,7 @@ impl LocalModelInstaller {
             LocalModelInstallSource::Archives { archives } => self.installArchiveSource(
                 &request.manifest,
                 request.installedAtMs,
+                request.preferredSourceKind,
                 &installDir,
                 archives,
                 control,
@@ -243,6 +247,7 @@ impl LocalModelInstaller {
         &self,
         manifest: &LocalModelManifest,
         installedAtMs: i64,
+        preferredSourceKind: Option<LocalModelSourceKind>,
         installDir: &Path,
         control: HttpDownloadControl,
         onProgress: LocalModelDownloadProgressCallback,
@@ -252,11 +257,11 @@ impl LocalModelInstaller {
         let mut downloadFiles = Vec::new();
         let mut downloadedTargets = Vec::new();
         for file in &manifest.files {
-            let source = manifest.sourceForFile(file).ok_or_else(|| {
-                LocalModelDownloadError::SourceNotFound {
+            let source = manifest
+                .sourceForFileWithPreferredKind(file, preferredSourceKind)
+                .map_err(|_| LocalModelDownloadError::SourceNotFound {
                     sourceId: file.sourceId.clone(),
-                }
-            })?;
+                })?;
             let url = source.fileUrl(&file.relativePath);
             let target = installDir.join(normalizedRelativePath(&file.relativePath)?);
             let tempTarget = downloadTempPath(&target)?;
@@ -309,6 +314,7 @@ impl LocalModelInstaller {
         &self,
         manifest: &LocalModelManifest,
         installedAtMs: i64,
+        preferredSourceKind: Option<LocalModelSourceKind>,
         installDir: &Path,
         archives: &[LocalModelArchive],
         control: HttpDownloadControl,
@@ -324,11 +330,11 @@ impl LocalModelInstaller {
         let mut downloadFiles = Vec::new();
         let mut archiveTargets = Vec::new();
         for archive in archives {
-            let source = manifest.sourceForArchive(archive).ok_or_else(|| {
-                LocalModelDownloadError::SourceNotFound {
+            let source = manifest
+                .sourceForArchiveWithPreferredKind(archive, preferredSourceKind)
+                .map_err(|_| LocalModelDownloadError::SourceNotFound {
                     sourceId: archive.sourceId.clone(),
-                }
-            })?;
+                })?;
             let archivePath = archiveDownloadPath(parent, archive)?;
             downloadFiles.push(HttpDownloadFileRequest {
                 fileId: archive.archiveId.clone(),
@@ -818,11 +824,14 @@ fn verifyFileReader(
             path: file.relativePath.clone(),
         });
     }
-    let calculated = format!("{:x}", hasher.finalize());
-    if !calculated.eq_ignore_ascii_case(file.sha256.trim()) {
-        return Err(LocalModelDownloadError::ChecksumMismatch {
-            path: file.relativePath.clone(),
-        });
+    let expected = file.sha256.trim();
+    if !expected.is_empty() {
+        let calculated = format!("{:x}", hasher.finalize());
+        if !calculated.eq_ignore_ascii_case(expected) {
+            return Err(LocalModelDownloadError::ChecksumMismatch {
+                path: file.relativePath.clone(),
+            });
+        }
     }
     Ok(fileBytes)
 }
@@ -1059,6 +1068,11 @@ mod tests {
     }
 
     impl HttpHost for TestHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Rejects buffered HTTP requests in registry-only tests.
         fn executeHttpRequest(&self, _request: HttpRequestData) -> HostResult<HttpResponseData> {
             Err(HostError::new("test HTTP request is not configured"))
@@ -1075,7 +1089,31 @@ mod tests {
         }
     }
 
+    impl operit_host_api::HttpStreamHost for TestHttpHost {
+        /// Rejects HTTP byte streams in registry-only tests.
+        fn openHttpByteStream(
+            &self,
+            _streamId: String,
+            _request: HttpRequestData,
+            _onOpened: operit_host_api::HttpStreamOpenedCallback,
+            _onChunk: operit_host_api::HttpStreamChunkCallback,
+            _onClosed: operit_host_api::HttpStreamClosedCallback,
+        ) -> HostResult<()> {
+            Err(HostError::new("test HTTP byte stream is not configured"))
+        }
+
+        /// Reports closure success because registry-only tests never open streams.
+        fn closeHttpByteStream(&self, _streamId: &str) -> HostResult<()> {
+            Ok(())
+        }
+    }
+
     impl HttpHost for FixtureArchiveHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Rejects buffered HTTP requests in archive installer tests.
         fn executeHttpRequest(&self, _request: HttpRequestData) -> HostResult<HttpResponseData> {
             Err(HostError::new("test HTTP request is not configured"))
@@ -1133,6 +1171,27 @@ mod tests {
                 files: results,
                 downloadedBytes: totalBytes,
             })
+        }
+    }
+
+    impl operit_host_api::HttpStreamHost for FixtureArchiveHttpHost {
+        /// Rejects HTTP byte streams because archive installer tests feed local fixtures.
+        fn openHttpByteStream(
+            &self,
+            _streamId: String,
+            _request: HttpRequestData,
+            _onOpened: operit_host_api::HttpStreamOpenedCallback,
+            _onChunk: operit_host_api::HttpStreamChunkCallback,
+            _onClosed: operit_host_api::HttpStreamClosedCallback,
+        ) -> HostResult<()> {
+            Err(HostError::new(
+                "test HTTP byte stream is not configured for archive fixtures",
+            ))
+        }
+
+        /// Reports closure success because archive fixture tests never open streams.
+        fn closeHttpByteStream(&self, _streamId: &str) -> HostResult<()> {
+            Ok(())
         }
     }
 
@@ -1254,6 +1313,7 @@ mod tests {
                 LocalModelInstallRequest {
                     manifest,
                     installedAtMs: 300,
+                    preferredSourceKind: None,
                 },
                 HttpDownloadControl::new(),
                 Arc::new(|_| {}),

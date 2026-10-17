@@ -48,6 +48,18 @@ String sanitizeUtf16(String value) {
   return buffer.toString();
 }
 
+/// Reports whether a Markdown surface is preparing its first content layout.
+class MarkdownLayoutNotification extends Notification {
+  /// Identifies one surface so containing rows can track nested preparation.
+  const MarkdownLayoutNotification({
+    required this.source,
+    required this.isPending,
+  });
+
+  final Object source;
+  final bool isPending;
+}
+
 class StreamMarkdownRenderer extends StatefulWidget {
   const StreamMarkdownRenderer({
     super.key,
@@ -67,6 +79,7 @@ class StreamMarkdownRenderer extends StatefulWidget {
     this.selectionRoot = true,
     this.onContentReady,
     this.onStreamDone,
+    this.onStreamError,
     required this.splitMarkdownContent,
   });
 
@@ -86,6 +99,7 @@ class StreamMarkdownRenderer extends StatefulWidget {
   final bool selectionRoot;
   final VoidCallback? onContentReady;
   final VoidCallback? onStreamDone;
+  final VoidCallback? onStreamError;
   final MarkdownContentSplitter splitMarkdownContent;
 
   @override
@@ -162,10 +176,10 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
 
     final stream = widget.contentStream;
     _streamDone = stream == null;
-    _rendererState.reset();
     if (stream == null) {
       final cachedNodes = _staticMarkdownNodeCache.get(widget.content);
       if (cachedNodes != null) {
+        _rendererState.reset();
         _streamDone = true;
         _rendererState.collectedContent.write(widget.content);
         _rendererState.streamParsingCompletedSuccessfully = true;
@@ -184,6 +198,7 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
       return;
     }
 
+    _rendererState.reset();
     _synchronizeRenderNodes(isStreaming: true);
     _subscribe(stream);
   }
@@ -193,6 +208,8 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
     if (!mounted || generation != _startGeneration) {
       return;
     }
+    // Keep the live tree visible until the persisted source has been parsed.
+    _rendererState.reset();
     for (final event in events) {
       _applyMarkdownEvent(event);
     }
@@ -244,6 +261,7 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
       },
       onError: (Object _, StackTrace _) {
         _rendererState.streamParsingCompletedSuccessfully = false;
+        widget.onStreamError?.call();
       },
     );
   }
@@ -438,6 +456,16 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
     });
   }
 
+  /// Releases the row reservation before this surface leaves its ancestors.
+  @override
+  void deactivate() {
+    MarkdownLayoutNotification(
+      source: this,
+      isPending: false,
+    ).dispatch(context);
+    super.deactivate();
+  }
+
   @override
   void dispose() {
     _renderTimer?.cancel();
@@ -448,6 +476,12 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
   /// Builds the Markdown node column inside a stable selection boundary.
   @override
   Widget build(BuildContext context) {
+    MarkdownLayoutNotification(
+      source: this,
+      isPending:
+          _rendererState.renderNodes.isEmpty &&
+          !_rendererState.streamParsingCompletedSuccessfully,
+    ).dispatch(context);
     final content = _MarkdownNodeColumn(
       nodes: _rendererState.renderNodes,
       rendererId: _rendererId,
@@ -1159,7 +1193,7 @@ int _typewriterTextLength(String text) {
     if (paragraphLines.isEmpty) {
       return;
     }
-    length += paragraphLines.join('\n').length;
+    length += paragraphLines.join('\n').characters.length;
     paragraphLines.clear();
   }
 
@@ -1210,14 +1244,16 @@ int _typewriterTextLength(String text) {
 
 int _typewriterLineLength(String text) {
   if (_headingLevel(text) > 0) {
-    return _markdownHeaderText(text).length;
+    return _markdownHeaderText(text).characters.length;
   }
   if (_isBulletLine(text)) {
-    return text.substring(2).length;
+    return text.substring(2).characters.length;
   }
   if (_isOrderedLine(text)) {
     final match = RegExp(r'^(\d+)\.\s*').firstMatch(text);
-    return match == null ? text.length : text.substring(match.end).length;
+    return match == null
+        ? text.characters.length
+        : text.substring(match.end).characters.length;
   }
-  return text.length;
+  return text.characters.length;
 }

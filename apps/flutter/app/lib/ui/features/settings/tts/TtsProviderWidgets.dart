@@ -7,12 +7,16 @@ class _SectionCard extends StatelessWidget {
   const _SectionCard({
     required this.title,
     required this.children,
+    this.icon,
     this.action,
+    this.initiallyExpanded = true,
   });
 
   final String title;
   final List<Widget> children;
+  final IconData? icon;
   final Widget? action;
+  final bool initiallyExpanded;
 
   /// Builds the section card with its content expanded by default.
   @override
@@ -36,20 +40,27 @@ class _SectionCard extends StatelessWidget {
           material: true,
           clip: false,
           child: ExpansionTile(
-            initiallyExpanded: true,
+            initiallyExpanded: initiallyExpanded,
             tilePadding: const EdgeInsets.symmetric(horizontal: 14),
             childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
             shape: RoundedRectangleBorder(borderRadius: radius),
             collapsedShape: RoundedRectangleBorder(borderRadius: radius),
             title: Row(
               children: <Widget>[
+                if (icon != null) ...<Widget>[
+                  Icon(icon, size: 18, color: colorScheme.onSurfaceVariant),
+                  const SizedBox(width: 8),
+                ],
                 Expanded(
                   child: Text(
                     title,
                     style: SettingsControlStyles.sectionTitleTextStyle(context),
                   ),
                 ),
-                ?action,
+                if (action != null) ...<Widget>[
+                  action!,
+                  const SizedBox(width: 4),
+                ],
               ],
             ),
             children: children,
@@ -81,8 +92,8 @@ class _TtsProviderManager extends StatelessWidget {
   final ValueChanged<String> onToggleProviderExpanded;
   final void Function(_TtsProviderGroup group) onAddVoice;
   final void Function(_TtsProviderGroup group) onEditProvider;
-  final void Function(core_proxy.TtsConfig config) onEditConfig;
-  final Future<void> Function(core_proxy.TtsConfig config) onTestConfig;
+  final void Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onEditConfig;
+  final Future<void> Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onTestConfig;
   final Future<void> Function(String id) onSetCurrent;
 
   @override
@@ -131,8 +142,8 @@ class _TtsProviderGroupTile extends StatelessWidget {
   final VoidCallback onToggleExpanded;
   final VoidCallback onAddVoice;
   final VoidCallback onEditProvider;
-  final void Function(core_proxy.TtsConfig config) onEditConfig;
-  final Future<void> Function(core_proxy.TtsConfig config) onTestConfig;
+  final void Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onEditConfig;
+  final Future<void> Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onTestConfig;
   final Future<void> Function(String id) onSetCurrent;
 
   @override
@@ -264,11 +275,11 @@ class _TtsVoiceList extends StatelessWidget {
     required this.onSetCurrent,
   });
 
-  final List<core_proxy.TtsConfig> configs;
+  final List<core_proxy.CoreOperitModelTtsConfigTtsConfig> configs;
   final String currentConfigId;
   final String? testingConfigId;
-  final void Function(core_proxy.TtsConfig config) onEditConfig;
-  final Future<void> Function(core_proxy.TtsConfig config) onTestConfig;
+  final void Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onEditConfig;
+  final Future<void> Function(core_proxy.CoreOperitModelTtsConfigTtsConfig config) onTestConfig;
   final Future<void> Function(String id) onSetCurrent;
 
   @override
@@ -304,7 +315,7 @@ class _TtsVoiceTile extends StatelessWidget {
     required this.onTest,
   });
 
-  final core_proxy.TtsConfig config;
+  final core_proxy.CoreOperitModelTtsConfigTtsConfig config;
   final bool current;
   final bool testing;
   final VoidCallback onSetCurrent;
@@ -385,7 +396,7 @@ class _TtsVoiceTile extends StatelessWidget {
 class _TtsVoiceMeta extends StatelessWidget {
   const _TtsVoiceMeta({required this.config});
 
-  final core_proxy.TtsConfig config;
+  final core_proxy.CoreOperitModelTtsConfigTtsConfig config;
 
   @override
   Widget build(BuildContext context) {

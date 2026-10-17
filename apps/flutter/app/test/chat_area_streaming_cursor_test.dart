@@ -1,6 +1,9 @@
+import 'support/markdown_event_fixture.dart';
+
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -14,6 +17,7 @@ import 'package:operit2/ui/common/markdown/MarkdownNodeGrouper.dart';
 import 'package:operit2/ui/common/markdown/StreamMarkdownRenderer.dart';
 import 'package:operit2/ui/common/markdown/StreamMarkdownRendererState.dart';
 import 'package:operit2/ui/features/chat/components/ChatArea.dart';
+import 'package:operit2/ui/features/chat/components/ChatMessageExtent.dart';
 import 'package:operit2/ui/features/chat/components/ChatScrollNavigator.dart';
 import 'package:operit2/ui/features/chat/components/part/StructuredMessagePartRenderer.dart';
 import 'package:operit2/ui/features/chat/components/part/ThinkToolsXmlNodeGrouper.dart';
@@ -25,6 +29,180 @@ import 'package:operit2/ui/theme/OperitTheme.dart';
 
 /// Verifies transcript rendering and scroll ownership across asynchronous updates.
 void main() {
+  testWidgets(
+    'keeps measured scroll extent stable during a manual upward drag',
+    (tester) async {
+      final scrollController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(false);
+      addTearDown(scrollController.dispose);
+      addTearDown(autoScrollToBottom.dispose);
+      final messages = List.generate(
+        18,
+        (index) => _heightTestMessage(index, lines: index % 4 == 0 ? 20 : 1),
+      );
+      await tester.pumpWidget(
+        _chatArea(
+          messages: messages,
+          isLoading: false,
+          scrollController: scrollController,
+          autoScrollToBottom: autoScrollToBottom,
+        ),
+      );
+      await tester.pumpAndSettle();
+      for (var step = 0; step < 100; step++) {
+        final position = scrollController.position;
+        if (position.extentAfter < 1) {
+          break;
+        }
+        scrollController.jumpTo(
+          (position.pixels + 120).clamp(0, position.maxScrollExtent),
+        );
+        await tester.pumpAndSettle();
+      }
+      expect(scrollController.position.extentAfter, lessThan(1));
+      final measuredBottom = scrollController.position.maxScrollExtent;
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byType(CustomScrollView)),
+      );
+      for (var step = 0; step < 18; step++) {
+        await gesture.moveBy(const Offset(0, 60));
+        await tester.pump();
+        expect(
+          scrollController.position.maxScrollExtent,
+          closeTo(measuredBottom, 1),
+          reason: 'Measured rows must not be replaced by a visible-row average',
+        );
+      }
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 1600));
+      expect(autoScrollToBottom.value, isFalse);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'keeps the manual viewport fixed while an earlier row changes height',
+    (tester) async {
+      final scrollController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(false);
+      final changedContent = Completer<List<MarkdownStreamEvent>>();
+      addTearDown(scrollController.dispose);
+      addTearDown(autoScrollToBottom.dispose);
+      final messages = List.generate(
+        12,
+        (index) => _heightTestMessage(100 + index, lines: 5),
+      );
+
+      /// Hosts the same transcript while delaying the edited first row's parsing.
+      Widget transcript(List<ChatUiMessage> rows) => _chatArea(
+        messages: rows,
+        isLoading: false,
+        scrollController: scrollController,
+        autoScrollToBottom: autoScrollToBottom,
+        splitMarkdownContent: (content) => content == 'height-test-edited'
+            ? changedContent.future
+            : _splitMarkdownContent(content),
+      );
+
+      await tester.pumpWidget(transcript(messages));
+      await tester.pumpAndSettle();
+      final target = find.byWidgetPredicate(
+        (widget) =>
+            widget is CursorStyleChatMessage &&
+            widget.message.timestamp == messages[1].timestamp,
+      );
+      final viewportTop = tester.getTopLeft(find.byType(CustomScrollView)).dy;
+      scrollController.jumpTo(tester.getTopLeft(target).dy - viewportTop - 40);
+      await tester.pumpAndSettle();
+      final targetTop = tester.getTopLeft(target).dy;
+      final previousOffset = scrollController.offset;
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byType(CustomScrollView)),
+      );
+      final edited = _heightTestMessageWithContent(100, 'height-test-edited');
+      await tester.pumpWidget(transcript([edited, ...messages.skip(1)]));
+      await tester.pump();
+      expect(tester.getTopLeft(target).dy, closeTo(targetTop, 1));
+      expect(scrollController.offset, closeTo(previousOffset, 1));
+      changedContent.complete([
+        _markdownBlockStart(),
+        _markdownBlockChunk(List.filled(24, 'Expanded earlier row').join('\n')),
+        _markdownCompleted(),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(tester.getTopLeft(target).dy, closeTo(targetTop, 1));
+      expect(scrollController.offset, greaterThan(previousOffset));
+      await gesture.moveBy(const Offset(0, 60));
+      await tester.pump();
+      final dragOffset = scrollController.offset;
+      await gesture.moveBy(const Offset(0, 60));
+      await tester.pump();
+      expect(scrollController.offset, closeTo(dragOffset - 60, 1));
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 1600));
+      expect(autoScrollToBottom.value, isFalse);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('retains row distance across display-window changes', (
+    tester,
+  ) async {
+    final scrollController = ScrollController();
+    final autoScrollToBottom = ValueNotifier<bool>(false);
+    final pending = Completer<List<MarkdownStreamEvent>>();
+    addTearDown(scrollController.dispose);
+    addTearDown(autoScrollToBottom.dispose);
+
+    /// Renders one window without changing the chat's stable identity.
+    Widget window(ChatUiMessage message) => _chatArea(
+      message: message,
+      isLoading: false,
+      scrollController: scrollController,
+      autoScrollToBottom: autoScrollToBottom,
+      splitMarkdownContent: (content) => content == 'window-height-delayed'
+          ? pending.future
+          : _splitMarkdownContent(content),
+    );
+
+    await tester.pumpWidget(window(_heightTestMessage(200, lines: 15)));
+    await tester.pumpAndSettle();
+    final originalExtent = tester
+        .widget<ChatMessageExtentBox>(find.byType(ChatMessageExtentBox))
+        .extent;
+    final originalHeight = tester
+        .getSize(find.byType(ChatMessageExtentBox))
+        .height;
+    await tester.pumpWidget(window(_heightTestMessage(201)));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      window(_heightTestMessageWithContent(200, 'window-height-delayed')),
+    );
+    expect(
+      tester
+          .widget<ChatMessageExtentBox>(find.byType(ChatMessageExtentBox))
+          .extent,
+      same(originalExtent),
+    );
+    expect(
+      tester.getSize(find.byType(ChatMessageExtentBox)).height,
+      originalHeight,
+    );
+    pending.complete([
+      _markdownBlockStart(),
+      _markdownBlockChunk('Shortened window message'),
+      _markdownCompleted(),
+    ]);
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSize(find.byType(ChatMessageExtentBox)).height,
+      lessThan(originalHeight),
+    );
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('keeps following disabled when scrolling away from the bottom', (
     tester,
   ) async {
@@ -67,6 +245,34 @@ void main() {
     expect(autoScrollToBottom.value, isFalse);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'does not allow the chat transcript to overscroll at the bottom',
+    (tester) async {
+      final scrollController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(false);
+      addTearDown(scrollController.dispose);
+      addTearDown(autoScrollToBottom.dispose);
+      await tester.pumpWidget(
+        _chatArea(
+          message: _aiMessage(parts: const []),
+          isLoading: false,
+          bottomContentInset: 1600,
+          scrollController: scrollController,
+          autoScrollToBottom: autoScrollToBottom,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(scrollController.position.physics, isA<ClampingScrollPhysics>());
+      final bottomOffset = scrollController.position.maxScrollExtent;
+      scrollController.jumpTo(bottomOffset);
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, -200));
+
+      expect(scrollController.offset, bottomOffset);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   testWidgets('ignores nested scroll updates at their own bottom', (
     tester,
@@ -158,7 +364,7 @@ void main() {
       await tester.pumpAndSettle();
       scrollController.jumpTo(scrollController.position.maxScrollExtent - 60);
       await tester.pump();
-      await tester.drag(find.byType(ListView), const Offset(0, -200));
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, -200));
       await tester.pumpAndSettle();
       expect(autoScrollToBottom.value, window.follows);
       await tester.pumpWidget(const SizedBox());
@@ -193,9 +399,362 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 270));
     await tester.pump();
-    await tester.drag(find.byType(ListView), const Offset(0, -200));
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -200));
     await tester.pumpAndSettle();
     expect(scrollController.offset, greaterThan(100));
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  for (final messageCount in [1, 80, 500]) {
+    testWidgets(
+      'paints the switched chat at its bottom with $messageCount rows',
+      (tester) async {
+        final scrollController = ScrollController();
+        final autoScrollToBottom = ValueNotifier<bool>(true);
+        final paints = <(double, double)>[];
+
+        /// Observes the active viewport even while an old keyed viewport unmounts.
+        Widget observePaint(Widget child) => CustomPaint(
+          foregroundPainter: _ScrollPositionPaintProbe(() {
+            final position = tester
+                .state<ScrollableState>(find.byType(Scrollable).first)
+                .position;
+            paints.add((position.pixels, position.maxScrollExtent));
+          }),
+          child: child,
+        );
+        addTearDown(scrollController.dispose);
+        addTearDown(autoScrollToBottom.dispose);
+        await tester.pumpWidget(
+          _chatArea(
+            messages: List.generate(
+              40,
+              (index) => _aiMessage(parts: const [], timestamp: 41000 + index),
+            ),
+            isLoading: false,
+            bottomContentInset: 1600,
+            bodyBuilder: observePaint,
+            scrollController: scrollController,
+            autoScrollToBottom: autoScrollToBottom,
+            onAutoScrollToBottomChanged: (value) =>
+                autoScrollToBottom.value = value,
+          ),
+        );
+        await tester.pumpAndSettle();
+        // Switch from a locator's coordinate system, not just a fresh viewport.
+        tester
+            .widget<ChatScrollNavigator>(find.byType(ChatScrollNavigator))
+            .onJumpToMessage(20);
+        await tester.pumpAndSettle();
+        expect(autoScrollToBottom.value, isFalse);
+        autoScrollToBottom.value = true;
+        paints.clear();
+        final loaded = Completer<List<MarkdownStreamEvent>>();
+        final messages = List.generate(
+          messageCount,
+          (index) => _aiMessage(
+            timestamp: 42000 + index,
+            completedAt: 1,
+            parts: [
+              MessagePart(
+                partId: 'switch-$index',
+                sequence: 0,
+                kind: MessagePartKind.markdown,
+                content: 'switch-$messageCount-$index',
+                toolCallId: null,
+                toolName: null,
+                attributes: const {},
+              ),
+            ],
+          ),
+        );
+        await tester.pumpWidget(
+          _chatArea(
+            currentChatId: 'switched-chat',
+            messages: messages,
+            isLoading: false,
+            bottomContentInset: 80,
+            scrollController: scrollController,
+            autoScrollToBottom: autoScrollToBottom,
+            splitMarkdownContent: (_) => loaded.future,
+            bodyBuilder: observePaint,
+          ),
+        );
+        expect(paints, isNotEmpty);
+        for (final (pixels, bottom) in paints) {
+          expect(
+            pixels,
+            closeTo(bottom, 0.01),
+            reason: 'The first painted frame',
+          );
+        }
+        paints.clear();
+        loaded.complete([
+          _markdownBlockStart(),
+          _markdownBlockChunk(
+            List.filled(40, 'Delayed switched content').join('\n'),
+          ),
+          _markdownCompleted(),
+        ]);
+        for (var frame = 0; frame < 40; frame++) {
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        expect(paints, isNotEmpty);
+        for (final (pixels, bottom) in paints) {
+          expect(
+            pixels,
+            closeTo(bottom, 0.01),
+            reason: 'Async content must align before paint',
+          );
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+        expect(scrollController.hasClients, isFalse);
+      },
+    );
+  }
+
+  testWidgets(
+    'initially aligns a switched live chat without snapping later growth',
+    (tester) async {
+      final scrollController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(true);
+      final streamController = StreamController<MarkdownStreamEvent>();
+      final paints = <(double, double)>[];
+      addTearDown(scrollController.dispose);
+      addTearDown(autoScrollToBottom.dispose);
+      addTearDown(streamController.close);
+
+      /// Observes the active viewport before post-frame callbacks can move it.
+      Widget observePaint(Widget child) => CustomPaint(
+        foregroundPainter: _ScrollPositionPaintProbe(() {
+          final position = tester
+              .state<ScrollableState>(find.byType(Scrollable).first)
+              .position;
+          paints.add((position.pixels, position.maxScrollExtent));
+        }),
+        child: child,
+      );
+      await tester.pumpWidget(
+        _chatArea(
+          message: _aiMessage(parts: const [], timestamp: 43000),
+          isLoading: false,
+          bottomContentInset: 80,
+          scrollController: scrollController,
+          autoScrollToBottom: autoScrollToBottom,
+          bodyBuilder: observePaint,
+        ),
+      );
+      await tester.pumpAndSettle();
+      paints.clear();
+      await tester.pumpWidget(
+        _chatArea(
+          currentChatId: 'live-switched-chat',
+          messages: [
+            ...List.generate(
+              80,
+              (index) => _aiMessage(parts: const [], timestamp: 44000 + index),
+            ),
+            _aiMessage(
+              parts: const [],
+              timestamp: 44080,
+              stream: streamController.stream,
+            ),
+          ],
+          isLoading: false,
+          bottomContentInset: 80,
+          scrollController: scrollController,
+          autoScrollToBottom: autoScrollToBottom,
+          bodyBuilder: observePaint,
+        ),
+      );
+      expect(paints, isNotEmpty);
+      for (final (pixels, bottom) in paints) {
+        expect(pixels, closeTo(bottom, 0.01));
+      }
+      await tester.pump();
+      final initialOffset = scrollController.offset;
+      streamController
+        ..add(_markdownBlockStart())
+        ..add(
+          _markdownBlockChunk(
+            List.filled(80, 'Continued live output').join('\n'),
+          ),
+        );
+      await _pumpRenderBoundary(tester);
+      expect(
+        scrollController.position.maxScrollExtent,
+        greaterThan(initialOffset),
+      );
+      expect(scrollController.position.extentAfter, greaterThan(1));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'transfers the layout position when its external controller changes',
+    (tester) async {
+      final oldController = ScrollController();
+      final newController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(true);
+      addTearDown(oldController.dispose);
+      addTearDown(newController.dispose);
+      addTearDown(autoScrollToBottom.dispose);
+      final message = _aiMessage(parts: const [], timestamp: 45000);
+      await tester.pumpWidget(
+        _chatArea(
+          message: message,
+          isLoading: false,
+          bottomContentInset: 1600,
+          scrollController: oldController,
+          autoScrollToBottom: autoScrollToBottom,
+        ),
+      );
+      await tester.pumpAndSettle();
+      final position = oldController.position;
+      await tester.pumpWidget(
+        _chatArea(
+          message: message,
+          isLoading: false,
+          bottomContentInset: 1600,
+          scrollController: newController,
+          autoScrollToBottom: autoScrollToBottom,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(oldController.hasClients, isFalse);
+      expect(newController.position, same(position));
+      autoScrollToBottom.value = false;
+      newController.jumpTo(120);
+      await tester.pumpAndSettle();
+      expect(newController.offset, 120);
+      await tester.pumpWidget(const SizedBox());
+      expect(newController.hasClients, isFalse);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('keeps the locator target fixed while older Markdown loads', (
+    tester,
+  ) async {
+    final scrollController = ScrollController();
+    final autoScrollToBottom = ValueNotifier<bool>(false);
+    final pending = <String, Completer<List<MarkdownStreamEvent>>>{};
+    addTearDown(scrollController.dispose);
+    addTearDown(autoScrollToBottom.dispose);
+    final messages = List.generate(
+      24,
+      (index) => _aiMessage(
+        timestamp: 20000 + index,
+        completedAt: 1,
+        parts: [
+          MessagePart(
+            partId: 'delayed-$index',
+            sequence: 0,
+            kind: MessagePartKind.markdown,
+            content: 'locator-delayed-$index',
+            toolCallId: null,
+            toolName: null,
+            attributes: const {},
+          ),
+        ],
+      ),
+    );
+    await tester.pumpWidget(
+      _chatArea(
+        messages: messages,
+        isLoading: false,
+        bottomContentInset: 1600,
+        scrollController: scrollController,
+        autoScrollToBottom: autoScrollToBottom,
+        onAutoScrollToBottomChanged: (value) =>
+            autoScrollToBottom.value = value,
+        splitMarkdownContent: (content) => pending
+            .putIfAbsent(content, () => Completer<List<MarkdownStreamEvent>>())
+            .future,
+      ),
+    );
+    await tester.pumpAndSettle();
+    tester
+        .widget<ChatScrollNavigator>(find.byType(ChatScrollNavigator))
+        .onJumpToMessage(12);
+    await tester.pumpAndSettle();
+    final target = find.byWidgetPredicate(
+      (widget) =>
+          widget is CursorStyleChatMessage && widget.message.timestamp == 20012,
+    );
+    final targetTop = tester.getTopLeft(target).dy;
+    final viewportTop = tester.getTopLeft(find.byType(CustomScrollView)).dy;
+    expect(targetTop, closeTo(viewportTop, 1));
+    expect(pending['locator-delayed-11'], isNotNull);
+    var scrollUpdates = 0;
+    scrollController.addListener(() => scrollUpdates++);
+    for (final index in [11, 10, 9]) {
+      // Resolve independent loads well beyond the old locator settle interval.
+      await tester.pump(const Duration(seconds: 1));
+      pending['locator-delayed-$index']!.complete([
+        _markdownBlockStart(),
+        _markdownBlockChunk(
+          List.filled(60, 'Expanded older message').join('\n'),
+        ),
+        _markdownCompleted(),
+      ]);
+      for (var frame = 0; frame < 24; frame++) {
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(tester.getTopLeft(target).dy, closeTo(targetTop, 1));
+      }
+    }
+    expect(scrollUpdates, 0);
+    expect(autoScrollToBottom.value, isFalse);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('locates an unbuilt message without walking intermediate rows', (
+    tester,
+  ) async {
+    final scrollController = ScrollController();
+    final autoScrollToBottom = ValueNotifier<bool>(false);
+    addTearDown(scrollController.dispose);
+    addTearDown(autoScrollToBottom.dispose);
+    await tester.pumpWidget(
+      _chatArea(
+        messages: List.generate(
+          500,
+          (index) => _aiMessage(parts: const [], timestamp: 30000 + index),
+        ),
+        isLoading: false,
+        bottomContentInset: 1600,
+        scrollController: scrollController,
+        autoScrollToBottom: autoScrollToBottom,
+        onAutoScrollToBottomChanged: (value) =>
+            autoScrollToBottom.value = value,
+      ),
+    );
+    await tester.pumpAndSettle();
+    final target = find.byWidgetPredicate(
+      (widget) =>
+          widget is CursorStyleChatMessage && widget.message.timestamp == 30400,
+    );
+    expect(target, findsNothing);
+    tester
+        .widget<ChatScrollNavigator>(find.byType(ChatScrollNavigator))
+        .onJumpToMessage(400);
+    await tester.pumpAndSettle();
+    expect(target, findsOneWidget);
+    expect(
+      tester.getTopLeft(target).dy,
+      closeTo(tester.getTopLeft(find.byType(CustomScrollView)).dy, 1),
+    );
+    expect(find.byType(CursorStyleChatMessage).evaluate().length, lessThan(50));
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 180));
+    await tester.pumpAndSettle();
+    final userOffset = scrollController.offset;
+    expect(userOffset, lessThan(0));
+    await tester.pump(const Duration(seconds: 2));
+    expect(scrollController.offset, userOffset);
+    expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
 
@@ -340,8 +899,106 @@ void main() {
 
     streamController.add(_markdownBlockChunk(' after snapshot'));
     await tester.pump(const Duration(milliseconds: 250));
+    await tester.pump(const Duration(milliseconds: 250));
 
     expect(find.textContaining('before snapshot after snapshot'), findsWidgets);
+  });
+
+  testWidgets('retains the list delegate and live stream during width changes', (
+    tester,
+  ) async {
+    final size = ValueNotifier<Size>(const Size(744, 500));
+    final scrollController = ScrollController();
+    final autoScrollToBottom = ValueNotifier<bool>(false);
+    var listens = 0;
+    var cancels = 0;
+    final stream = StreamController<MarkdownStreamEvent>.broadcast(
+      onListen: () => listens++,
+      onCancel: () => cancels++,
+    );
+    addTearDown(() async {
+      await stream.close();
+      size.dispose();
+      scrollController.dispose();
+      autoScrollToBottom.dispose();
+    });
+    await tester.pumpWidget(
+      _chatArea(
+        message: _aiMessage(parts: const [], stream: stream.stream),
+        scrollController: scrollController,
+        autoScrollToBottom: autoScrollToBottom,
+        bodyBuilder: (child) => Align(
+          alignment: Alignment.topLeft,
+          child: ValueListenableBuilder<Size>(
+            valueListenable: size,
+            child: child,
+            builder: (context, value, child) => SizedBox(
+              width: value.width,
+              height: value.height,
+              child: child,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 250));
+    stream
+      ..add(_markdownBlockStart())
+      ..add(_markdownBlockChunk('before sidebar'));
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.textContaining('before sidebar'), findsWidgets);
+    final list = tester.widget<CustomScrollView>(find.byType(CustomScrollView));
+    final position = scrollController.position;
+    final rendererState = tester.state(find.byType(StreamMarkdownRenderer));
+    final baselineListens = listens;
+    expect(baselineListens, greaterThan(0));
+    for (var cycle = 0; cycle < 3; cycle++) {
+      for (final width in <double>[
+        700,
+        640,
+        600,
+        580,
+        520,
+        580,
+        600,
+        640,
+        744,
+      ]) {
+        size.value = Size(width, 500);
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(
+          tester.widget<CustomScrollView>(find.byType(CustomScrollView)),
+          same(list),
+        );
+        expect(scrollController.position, same(position));
+        expect(
+          tester.state(find.byType(StreamMarkdownRenderer)),
+          same(rendererState),
+        );
+        expect(listens, baselineListens);
+        expect(cancels, 0);
+      }
+    }
+    // Height changes must still update the navigator without replacing the list.
+    size.value = const Size(744, 400);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(
+      tester.widget<CustomScrollView>(find.byType(CustomScrollView)),
+      same(list),
+    );
+    expect(
+      tester
+          .widget<ChatScrollNavigator>(find.byType(ChatScrollNavigator))
+          .viewportHeight,
+      400,
+    );
+    stream.add(_markdownBlockChunk(' after sidebar'));
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.textContaining('before sidebar after sidebar'), findsWidgets);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets('interpolates the cursor position across a stream line break', (
@@ -463,8 +1120,18 @@ void main() {
     );
     await tester.pump();
 
-    final listView = tester.widget<ListView>(find.byType(ListView));
-    expect(listView.padding, const EdgeInsets.fromLTRB(16, 16, 16, 48));
+    final listView = tester.widget<CustomScrollView>(
+      find.byType(CustomScrollView),
+    );
+    expect(
+      (listView.slivers.last as SliverPadding).padding,
+      const EdgeInsets.fromLTRB(
+        16,
+        16,
+        16,
+        16 + inputProcessingStatusLaneHeight,
+      ),
+    );
   });
 
   testWidgets('does not render a trailing stream newline as a paragraph gap', (
@@ -488,9 +1155,40 @@ void main() {
     await tester.pump(const Duration(milliseconds: 250));
 
     expect(
-      find.byKey(const ValueKey<String>('markdown-paragraph-break')),
+      find.byKey(const ValueKey<String>('markdown-paragraph-break-0')),
       findsNothing,
     );
+  });
+
+  /// Verifies that separated Markdown paragraphs do not create duplicate keys.
+  testWidgets('renders multiple Markdown paragraph gaps without key errors', (
+    tester,
+  ) async {
+    final streamController = StreamController<MarkdownStreamEvent>();
+    addTearDown(() async {
+      await streamController.close();
+    });
+
+    await tester.pumpWidget(
+      _streamingStructuredRendererHarness(
+        parts: const <MessagePart>[],
+        contentStream: streamController.stream,
+        streamState: StreamMarkdownRendererState(),
+      ),
+    );
+    streamController
+      ..add(_markdownBlockStart())
+      ..add(
+        _markdownBlockChunk(
+          'first paragraph\n\nsecond paragraph\n\nthird paragraph',
+        ),
+      );
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('first paragraph'), findsWidgets);
+    expect(find.textContaining('second paragraph'), findsWidgets);
+    expect(find.textContaining('third paragraph'), findsWidgets);
   });
 
   testWidgets('keeps live output when Flow rebuilds the stream wrapper', (
@@ -1076,66 +1774,72 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('pauses live bottom follow while a touch drag is active', (
-    tester,
-  ) async {
-    final scrollController = ScrollController();
-    final autoScrollToBottom = ValueNotifier<bool>(true);
-    addTearDown(() {
-      scrollController.dispose();
-      autoScrollToBottom.dispose();
-    });
+  for (final kind in [PointerDeviceKind.touch, PointerDeviceKind.trackpad]) {
+    testWidgets('pauses live bottom follow while a $kind drag is active', (
+      tester,
+    ) async {
+      final scrollController = ScrollController();
+      final autoScrollToBottom = ValueNotifier<bool>(true);
+      addTearDown(() {
+        scrollController.dispose();
+        autoScrollToBottom.dispose();
+      });
 
-    Widget chatArea(String content, {double bottomContentInset = 0}) {
-      return _chatArea(
-        message: _aiMessage(
-          parts: <MessagePart>[
-            MessagePart(
-              partId: 'part-0',
-              sequence: 0,
-              kind: MessagePartKind.markdown,
-              content: content,
-              toolCallId: null,
-              toolName: null,
-              attributes: <String, String>{},
-            ),
-          ],
-          stream: const Stream.empty(),
-        ),
-        isLoading: false,
-        scrollController: scrollController,
-        autoScrollToBottom: autoScrollToBottom,
-        onAutoScrollToBottomChanged: (value) =>
-            autoScrollToBottom.value = value,
-        bottomContentInset: bottomContentInset,
+      Widget chatArea(String content, {double bottomContentInset = 0}) {
+        return _chatArea(
+          message: _aiMessage(
+            parts: <MessagePart>[
+              MessagePart(
+                partId: 'part-0',
+                sequence: 0,
+                kind: MessagePartKind.markdown,
+                content: content,
+                toolCallId: null,
+                toolName: null,
+                attributes: <String, String>{},
+              ),
+            ],
+            stream: const Stream.empty(),
+          ),
+          isLoading: false,
+          scrollController: scrollController,
+          autoScrollToBottom: autoScrollToBottom,
+          onAutoScrollToBottomChanged: (value) =>
+              autoScrollToBottom.value = value,
+          bottomContentInset: bottomContentInset,
+        );
+      }
+
+      await tester.pumpWidget(chatArea('start', bottomContentInset: 800));
+      await tester.pump();
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byType(Scrollable).first),
+        kind: kind,
       );
-    }
+      await tester.pumpWidget(chatArea('updated', bottomContentInset: 1600));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
 
-    await tester.pumpWidget(chatArea('start'));
-    await tester.pump();
+      final maxScrollExtent = scrollController.position.maxScrollExtent;
+      final pausedOffset = scrollController.offset;
+      expect(maxScrollExtent - pausedOffset, greaterThan(80));
+      await tester.pump(const Duration(milliseconds: 120));
+      expect(scrollController.offset, pausedOffset);
 
-    final gesture = await tester.startGesture(
-      tester.getCenter(find.byType(Scrollable).first),
-    );
-    await tester.pumpWidget(chatArea('updated', bottomContentInset: 800));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 120));
-
-    final maxScrollExtent = scrollController.position.maxScrollExtent;
-    final pausedOffset = scrollController.offset;
-    expect(maxScrollExtent - pausedOffset, greaterThan(80));
-    await tester.pump(const Duration(milliseconds: 120));
-    expect(scrollController.offset, pausedOffset);
-
-    await gesture.moveBy(const Offset(0, 120));
-    await tester.pump();
-    await gesture.up();
-    await tester.pump();
-    await tester.drag(find.byType(ListView).first, const Offset(0, -120));
-    await tester.pump();
-    expect(scrollController.offset, greaterThan(pausedOffset));
-    expect(autoScrollToBottom.value, isFalse);
-  });
+      // Contact alone must not turn off following, but the same gesture must
+      // take over immediately once the user pans, without lifting and retrying.
+      expect(autoScrollToBottom.value, isTrue);
+      await gesture.moveBy(const Offset(0, -120));
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -120));
+      await tester.pump();
+      expect(scrollController.offset, greaterThan(pausedOffset));
+      expect(autoScrollToBottom.value, isFalse);
+      await gesture.up();
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
 }
 
 /// Pumps the renderer through stream delivery, throttled flush, and readiness frames.
@@ -1345,6 +2049,7 @@ Widget _streamingStructuredRendererHarness({
 
 /// Builds a minimal themed transcript around one active AI message.
 Widget _chatArea({
+  String currentChatId = 'chat',
   ChatUiMessage? message,
   List<ChatUiMessage>? messages,
   required ScrollController scrollController,
@@ -1354,59 +2059,60 @@ Widget _chatArea({
   bool isLoadingDisplayWindow = false,
   double bottomContentInset = 0,
   ValueChanged<bool>? onAutoScrollToBottomChanged,
+  Widget Function(Widget)? bodyBuilder,
+  MarkdownContentSplitter splitMarkdownContent = _splitMarkdownContent,
+  RevealMessageForLocator? onRevealMessageForLocator,
 }) {
   final bridge = _ScriptedGeneratedChatBridge();
   final clients = GeneratedCoreProxyClients(bridge);
   addTearDown(bridge.dispose);
+  final chatArea = ChatArea(
+    messages:
+        messages ??
+        (message == null ? const <ChatUiMessage>[] : <ChatUiMessage>[message]),
+    isLoading: isLoading,
+    errorMessage: null,
+    scrollController: scrollController,
+    currentChatId: currentChatId,
+    identityAvatarUri: null,
+    clients: clients,
+    packageManager: clients.application.packageManager(),
+    autoScrollToBottomListenable: autoScrollToBottom,
+    hasOlderDisplayHistory: false,
+    hasNewerDisplayHistory: hasNewerDisplayHistory,
+    isLoadingDisplayWindow: isLoadingDisplayWindow,
+    loadLocatorEntries: (chatId, query) async => const [],
+    onRevealMessageForLocator:
+        onRevealMessageForLocator ?? (timestamp) async => false,
+    onAutoScrollToBottomChanged: onAutoScrollToBottomChanged ?? (_) {},
+    onLoadOlderDisplayWindow: () async {},
+    onLoadNewerDisplayWindow: () async {},
+    onShowLatestDisplayWindow: () async {},
+    onToggleFavoriteMessage: (timestamp, isFavorite) async {},
+    onDeleteMessage: (timestamp) async {},
+    onDeleteMessagesFrom: (timestamp) async => true,
+    onDeleteMessageVariant: (timestamp, variantIndex) async {},
+    onSelectMessageVariant: (timestamp, selectedVariantIndex) async {},
+    onRollbackToMessage: (_) {},
+    onSelectMessageToEdit: (message) {},
+    onRegenerateMessage: (timestamp) async {},
+    onInsertSummary: (_) {},
+    onCreateBranch: (timestamp) async {},
+    onReplyToMessage: (_) {},
+    onPlayVoice: (message) async {},
+    onToggleMultiSelectMode: (_) {},
+    onToggleMessageSelection: (_) {},
+    onRefreshRequested: () async {},
+    bottomContentInset: bottomContentInset,
+    splitMarkdownContent: splitMarkdownContent,
+  );
   return OperitTheme(
     initialThemePreferenceSnapshot:
         UserPreferencesManager.defaultThemePreferenceSnapshot,
     initialThemeIsReady: false,
     unconfiguredChildEnabled: true,
     hostInteractionHostsEnabled: false,
-    child: Scaffold(
-      body: ChatArea(
-        messages:
-            messages ??
-            (message == null
-                ? const <ChatUiMessage>[]
-                : <ChatUiMessage>[message]),
-        isLoading: isLoading,
-        errorMessage: null,
-        scrollController: scrollController,
-        currentChatId: 'chat',
-        currentCharacterCardAvatarUri: null,
-        clients: clients,
-        packageManager: clients.application.packageManager(),
-        autoScrollToBottomListenable: autoScrollToBottom,
-        hasOlderDisplayHistory: false,
-        hasNewerDisplayHistory: hasNewerDisplayHistory,
-        isLoadingDisplayWindow: isLoadingDisplayWindow,
-        loadLocatorEntries: (chatId, query) async => const [],
-        onRevealMessageForLocator: (timestamp) async => false,
-        onAutoScrollToBottomChanged: onAutoScrollToBottomChanged ?? (_) {},
-        onLoadOlderDisplayWindow: () async {},
-        onLoadNewerDisplayWindow: () async {},
-        onShowLatestDisplayWindow: () async {},
-        onToggleFavoriteMessage: (timestamp, isFavorite) async {},
-        onDeleteMessage: (timestamp) async {},
-        onDeleteMessagesFrom: (timestamp) async => true,
-        onDeleteMessageVariant: (timestamp, variantIndex) async {},
-        onSelectMessageVariant: (timestamp, selectedVariantIndex) async {},
-        onRollbackToMessage: (_) {},
-        onSelectMessageToEdit: (message) {},
-        onRegenerateMessage: (timestamp) async {},
-        onInsertSummary: (_) {},
-        onCreateBranch: (timestamp) async {},
-        onReplyToMessage: (_) {},
-        onPlayVoice: (message) async {},
-        onToggleMultiSelectMode: (_) {},
-        onToggleMessageSelection: (_) {},
-        onRefreshRequested: () async {},
-        bottomContentInset: bottomContentInset,
-        splitMarkdownContent: _splitMarkdownContent,
-      ),
-    ),
+    child: Scaffold(body: bodyBuilder?.call(chatArea) ?? chatArea),
   );
 }
 
@@ -1431,7 +2137,7 @@ CoreEvent _rawGeneratedEvent(
 ) {
   return CoreEvent.raw(
     requestId: request.requestId,
-    targetObjectId: request.targetObjectId,
+    target: request.target,
     propertyName: request.propertyName,
     kind: kind,
     valueBytes: encodeCoreLink(value),
@@ -1464,6 +2170,7 @@ Map<String, Object?> _chatMessageLinkValue({
     'displayMode': 'NORMAL',
     'isFavorite': false,
     'contentStream': contentStream,
+    'pluginExtensions': <String, Object?>{},
   };
 }
 
@@ -1485,7 +2192,7 @@ Map<String, Object?> _streamDescriptorLinkValue(String streamId) {
   return <String, Object?>{
     r'$coreStream': <String, Object?>{
       'streamId': streamId,
-      'targetObjectId': 4294967295,
+      'target': r'$core.stream.open',
       'propertyName': 'openCoreStream',
       'args': <String, Object?>{'streamId': streamId},
     },
@@ -1513,12 +2220,34 @@ void _appendRenderedMarkdownNodeText(
 }
 
 /// Produces the same event boundary used by Core for one static Markdown block.
-Future<List<MarkdownStreamEvent>> _splitMarkdownContent(String content) async {
-  return <MarkdownStreamEvent>[
-    _markdownBlockStart(),
-    _markdownBlockChunk(content),
-    _markdownCompleted(),
-  ];
+Future<List<MarkdownStreamEvent>> _splitMarkdownContent(String content) =>
+    splitMarkdownEventFixture(content);
+
+/// Creates a completed row with distinct content for height-cache regressions.
+ChatUiMessage _heightTestMessage(int index, {int lines = 1}) {
+  return _heightTestMessageWithContent(
+    index,
+    List.generate(lines, (line) => 'Height row $index line $line').join('\n'),
+  );
+}
+
+/// Creates a completed height-test row with an explicit Markdown payload.
+ChatUiMessage _heightTestMessageWithContent(int index, String content) {
+  return _aiMessage(
+    timestamp: 80000 + index,
+    completedAt: 1,
+    parts: [
+      MessagePart(
+        partId: 'height-part-$index',
+        sequence: 0,
+        kind: MessagePartKind.markdown,
+        content: content,
+        toolCallId: null,
+        toolName: null,
+        attributes: const {},
+      ),
+    ],
+  );
 }
 
 /// Creates the active AI message used to verify transcript cursor ownership.
@@ -1529,6 +2258,7 @@ ChatUiMessage _aiMessage({
   int completedAt = 0,
 }) {
   return ChatMessage(
+    pluginExtensions: const {},
     sender: 'ai',
     parts: parts,
     timestamp: timestamp,
@@ -1651,4 +2381,20 @@ MarkdownStreamEvent _markdownCompleted() {
     headerLevel: null,
     xml: null,
   );
+}
+
+/// Samples the real paint phase rather than post-frame controller corrections.
+class _ScrollPositionPaintProbe extends CustomPainter {
+  /// Records the observed position whenever the transcript is painted.
+  _ScrollPositionPaintProbe(this.onPaint);
+
+  final VoidCallback onPaint;
+
+  /// Observes the frame after layout has finalized the viewport position.
+  @override
+  void paint(Canvas canvas, Size size) => onPaint();
+
+  /// Samples every replacement of the probe.
+  @override
+  bool shouldRepaint(_ScrollPositionPaintProbe oldDelegate) => true;
 }

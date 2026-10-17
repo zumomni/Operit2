@@ -2,171 +2,32 @@
 
 part of '../ToolPkgUiLauncherScreen.dart';
 
-class _ParsedComposeDslActionEvent {
-  /// Resolves parsed compose dsl action event for the Compose DSL renderer.
-  const _ParsedComposeDslActionEvent({
-    required this.phase,
-    required this.renderResult,
-    required this.actionResult,
-    required this.errorText,
-    this.navigationCommands = const [],
-  });
-
-  final String? phase;
-  final _ComposeDslRenderResult? renderResult;
-  final Object? actionResult;
-  final String? errorText;
-  final List<({String routeId, Map<String, Object?> args})> navigationCommands;
-
-  /// Parses one serialized DSL value.
-  static _ParsedComposeDslActionEvent parse(String event) {
-    final decoded = jsonDecode(event) as Map<String, Object?>;
-    final phase = decoded['phase']?.toString().trim();
-    if (phase == 'intermediate' || phase == 'final') {
-      final raw = decoded['result'];
-      if (raw is! String) {
-        throw StateError('compose_dsl action result event missing result');
-      }
-      final result = _ComposeDslRenderResult.tryParse(raw);
-      return _ParsedComposeDslActionEvent(
-        phase: phase,
-        renderResult: result,
-        actionResult: _ComposeDslRenderResult.actionResultOf(raw),
-        errorText: null,
-        navigationCommands: _ComposeDslRenderResult.navigationCommandsOf(raw),
-      );
-    }
-    if (phase == 'error') {
-      return _ParsedComposeDslActionEvent(
-        phase: phase,
-        renderResult: null,
-        actionResult: null,
-        errorText: decoded['error']?.toString(),
-      );
-    }
-    return _ParsedComposeDslActionEvent(
-      phase: phase,
-      renderResult: null,
-      actionResult: null,
-      errorText: null,
-    );
+/// Exposes the structured action result contract for return-type regression tests.
+@visibleForTesting
+({Object? actionResult, Object? renderedActionResult, bool hasRenderResult})
+parseComposeDslActionEventForTest(core_proxy.ToolPkgComposeDslEvent event) {
+  if (event.error != null) throw StateError(event.error!);
+  final update = event.update;
+  if (update != null) {
+    final store = _ComposeDslNodeStore()..apply(update);
+    store.dispose();
   }
+  return (
+    actionResult: event.actionResult,
+    renderedActionResult: update == null ? null : event.actionResult,
+    hasRenderResult: update != null,
+  );
 }
 
 class _ComposeDslRenderResult {
-  /// Reads navigation side effects independently of the action return value.
-  static List<({String routeId, Map<String, Object?> args})>
-  navigationCommandsOf(String? raw) {
-    final commands = _rootObject(raw)?['navigationCommands'];
-    if (commands == null) return const [];
-    return (commands as List).map(_composeNavigateCommand).toList();
-  }
-
-  /// Creates the compose dsl render result instance.
+  /// Stores the root handle and the latest structured runtime metadata.
   const _ComposeDslRenderResult({
     required this.tree,
-    required this.state,
-    required this.memo,
     required this.actionResult,
   });
 
   final _ComposeDslNode tree;
-  final Map<String, Object?> state;
-  final Map<String, Object?> memo;
   final Object? actionResult;
-
-  /// Parses one serialized DSL value.
-  static _ComposeDslRenderResult parse(String? raw) {
-    final result = tryParse(raw);
-    if (result != null) {
-      return result;
-    }
-    throw FormatException(
-      'compose_dsl result is invalid: ${_rawResultSummary(raw)}',
-    );
-  }
-
-  /// Parses a supported serialized DSL representation.
-  static _ComposeDslRenderResult? tryParse(String? raw) {
-    final value = _rootObject(raw);
-    if (value == null) {
-      return null;
-    }
-    final success = value['success'];
-    if (success == false) {
-      throw Exception((value['message'] ?? 'compose_dsl failed').toString());
-    }
-    final tree = _ComposeDslNode.parse(value['tree']);
-    if (tree == null) {
-      return null;
-    }
-    return _ComposeDslRenderResult(
-      tree: tree,
-      state: _stringMap(value['state']),
-      memo: _stringMap(value['memo']),
-      actionResult: _plainJsonValue(value['actionResult']),
-    );
-  }
-
-  /// Resolves action result of for the Compose DSL renderer.
-  static Object? actionResultOf(String? raw) {
-    final value = _rootObject(raw);
-    if (value == null) {
-      return null;
-    }
-    final success = value['success'];
-    if (success == false) {
-      throw Exception((value['message'] ?? 'compose_dsl failed').toString());
-    }
-    return _plainJsonValue(value['actionResult']);
-  }
-
-  static Map<Object?, Object?>? _rootObject(String? raw) {
-    Object? value = raw;
-    for (var i = 0; i < 3; i += 1) {
-      if (value is String) {
-        final trimmed = value.trim();
-        if (trimmed.isEmpty) {
-          break;
-        }
-        value = jsonDecode(trimmed);
-      }
-    }
-    if (value is Map) {
-      return Map<Object?, Object?>.from(value);
-    }
-    return null;
-  }
-
-  /// Resolves raw result summary for the Compose DSL renderer.
-  static String _rawResultSummary(Object? raw) {
-    final text = raw?.toString().trim();
-    if (text == null || text.isEmpty) {
-      return '<empty>';
-    }
-    const maxLength = 1200;
-    if (text.length <= maxLength) {
-      return text;
-    }
-    return '${text.substring(0, maxLength)}...';
-  }
-}
-
-/// Reads a Compose `setEnv` command returned by a plugin action.
-Map<String, String>? _composeSetEnvCommand(Object? raw) {
-  if (raw is! Map) {
-    return null;
-  }
-  final map = _stringMap(raw);
-  if (!_bool(map['__operitSetEnv'])) {
-    return null;
-  }
-  final key = _string(map['key']).trim();
-  final value = _string(map['value']).trim();
-  if (key.isEmpty) {
-    throw StateError('compose setEnv requires a key');
-  }
-  return {key: value};
 }
 
 /// Decodes one queued Compose navigation request.
@@ -186,24 +47,19 @@ Map<String, String>? _composeSetEnvCommand(Object? raw) {
   return (routeId: routeId, args: args);
 }
 
-/// Resolves plain json value for the Compose DSL renderer.
-Object? _plainJsonValue(Object? raw) {
-  if (raw is! String) {
-    return raw;
-  }
-  final trimmed = raw.trim();
-  if (trimmed.isEmpty) {
-    return null;
-  }
-  try {
-    return jsonDecode(trimmed);
-  } catch (_) {
-    return raw;
-  }
-}
-
 /// Canonical node names indexed by the Kotlin-compatible normalized token.
 const _composeNodeTypes = <String, String>{
+  'gradientrule': 'GradientRule',
+  'loadingindicator': 'LoadingIndicator',
+  'activitydots': 'ActivityDots',
+  'draggable': 'Draggable',
+  'dragtarget': 'DragTarget',
+  'swipeactions': 'SwipeActions',
+  'hoverregion': 'HoverRegion',
+  'hoveronly': 'HoverOnly',
+  'popupmenu': 'PopupMenu',
+  'horizontalpager': 'HorizontalPager',
+  'inputdecorator': 'InputDecorator',
   'outlinedtextfield': 'OutlinedTextField',
   'asyncimage': 'AsyncImage',
   'navigationbaritem': 'NavigationBarItem',
@@ -241,6 +97,7 @@ const _composeNodeTypes = <String, String>{
   'filledtonalicontogglebutton': 'FilledTonalIconToggleButton',
   'filterchip': 'FilterChip',
   'floatingactionbutton': 'FloatingActionButton',
+  'flowrow': 'FlowRow',
   'horizontaldivider': 'HorizontalDivider',
   'icon': 'Icon',
   'iconbutton': 'IconButton',
@@ -299,21 +156,82 @@ const _composeNodeTypes = <String, String>{
   'widenavigationrailitem': 'WideNavigationRailItem',
 };
 
-class _ComposeDslNode {
+class _ComposeDslNode extends ChangeNotifier {
   /// Creates the compose dsl node instance.
-  const _ComposeDslNode({
-    required this.type,
-    required this.props,
-    required this.children,
-    required this.slots,
-  });
+  _ComposeDslNode({
+    required String type,
+    required Map<String, Object?> props,
+    required List<_ComposeDslNode> children,
+    required Map<String, List<_ComposeDslNode>> slots,
+    this.id,
+  }) : _type = type,
+       _props = props,
+       _children = children,
+       _slots = slots;
 
-  final String type;
-  final Map<String, Object?> props;
-  final List<_ComposeDslNode> children;
-  final Map<String, List<_ComposeDslNode>> slots;
+  final String? id;
+  String _type;
+  bool _disposed = false;
+  Map<String, Object?> _props;
+  List<_ComposeDslNode> _children;
+  Map<String, List<_ComposeDslNode>> _slots;
 
-  /// Parses one serialized DSL value.
+  /// A modal route may briefly outlive its removed source node until frame cleanup.
+  bool get isDisposed => _disposed;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
+  /// Records a renderer's dependency before returning this node's type.
+  String get type {
+    _ComposeDslReadScope.read(this);
+    return _type;
+  }
+
+  /// Records a renderer's dependency before returning this node's properties.
+  Map<String, Object?> get props {
+    _ComposeDslReadScope.read(this);
+    return _props;
+  }
+
+  /// Returns retained child handles without reconstructing a recursive tree.
+  List<_ComposeDslNode> get children {
+    _ComposeDslReadScope.read(this);
+    return _children;
+  }
+
+  /// Returns retained slot handles without reconstructing their descendants.
+  Map<String, List<_ComposeDslNode>> get slots {
+    _ComposeDslReadScope.read(this);
+    return _slots;
+  }
+
+  /// Atomically replaces one flat node record after all new handles have been allocated.
+  void replace(
+    core_proxy.ToolPkgComposeDslNodeRecord record,
+    _ComposeDslNodeStore store,
+  ) {
+    final type = _composeNodeTypes[_normalizeToken(record.nodeType)];
+    if (type == null)
+      throw FormatException('Unknown Compose node type: ${record.nodeType}');
+    _type = type;
+    _props = record.props;
+    _children = record.children.map(store.node).toList(growable: false);
+    _slots = record.slots.map(
+      (name, ids) =>
+          MapEntry(name, ids.map(store.node).toList(growable: false)),
+    );
+  }
+
+  /// Invalidates only renderers that read this node during their latest build.
+  void publish() {
+    notifyListeners();
+  }
+
+  /// Reads structured nodes supplied directly by isolated renderer tests.
   static _ComposeDslNode? parse(Object? raw) {
     if (raw is! Map) {
       return null;
@@ -344,4 +262,27 @@ class _NoUiView extends StatelessWidget {
   Widget build(BuildContext context) {
     return const Center(child: Icon(Icons.extension_off_outlined, size: 42));
   }
+}
+
+/// Matches Kotlin Map/List value equality for JSON-backed Compose effect inputs.
+bool _composeInputEquals(Object? left, Object? right) {
+  if (identical(left, right)) return true;
+  if (left is Map && right is Map) {
+    if (left.length != right.length) return false;
+    for (final entry in left.entries) {
+      if (!right.containsKey(entry.key) ||
+          !_composeInputEquals(entry.value, right[entry.key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (left is List && right is List) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index++) {
+      if (!_composeInputEquals(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  return left == right;
 }

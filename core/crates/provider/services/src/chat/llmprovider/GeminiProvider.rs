@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::OpenAIProvider::{StreamingJsonXmlConverter, StreamingJsonXmlEvent};
 use super::OpenAIResponsesProvider::strip_responses_protocol_markup;
 use super::StructuredToolCallBridge::{OpenToolCall, StructuredToolCallBridge};
+use super::StreamingResponseLines::{decodeStreamingTail, takeNextStreamingLine};
 use super::ThinkingConfiguration::ThinkingConfigurationApplier;
 use crate::chat::llmprovider::AIService::{
     response_stream_from_chunks, retry_error_text, retry_message, AIService, AiServiceError,
@@ -24,7 +25,8 @@ use operit_model::ModelParameter::{ModelParameter, ParameterCategory};
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::stream::RevisableTextStream::{
-    empty_revisable_event_channel, with_event_channel, RevisableTextStreamLike,
+    empty_revisable_event_channel, with_event_channel_and_failure, RevisableTextStream,
+    RevisableTextStreamLike, TerminalFailureState,
 };
 use operit_util::stream::Stream::FnStream;
 use operit_util::ChatMarkupRegex::{attr_value, tag_ranges, ChatMarkupRegex};
@@ -38,6 +40,7 @@ pub struct GeminiProvider {
     pub custom_headers: Vec<(String, String)>,
     pub builtin_tools: Vec<ModelBuiltinTool>,
     pub enable_tool_call: bool,
+    pub api_key_header_name: Option<String>,
     state: Arc<Mutex<GeminiProviderState>>,
     isInThinkingMode: bool,
 }
@@ -67,6 +70,30 @@ impl GeminiProvider {
         builtin_tools: Vec<ModelBuiltinTool>,
         enable_tool_call: bool,
     ) -> Self {
+        Self::new_with_request_options(
+            api_endpoint,
+            api_key,
+            model_name,
+            provider_type,
+            custom_headers,
+            builtin_tools,
+            enable_tool_call,
+            None,
+        )
+    }
+
+    /// Creates a Gemini provider with an optional API-key header transport mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_request_options(
+        api_endpoint: String,
+        api_key: String,
+        model_name: String,
+        provider_type: String,
+        custom_headers: Vec<(String, String)>,
+        builtin_tools: Vec<ModelBuiltinTool>,
+        enable_tool_call: bool,
+        api_key_header_name: Option<String>,
+    ) -> Self {
         Self {
             api_endpoint,
             api_key,
@@ -75,6 +102,7 @@ impl GeminiProvider {
             custom_headers,
             builtin_tools,
             enable_tool_call,
+            api_key_header_name,
             state: Arc::new(Mutex::new(GeminiProviderState::default())),
             isInThinkingMode: false,
         }
@@ -479,15 +507,43 @@ impl GeminiProvider {
         Ok((contents_array, system_instruction, token_count))
     }
 
-    /// Builds Gemini content parts from text and registered image links.
+    /// Builds Gemini content parts from text and registered image and media links.
     fn build_parts_array(&self, text: &str) -> Vec<Value> {
-        if !MediaLinkParser::has_image_links(text) {
+        let has_images = MediaLinkParser::has_image_links(text);
+        let has_media = MediaLinkParser::has_media_links(text);
+        if !has_images && !has_media {
             return vec![json!({"text": text})];
         }
 
-        let image_links = MediaLinkParser::extract_image_links(text);
-        let text_without_links = MediaLinkParser::remove_image_links(text).trim().to_string();
+        let media_links = if has_media {
+            MediaLinkParser::extract_media_links(text)
+        } else {
+            Vec::new()
+        };
+        let image_links = if has_images {
+            MediaLinkParser::extract_image_links(text)
+        } else {
+            Vec::new()
+        };
+
+        let mut text_without_links = text.to_string();
+        if has_images {
+            text_without_links = MediaLinkParser::remove_image_links(&text_without_links);
+        }
+        if has_media {
+            text_without_links = MediaLinkParser::remove_media_links(&text_without_links);
+        }
+        let text_without_links = text_without_links.trim().to_string();
+
         let mut parts = Vec::new();
+        for link in media_links {
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": link.mime_type,
+                    "data": link.base64_data,
+                },
+            }));
+        }
         for link in image_links {
             parts.push(json!({
                 "inline_data": {
@@ -647,6 +703,24 @@ impl GeminiProvider {
     }
 
     fn request_url(&self, stream: bool) -> String {
+        if let Some(api_key_header_name) = self.api_key_header_name.as_deref() {
+            let base_url = self
+                .api_endpoint
+                .split("/models/")
+                .next()
+                .expect("endpoint split always has one segment")
+                .trim_end_matches('/');
+            let method = if stream {
+                "streamGenerateContent"
+            } else {
+                "generateContent"
+            };
+            let suffix = if stream { "?alt=sse" } else { "" };
+            return format!(
+                "{base_url}/models/{}:{method}{suffix}",
+                self.model_name
+            );
+        }
         let base_url = determine_base_url(&self.api_endpoint);
         let method = if stream {
             "streamGenerateContent"
@@ -664,6 +738,16 @@ impl GeminiProvider {
     fn headers(&self) -> Result<HeaderMap, AiServiceError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(api_key_header_name) = self.api_key_header_name.as_deref() {
+            if !self.api_key.trim().is_empty() {
+                headers.insert(
+                    HeaderName::from_bytes(api_key_header_name.as_bytes())
+                        .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
+                    HeaderValue::from_str(self.api_key.trim())
+                        .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
+                );
+            }
+        }
         for (name, value) in &self.custom_headers {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
@@ -796,34 +880,34 @@ impl GeminiProvider {
                 retryCount = newRetryCount;
                 continue;
             }
-            match self.process_streaming_response(response).await {
+            let error = match self.process_streaming_response(response).await {
                 Ok(responseStream) => return Ok(responseStream),
-                Err(error) => {
-                    let errorText = retry_error_text(&error);
-                    if !request.enable_retry {
-                        return Err(error);
-                    }
-                    let newRetryCount = retryCount + 1;
-                    if newRetryCount > maxRetries {
-                        return Err(error);
-                    }
-                    if let Some(on_non_fatal_error) = request.on_non_fatal_error.as_ref() {
-                        on_non_fatal_error(retry_message(&errorText, newRetryCount));
-                    }
-                    delay_retry_ms(newRetryCount).await;
-                    retryCount = newRetryCount;
-                    continue;
-                }
+                Err(error) => error,
+            };
+            let errorText = retry_error_text(&error);
+            if !request.enable_retry {
+                return Err(error);
             }
+            let newRetryCount = retryCount + 1;
+            if newRetryCount > maxRetries {
+                return Err(error);
+            }
+            if let Some(on_non_fatal_error) = request.on_non_fatal_error.as_ref() {
+                on_non_fatal_error(retry_message(&errorText, newRetryCount));
+            }
+            delay_retry_ms(newRetryCount).await;
+            retryCount = newRetryCount;
+            continue;
         }
     }
 
+    /// Parses response lines after their complete UTF-8 bytes have arrived.
     async fn process_streaming_response(
         &mut self,
         response: reqwest::Response,
     ) -> Result<Box<dyn RevisableTextStreamLike>, AiServiceError> {
         let mut chunks = Vec::new();
-        let mut pending = String::new();
+        let mut pending_bytes = Vec::new();
         let mut bytes_stream = response.bytes_stream();
         while let Some(item) = bytes_stream.next().await {
             if self.is_cancelled() {
@@ -831,14 +915,12 @@ impl GeminiProvider {
             }
             let bytes =
                 item.map_err(|error| AiServiceError::ConnectionFailed(error.to_string()))?;
-            pending.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(newline_index) = pending.find('\n') {
-                let line = pending[..newline_index].trim().to_string();
-                pending = pending[newline_index + 1..].to_string();
+            pending_bytes.extend_from_slice(&bytes);
+            while let Some(line) = takeNextStreamingLine(&mut pending_bytes)? {
                 self.process_response_line(&line, &mut chunks)?;
             }
         }
-        let tail = pending.trim().to_string();
+        let tail = decodeStreamingTail(&mut pending_bytes)?;
         if !tail.is_empty() {
             self.process_response_line(&tail, &mut chunks)?;
         }
@@ -1094,6 +1176,7 @@ impl AIService for GeminiProvider {
         self.set_cancelled(true);
     }
 
+    /// Sends a Gemini request while preserving producer failures through the cold wrapper.
     async fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -1103,6 +1186,8 @@ impl AIService for GeminiProvider {
         if request.stream {
             let event_channel = empty_revisable_event_channel();
             let streamEventChannel = event_channel.clone();
+            let terminalFailure = TerminalFailureState::new();
+            let producerTerminalFailure = terminalFailure.clone();
             let mut ownedProvider = Some(self.clone());
             let mut ownedRequest = Some(request);
             let coldStream = FnStream::new(move |emit| {
@@ -1113,17 +1198,31 @@ impl AIService for GeminiProvider {
                     .take()
                     .expect("GeminiProvider stream must only be collected once");
                 let eventChannel = streamEventChannel.clone();
+                let producerTerminalFailure = producerTerminalFailure.clone();
                 Box::pin(async move {
-                    if let Ok(mut responseStream) = provider.send_streaming_message(request).await {
-                        responseStream.collect(emit).await;
+                    match provider.send_streaming_message(request).await {
+                        Ok(mut responseStream) => {
+                            responseStream.collect(emit).await;
+                            if let Some(error) = responseStream.terminal_failure() {
+                                producerTerminalFailure.set(error);
+                            }
+                        }
+                        Err(AiServiceError::RequestCancelled) => {}
+                        Err(error) => producerTerminalFailure.set(error.to_string()),
                     }
                     eventChannel.close();
                 })
             });
-            return Ok(Box::new(with_event_channel(coldStream, event_channel)));
+            return Ok(Box::new(with_event_channel_and_failure(
+                coldStream,
+                event_channel,
+                terminalFailure,
+            )));
         }
         let event_channel = empty_revisable_event_channel();
         let streamEventChannel = event_channel.clone();
+        let terminalFailure = TerminalFailureState::new();
+        let producerTerminalFailure = terminalFailure.clone();
         let mut ownedProvider = Some(self.clone());
         let mut ownedRequest = Some(request);
         let coldStream = FnStream::new(move |emit| {
@@ -1134,14 +1233,26 @@ impl AIService for GeminiProvider {
                 .take()
                 .expect("GeminiProvider non-stream request must only be collected once");
             let eventChannel = streamEventChannel.clone();
+            let producerTerminalFailure = producerTerminalFailure.clone();
             Box::pin(async move {
-                if let Ok(mut responseStream) = provider.send_non_streaming_message(request).await {
-                    responseStream.collect(emit).await;
+                match provider.send_non_streaming_message(request).await {
+                    Ok(mut responseStream) => {
+                        responseStream.collect(emit).await;
+                        if let Some(error) = responseStream.terminal_failure() {
+                            producerTerminalFailure.set(error);
+                        }
+                    }
+                    Err(AiServiceError::RequestCancelled) => {}
+                    Err(error) => producerTerminalFailure.set(error.to_string()),
                 }
                 eventChannel.close();
             })
         });
-        Ok(Box::new(with_event_channel(coldStream, event_channel)))
+        Ok(Box::new(with_event_channel_and_failure(
+            coldStream,
+            event_channel,
+            terminalFailure,
+        )))
     }
 
     async fn calculate_input_tokens(
@@ -1370,90 +1481,5 @@ fn xml_unescape(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::GeminiProvider;
-    use crate::chat::llmprovider::MediaLinkBuilder::MediaLinkBuilder;
-    use operit_model::ModelConfigData::ModelBuiltinTool;
-    use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
-    use operit_util::ImagePoolManager::ImagePoolManager;
-
-    /// Creates a Gemini provider for content-part conversion tests.
-    fn test_provider() -> GeminiProvider {
-        GeminiProvider::new(
-            "http://localhost".to_string(),
-            String::new(),
-            "gemini-test".to_string(),
-            "GEMINI".to_string(),
-            Vec::new(),
-            Vec::<ModelBuiltinTool>::new(),
-            true,
-        )
-    }
-
-    /// Verifies image media links become Gemini inline_data parts.
-    #[test]
-    fn imageLinksBecomeGeminiInlineDataParts() {
-        ImagePoolManager::clear();
-        let image_id = ImagePoolManager::add_image_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
-            Some("image/png"),
-            None,
-        );
-        let prompt = format!("look {}", MediaLinkBuilder::image(&image_id));
-        let provider = test_provider();
-
-        let parts = provider.build_parts_array(&prompt);
-
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["inline_data"]["mime_type"], "image/png");
-        assert!(!parts[0]["inline_data"]["data"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty());
-        assert_eq!(parts[1]["text"], "look");
-    }
-
-    /// Verifies Gemini pairs package-proxy calls with the proxied tool result name.
-    #[test]
-    fn packageProxyResultMatchesGeminiFunctionCall() {
-        let provider = test_provider();
-        let history = vec![
-            PromptTurn::new(
-                PromptTurnKind::ASSISTANT,
-                [
-                    r#"<tool name="package_proxy">"#,
-                    r#"<param name="tool_name">daily_life:get_current_date</param>"#,
-                    r#"<param name="params">{}</param>"#,
-                    r#"</tool>"#,
-                ]
-                .join("\n"),
-            ),
-            PromptTurn::new(
-                PromptTurnKind::TOOL_RESULT,
-                [
-                    r#"<tool_result name="daily_life:get_current_date">"#,
-                    r#"<content>2026-09-12</content>"#,
-                    r#"</tool_result>"#,
-                ]
-                .join("\n"),
-            ),
-        ];
-
-        let (contents, _, _) = provider
-            .build_contents_and_count_tokens(&history, None, true)
-            .expect("Gemini contents must be buildable");
-        assert_eq!(contents.len(), 2);
-        assert_eq!(
-            contents[0].pointer("/parts/0/functionCall/name"),
-            Some(&serde_json::json!("package_proxy"))
-        );
-        assert_eq!(
-            contents[1].pointer("/parts/0/functionResponse/name"),
-            Some(&serde_json::json!("package_proxy"))
-        );
-        assert_eq!(
-            contents[1].pointer("/parts/0/functionResponse/response/result"),
-            Some(&serde_json::json!("2026-09-12"))
-        );
-    }
-}
+#[path = "../../../../tests/GeminiProviderTests.rs"]
+mod tests;

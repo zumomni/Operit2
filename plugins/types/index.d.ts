@@ -6,7 +6,8 @@
  */
 
 // Import types that will be used in global declarations
-import { ToolReturnType, NativeInterface as CoreNativeInterface } from './core';
+import { DeviceEdge, DeviceIo, DeviceTransport } from './edge';
+import { ToolReturnType, ToolCatalogEntry, ToolCatalog, DeviceToolOptions } from './core';
 import {
     JavaBridgeApi as JavaBridgeApiType,
     JavaBridgeClass as JavaBridgeClassType,
@@ -67,7 +68,6 @@ import {
     ComposeNode as ComposeNodeType,
     ComposeCanvasCommand as ComposeCanvasCommandType
 } from './compose-dsl';
-import { ToolPkg as ToolPkgType } from './toolpkg';
 import {
     OkHttp as OkHttpValue,
     OkHttpClientBuilder as OkHttpClientBuilderClass,
@@ -101,17 +101,29 @@ import { Files as FilesType } from './files';
 import { Net as NetType } from './network';
 import { System as SystemType } from './system';
 import { SoftwareSettings as SoftwareSettingsType } from './software_settings';
+import { Models as ModelsType } from './models';
+import { Tts as TtsType } from './tts';
+import { Stt as SttType } from './stt';
+import { Theme as ThemeType } from './theme';
+import { Catalog as CatalogType } from './catalog';
 import { UI as UIType } from './ui';
 import { Chat as ChatType } from './chat';
-import { Memory as MemoryType } from './memory';
+import { Storage as StorageType } from './storage';
 
 export { Net } from './network';
 export { System } from './system';
 export { SoftwareSettings } from './software_settings';
+export { Models } from './models';
+export { Tts } from './tts';
+export { Stt } from './stt';
+export { Theme } from './theme';
+export { Catalog } from './catalog';
 export { UI, UINode } from './ui';
 export { ToolPkg } from './toolpkg';
 export { Chat } from './chat';
-export { Memory } from './memory';
+export { DeviceEdge, DeviceIo, DeviceTransport } from './edge';
+export type { EdgeInterfaceInfo, IoInterfaceInfo, DeviceTransportEndpoint, DeviceTransportEvent, DeviceTransportChannel } from './edge';
+export * from './storage';
 
 // Export Android utilities
 export {
@@ -195,7 +207,6 @@ declare global {
     type EnvironmentVariableReadResultData = _EnvironmentVariableReadResultData;
     type EnvironmentVariableWriteResultData = _EnvironmentVariableWriteResultData;
 
-    export import ToolPkg = ToolPkgType;
 
     // Global interface definitions
     interface ToolParams {
@@ -221,6 +232,9 @@ declare global {
     function toolCall<T extends string, TIntermediate = unknown>(toolName: T, toolParams: ToolParams | undefined, options: ToolCallOptions<TIntermediate>): Promise<ToolReturnType<T>>;
     function toolCall(toolName: string): Promise<any>;
 
+    /** Returns the current executable tool catalog from the host runtime. */
+    function getToolCatalog(): { tools: ToolCatalogEntry[] };
+
     // Complete function
     function complete<T>(result: T): void;
 
@@ -244,9 +258,14 @@ declare global {
 
     function getChatId(): string | undefined;
 
-    function getCallerCardId(): string | undefined;
+    /** Returns the opaque execution participant authenticated by the host. */
+    function getCallerParticipantId(): string | undefined;
 
     const OPERIT_DOWNLOAD_DIR: string;
+    /**
+     * Absolute VFS directory for temporary files removed on exit.
+     * Use with Tools.Files; this is not a physical path for shell commands.
+     */
     const OPERIT_CLEAN_ON_EXIT_DIR: string;
 
     // Utility objects
@@ -267,16 +286,47 @@ declare global {
         formatDate(date?: Date | string): string;
     };
 
-    // Tools namespace available globally
-    const Tools: {
+    /** Explicit-device tool view, with the same namespace overloads and result types. */
+    interface DeviceTools {
         Files: typeof FilesType;
         Net: typeof NetType;
         System: typeof SystemType;
         SoftwareSettings: typeof SoftwareSettingsType;
+        Chat: typeof ChatType;
+        Models: typeof ModelsType;
+        Tts: typeof TtsType;
+        Stt: typeof SttType;
+        Theme: typeof ThemeType;
+        Catalog: typeof CatalogType;
+        Storage: typeof StorageType;
+        transport: DeviceTransport;
+        Edge: DeviceEdge;
+        Io: DeviceIo;
+        call<T extends string>(name: T, params?: Record<string, unknown>): Promise<ToolReturnType<T>>;
+        catalog(): Promise<ToolCatalog>;
+        /** Cancels this view's pending calls; subsequent calls remain available. */
+        cancel(): void;
+    }
+
+    // Tools namespace available globally
+    const Tools: {
+        device(nodeId: string, options?: DeviceToolOptions): DeviceTools;
+        Files: typeof FilesType;
+        Net: typeof NetType;
+        System: typeof SystemType;
+        SoftwareSettings: typeof SoftwareSettingsType;
+        Models: typeof ModelsType;
+        Tts: typeof TtsType;
+        Stt: typeof SttType;
+        Theme: typeof ThemeType;
+        Catalog: typeof CatalogType;
         UI: typeof UIType;
         Chat: typeof ChatType;
-        Memory: typeof MemoryType;
+        Storage: typeof StorageType;
     };
+
+    /** Lowercase alias of the existing Core plugin Tools object. */
+    const tools: typeof Tools;
 
     // CommonJS exports
     const exports: Record<string, any>;
@@ -285,6 +335,4 @@ declare global {
     const Java: JavaBridgeApiType;
     const Kotlin: JavaBridgeApiType;
 
-    // NativeInterface
-    const NativeInterface: typeof CoreNativeInterface;
 }

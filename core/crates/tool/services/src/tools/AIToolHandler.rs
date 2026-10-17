@@ -1,13 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+
+use uuid::Uuid;
 
 use operit_host_api::HostEnvironmentDescriptor;
 use operit_host_api::HostManager::HostManager;
+use operit_link::{CoreCallRequest, CoreEventStream, CoreWatchRequest};
 use operit_plugin_sdk::javascript::{
     JsExecutionHost, JsToolCallRequest, JsToolCallResult, JsToolCallResultData,
     JsToolNameResolutionRequest, JsToolPkgIpcCompletion, JsToolPkgIpcRequest,
-    JsToolPkgResourceRequest, JsToolPkgWasmRequest, JsToolPkgWasmResult,
+    JsToolPkgResourceRequest, JsToolPkgWasmRequest, JsToolPkgWasmResult, ToolPkgConfigScope,
 };
+use operit_plugin_sdk::js_sdk::chat::ChatSendEvent;
+use operit_plugin_sdk::js_sdk::JsAsyncIterable;
 use operit_plugin_sdk::js_sdk::tool_types::BuiltinToolName;
 use operit_plugin_sdk::package::ToolPackage;
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
@@ -22,21 +27,16 @@ use operit_tools::tools::ToolRegistration::registerAllTools;
 use operit_tools::tools::ToolResultDataClasses::{stringResultData, ToolResultData};
 use operit_tools::ConversationMarkupManager::ToolResult;
 use operit_tools::ToolExecutionManager::{
-    AITool, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutionManager, ToolExecutor,
-    ToolParameter, ToolValidationResult,
+    AITool, AsyncToolExecutor, RegisteredToolExecutor, ToolAccessSpec, ToolBoundary, ToolEffect,
+    ToolCall, ToolExecutionManager, ToolExecutionPolicy, ToolExecutor, ToolInvocationContext, ToolInvocationFuture, ToolParameter, ToolValidationResult, SharedToolExecutor,
 };
 use operit_util::ChainLogger::{self, TOOL_CHAIN};
 use operit_util::LocaleUtils::LocaleUtils;
 use operit_util::OperitPaths;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::runtime_support::{ToolRuntimeDependencies, ToolRuntimeSupport};
-
-#[derive(Clone, Copy)]
-enum ToolExecutionAccess {
-    AiPermission,
-    Direct,
-}
 
 /// Classifies file-bound invocation failures as policy restrictions or invalid requests.
 #[derive(Debug, PartialEq, Eq)]
@@ -51,17 +51,114 @@ pub enum ToolRegistrationVisibility {
     INTERNAL,
 }
 
+/// Owns one authenticated route stream and its pending-read cancellation signal.
+pub(crate) struct CoreRouteWatch {
+    stream: tokio::sync::Mutex<CoreEventStream>,
+    closed: tokio::sync::Notify,
+    value: Mutex<Option<operit_link::CoreValue>>,
+}
+
+/// Owns a cancellable input stream without holding the registry lock across network waits.
+pub(crate) struct CoreRoutePush {
+    session: tokio::sync::Mutex<Option<Box<dyn operit_link::CoreLinkPushSession>>>,
+    closed: tokio::sync::Notify,
+}
+
+/// Serializes a decorated invocation with an engine-authenticated package owner.
+fn toolPkgRouteArguments(owner: Option<String>, method: String, args: Value) -> Result<operit_link::CoreValue, String> {
+    let owner = owner.ok_or("Plugin routes require an authenticated engine")?;
+    crate::tools::packTool::ToolPkgRouteRuntime::requireSpacePackage(&owner)?;
+    let mut args = args.as_object().cloned().ok_or("Plugin route arguments must be an object")?;
+    if args.contains_key("packageName") || args.contains_key("methodName") { return Err("Plugin route envelope cannot override authenticated identity".into()); }
+    args.insert("packageName".into(), Value::String(owner));
+    args.insert("methodName".into(), Value::String(method));
+    operit_link::toCoreValue(Value::Object(args)).map_err(|error| error.to_string())
+}
+
 #[derive(Clone)]
 pub struct AIToolHandler {
     inner: Arc<Mutex<AIToolHandlerState>>,
-    executorAvailability: Arc<Condvar>,
+    executorAvailability: Arc<tokio::sync::Notify>,
+    /// Contains only the immutable package identity bound by the JavaScript engine.
+    pub(crate) authenticatedExtensionOwner: Option<String>,
+    pub(crate) storageSession: operit_store::PluginStorage::PluginStorageSession,
+    pub(crate) deviceTransportScope: Arc<crate::tools::DeviceTools::DeviceTransportScope>,
+    pub(crate) chatObservations: Arc<Mutex<BTreeMap<String, JsAsyncIterable<ChatSendEvent>>>>,
+    pub(crate) coreRoutePushes: Arc<Mutex<BTreeMap<String, Arc<CoreRoutePush>>>>,
+    pub(crate) coreRouteWatches: Arc<Mutex<BTreeMap<String, Arc<CoreRouteWatch>>>>,
+    pub(crate) invocationSnapshot: crate::ToolExecutionManager::ToolInvocationSnapshot,
+}
+
+/// Returns a taken executor on normal completion, cancellation or panic unwinding.
+struct ToolExecutorLease {
+    name: String,
+    executor: Option<RegisteredToolExecutor>,
+    exclusive: bool,
+    state: Arc<Mutex<AIToolHandlerState>>,
+    available: Arc<tokio::sync::Notify>,
+}
+
+impl std::ops::Deref for ToolExecutorLease {
+    type Target = RegisteredToolExecutor;
+    /// Borrows the executor while its registry lease remains owned.
+    fn deref(&self) -> &Self::Target {
+        self.executor
+            .as_ref()
+            .expect("tool executor lease must remain owned")
+    }
+}
+
+impl std::ops::DerefMut for ToolExecutorLease {
+    /// Mutably borrows the executor while its registry lease remains owned.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.executor
+            .as_mut()
+            .expect("tool executor lease must remain owned")
+    }
+}
+
+impl Drop for ToolExecutorLease {
+    /// Restores the exact executor and wakes queued invocations after releasing the registry lock.
+    fn drop(&mut self) {
+        let executor = self
+            .executor
+            .take()
+            .expect("tool executor lease must remain owned");
+        if self.exclusive {
+            let mut state = self.state.lock().expect("AIToolHandler mutex poisoned");
+            assert!(
+                state.executingTools.remove(&self.name),
+                "tool must remain marked executing"
+            );
+            assert!(
+                state
+                    .availableTools
+                    .insert(self.name.clone(), executor)
+                    .is_none(),
+                "tool executor must not be replaced during execution"
+            );
+        }
+        self.available.notify_waiters();
+    }
+}
+
+/// Ends an AI invocation lifecycle even when its future is cancelled or unwinds.
+struct ToolInvocationLifecycle {
+    context: ToolInvocationContext,
+    tool: AITool,
+}
+
+impl Drop for ToolInvocationLifecycle {
+    /// Publishes exactly one finish event after all local executor leases have been released.
+    fn drop(&mut self) {
+        self.context.clone().scopeSync(|| self.context.host().notifyToolExecutionFinished(&self.tool));
+    }
 }
 
 pub struct AIToolHandlerState {
-    availableTools: BTreeMap<String, Box<dyn ToolExecutor>>,
+    availableTools: BTreeMap<String, RegisteredToolExecutor>,
     executingTools: BTreeSet<String>,
     toolVisibility: BTreeMap<String, ToolRegistrationVisibility>,
-    unavailableBuiltinTools: BTreeMap<BuiltinToolName, String>,
     defaultToolsRegistered: bool,
     context: HostManager,
     runtimeDependencies: ToolRuntimeDependencies,
@@ -71,6 +168,48 @@ pub struct AIToolHandlerState {
 }
 
 impl AIToolHandler {
+    /// Creates one scope-owned directory through the filesystem Host without package manager locks.
+    fn createPackageConfigDirectory(
+        &self,
+        owner_id: &str,
+        plugin_id: &str,
+        scope: &str,
+    ) -> Result<String, String> {
+        let root =
+            operit_store::ExtensionStore::ExtensionStore::configPathForScope(owner_id, scope)?;
+        let path = if plugin_id == owner_id {
+            root
+        } else {
+            let name = operit_util::OperitPaths::pluginConfigDirName(plugin_id)?;
+            format!("{root}/namespaces/{name}")
+        };
+        let configDir = RuntimeStorePaths::default().runtime_storage_path(&path);
+        self.getContext()
+            .fileSystemHost
+            .as_ref()
+            .ok_or("FileSystemHost is required for plugin configuration")?
+            .makeDirectory(&configDir.to_string_lossy(), true)
+            .map_err(|error| error.to_string())?;
+        let relative = path
+            .strip_prefix("runtime/")
+            .ok_or("Configuration is outside runtime storage")?;
+        PathMapper::joinVfsPath("/app/data", relative)
+    }
+
+    /// Creates persistent local plugin data through the filesystem Host and returns its public VFS path.
+    fn createPackageDataDirectory(&self, owner_id: &str, scope: &str) -> Result<String, String> {
+        let path = operit_store::ExtensionStore::ExtensionStore::dataPathForScope(owner_id, scope)?;
+        let directory = RuntimeStorePaths::default().runtime_storage_path(&path);
+        self.getContext()
+            .fileSystemHost
+            .as_ref()
+            .ok_or("FileSystemHost is required for local plugin data")?
+            .makeDirectory(&directory.to_string_lossy(), true)
+            .map_err(|error| error.to_string())?;
+        let relative = path.strip_prefix("runtime/").ok_or("Local plugin data is outside runtime storage")?;
+        PathMapper::joinVfsPath("/app/data", relative)
+    }
+
     fn truncateLogValue(value: &str, maxChars: usize) -> String {
         let mut truncated = String::new();
         for character in value.chars().take(maxChars) {
@@ -108,7 +247,6 @@ impl AIToolHandler {
                 availableTools: BTreeMap::new(),
                 executingTools: BTreeSet::new(),
                 toolVisibility: BTreeMap::new(),
-                unavailableBuiltinTools: BTreeMap::new(),
                 defaultToolsRegistered: false,
                 context,
                 runtimeDependencies,
@@ -116,7 +254,14 @@ impl AIToolHandler {
                 toolPermissionSystem: ToolPermissionSystem::getInstance(),
                 packageManager: None,
             })),
-            executorAvailability: Arc::new(Condvar::new()),
+            executorAvailability: Arc::new(tokio::sync::Notify::new()),
+            authenticatedExtensionOwner: None,
+            invocationSnapshot: crate::ToolExecutionManager::ToolInvocationSnapshot::default(),
+            deviceTransportScope: Default::default(),
+            chatObservations: Arc::new(Mutex::new(BTreeMap::new())),
+            coreRoutePushes: Default::default(),
+            coreRouteWatches: Arc::new(Mutex::new(BTreeMap::new())),
+            storageSession: operit_store::PluginStorage::PluginStorageSession::default(),
         }
     }
 
@@ -210,6 +355,7 @@ impl AIToolHandler {
             .clear();
     }
 
+    /// Delivers notifications outside already active lifecycle hooks.
     fn notifyHooks<F>(&self, action: F)
     where
         F: Fn(&dyn AIToolHook),
@@ -220,20 +366,25 @@ impl AIToolHandler {
             .expect("AIToolHandler mutex poisoned")
             .hooks
             .clone();
+        let context = ToolExecutionManager::currentToolInvocationContext()
+            .expect("Lifecycle notifications require the native invocation context");
         for hook in hooks {
-            action(hook.as_ref());
+            if context.isHookActive(hook.id()) {
+                continue;
+            }
+            context.withHook(hook.id()).scopeSync(|| action(hook.as_ref()));
         }
     }
 
     /// Notifies hooks that a tool call has been requested.
     #[allow(non_snake_case)]
-    pub fn notifyToolCallRequested(&self, tool: &AITool) {
+    fn notifyToolCallRequested(&self, tool: &AITool) {
         self.notifyHooks(|hook| hook.onToolCallRequested(tool));
     }
 
-    /// Returns the first hook decision for a tool call before execution begins.
+    /// Returns an explicit policy decision or the original invoked failure before tool execution begins.
     #[allow(non_snake_case)]
-    pub fn checkToolInterception(&self, tool: &AITool) -> AIToolHookDecision {
+    async fn checkToolInterception(&self, tool: &AITool) -> Result<AIToolHookDecision, String> {
         let hooks = self
             .inner
             .lock()
@@ -241,17 +392,20 @@ impl AIToolHandler {
             .hooks
             .clone();
         for hook in hooks {
-            match hook.onToolCallIntercept(tool) {
+            let context = ToolExecutionManager::currentToolInvocationContext()
+                .ok_or_else(|| "Tool interception requires the native invocation context".to_string())?;
+            if context.isHookActive(hook.id()) { continue; }
+            match context.withHook(hook.id()).scope(async { hook.onToolCallInterceptAsync(tool).await }).await? {
                 AIToolHookDecision::Allow => {}
-                decision @ AIToolHookDecision::Block(_) => return decision,
+                decision @ AIToolHookDecision::Block(_) => return Ok(decision),
             }
         }
-        AIToolHookDecision::Allow
+        Ok(AIToolHookDecision::Allow)
     }
 
     /// Builds the standard failed result emitted when a hook blocks a tool call.
     #[allow(non_snake_case)]
-    pub fn toolInterceptionResult(tool: &AITool, decision: AIToolHookDecision) -> ToolResult {
+    fn toolInterceptionResult(tool: &AITool, decision: AIToolHookDecision) -> ToolResult {
         let reason = match decision {
             AIToolHookDecision::Allow => "Tool call was not blocked.".to_string(),
             AIToolHookDecision::Block(reason) => reason,
@@ -266,31 +420,31 @@ impl AIToolHandler {
 
     /// Notifies hooks that permission was checked for a tool call.
     #[allow(non_snake_case)]
-    pub fn notifyToolPermissionChecked(&self, tool: &AITool, granted: bool, reason: Option<&str>) {
+    fn notifyToolPermissionChecked(&self, tool: &AITool, granted: bool, reason: Option<&str>) {
         self.notifyHooks(|hook| hook.onToolPermissionChecked(tool, granted, reason));
     }
 
     /// Notifies hooks that tool execution is about to start.
     #[allow(non_snake_case)]
-    pub fn notifyToolExecutionStarted(&self, tool: &AITool) {
+    fn notifyToolExecutionStarted(&self, tool: &AITool) {
         self.notifyHooks(|hook| hook.onToolExecutionStarted(tool));
     }
 
     /// Notifies hooks that tool execution returned a result.
     #[allow(non_snake_case)]
-    pub fn notifyToolExecutionResult(&self, tool: &AITool, result: &ToolResult) {
+    fn notifyToolExecutionResult(&self, tool: &AITool, result: &ToolResult) {
         self.notifyHooks(|hook| hook.onToolExecutionResult(tool, result));
     }
 
     /// Notifies hooks that tool execution failed before producing a normal result.
     #[allow(non_snake_case)]
-    pub fn notifyToolExecutionError(&self, tool: &AITool, message: &str) {
+    fn notifyToolExecutionError(&self, tool: &AITool, message: &str) {
         self.notifyHooks(|hook| hook.onToolExecutionError(tool, message));
     }
 
     /// Notifies hooks that tool execution has fully finished.
     #[allow(non_snake_case)]
-    pub fn notifyToolExecutionFinished(&self, tool: &AITool) {
+    fn notifyToolExecutionFinished(&self, tool: &AITool) {
         self.notifyHooks(|hook| hook.onToolExecutionFinished(tool));
     }
 
@@ -325,6 +479,19 @@ impl AIToolHandler {
             .expect("AIToolHandler mutex poisoned")
             .context
             .clone()
+    }
+
+    /// Installs the live Core command callback after the local application has been assembled.
+    #[allow(non_snake_case)]
+    pub fn setCoreCommandExecutor(
+        &self,
+        executor: operit_host_api::HostManager::CoreCommandExecutor,
+    ) {
+        self.inner
+            .lock()
+            .expect("AIToolHandler mutex poisoned")
+            .context
+            .coreCommandExecutor = Some(executor);
     }
 
     /// Returns the dependency set associated with this handler.
@@ -402,10 +569,10 @@ impl AIToolHandler {
 
     /// Registers one statically declared built-in tool with explicit visibility.
     #[allow(non_snake_case)]
-    pub fn registerBuiltinTool(
+    pub fn registerBuiltinTool<E: Into<RegisteredToolExecutor>>(
         &mut self,
         name: BuiltinToolName,
-        executor: Box<dyn ToolExecutor>,
+        executor: E,
         visibility: ToolRegistrationVisibility,
     ) {
         let toolName = name.as_str().to_string();
@@ -414,34 +581,8 @@ impl AIToolHandler {
             !guard.availableTools.contains_key(&toolName),
             "Built-in tool is registered more than once: {toolName}"
         );
-        assert!(
-            !guard.unavailableBuiltinTools.contains_key(&name),
-            "Built-in tool cannot be both registered and unavailable: {toolName}"
-        );
-        guard.availableTools.insert(
-            toolName.clone(),
-            Box::new(ContractCheckedBuiltinToolExecutor { name, executor }),
-        );
+        guard.availableTools.insert(toolName.clone(), executor.into());
         guard.toolVisibility.insert(toolName, visibility);
-    }
-
-    /// Marks built-in tools as unavailable because their required host capability is absent.
-    #[allow(non_snake_case)]
-    pub(crate) fn markBuiltinToolsUnavailable(&mut self, names: &[BuiltinToolName], reason: &str) {
-        let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
-        for name in names {
-            assert!(
-                !guard.availableTools.contains_key(name.as_str()),
-                "Registered built-in tool cannot be marked unavailable: {name}"
-            );
-            assert!(
-                guard
-                    .unavailableBuiltinTools
-                    .insert(*name, reason.to_string())
-                    .is_none(),
-                "Built-in tool is marked unavailable more than once: {name}"
-            );
-        }
     }
 
     /// Registers a tool executor with explicit public or internal visibility.
@@ -457,8 +598,34 @@ impl AIToolHandler {
             "Built-in tools must use registerBuiltinTool: {name}"
         );
         let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
-        guard.availableTools.insert(name.clone(), executor);
+        guard
+            .availableTools
+            .insert(name.clone(), RegisteredToolExecutor::Synchronous(executor));
         guard.toolVisibility.insert(name, visibility);
+    }
+
+    /// Registers a public tool with an explicitly asynchronous execution contract.
+    pub fn registerAsyncTool(&mut self, name: String, executor: Box<dyn AsyncToolExecutor>) {
+        assert!(
+            BuiltinToolName::from_name(&name).is_none(),
+            "Built-in tools must use their typed registration"
+        );
+        let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
+        guard
+            .availableTools
+            .insert(name.clone(), RegisteredToolExecutor::Asynchronous(executor));
+        guard
+            .toolVisibility
+            .insert(name, ToolRegistrationVisibility::PUBLIC);
+    }
+
+    /// Registers an explicitly concurrent operation on the same public or internal executor registry.
+    pub fn registerSharedTool(&mut self, name: String, executor: Arc<dyn SharedToolExecutor>, visibility: ToolRegistrationVisibility) {
+        assert!(BuiltinToolName::from_name(&name).is_none(), "Built-in tools must use their typed registration");
+        let mut state = self.inner.lock().expect("AIToolHandler mutex poisoned");
+        assert!(!state.executingTools.contains(&name), "Cannot replace an executing tool");
+        state.availableTools.insert(name.clone(), RegisteredToolExecutor::Shared(executor));
+        state.toolVisibility.insert(name, visibility);
     }
 
     /// Returns the configured visibility for one tool.
@@ -490,20 +657,7 @@ impl AIToolHandler {
         };
         registerAllTools(self, &context);
         let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
-        for name in BuiltinToolName::ALL {
-            let registered = guard.availableTools.contains_key(name.as_str());
-            let unavailable = guard.unavailableBuiltinTools.contains_key(name);
-            assert!(
-                registered ^ unavailable,
-                "Built-in tool must be exactly registered or unavailable: {name}"
-            );
-        }
         guard.defaultToolsRegistered = true;
-    }
-
-    #[allow(non_snake_case)]
-    pub fn getToolExecutor(&mut self, _toolName: &str) -> Option<&mut Box<dyn ToolExecutor>> {
-        None
     }
 
     /// Returns whether a tool executor is already registered.
@@ -514,43 +668,50 @@ impl AIToolHandler {
     }
 
     /// Acquires one named executor, waiting for an in-flight invocation of that same tool to finish.
-    fn takeToolExecutorForExecution(&self, toolName: &str) -> Option<Box<dyn ToolExecutor>> {
-        let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
+    async fn takeToolExecutorForExecution(&self, toolName: &str) -> Option<ToolExecutorLease> {
         loop {
-            if let Some(executor) = guard.availableTools.remove(toolName) {
-                assert!(
-                    guard.executingTools.insert(toolName.to_string()),
-                    "Tool executor was already marked executing: {toolName}"
-                );
-                return Some(executor);
+            let notified = self.executorAvailability.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
+                if let Some(RegisteredToolExecutor::Shared(executor)) = guard.availableTools.get(toolName) {
+                    return Some(ToolExecutorLease {
+                        name: toolName.to_owned(),
+                        executor: Some(RegisteredToolExecutor::Shared(executor.clone())),
+                        exclusive: false,
+                        state: self.inner.clone(),
+                        available: self.executorAvailability.clone(),
+                    });
+                }
+                if let Some(executor) = guard.availableTools.remove(toolName) {
+                    assert!(
+                        guard.executingTools.insert(toolName.to_owned()),
+                        "Tool executor was already marked executing: {toolName}"
+                    );
+                    return Some(ToolExecutorLease {
+                        name: toolName.to_owned(),
+                        executor: Some(executor),
+                        exclusive: true,
+                        state: self.inner.clone(),
+                        available: self.executorAvailability.clone(),
+                    });
+                }
+                if !guard.executingTools.contains(toolName) {
+                    return None;
+                }
             }
-            if !guard.executingTools.contains(toolName) {
-                return None;
-            }
-            guard = self
-                .executorAvailability
-                .wait(guard)
-                .expect("AIToolHandler mutex poisoned while waiting for tool executor");
+            notified.await;
         }
-    }
-
-    /// Restores one completed executor and wakes calls queued for the same tool name.
-    fn restoreToolExecutorAfterExecution(&self, toolName: String, executor: Box<dyn ToolExecutor>) {
-        let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
-        assert!(
-            guard.executingTools.remove(&toolName),
-            "Tool executor was not marked executing: {toolName}"
-        );
-        assert!(
-            guard.availableTools.insert(toolName, executor).is_none(),
-            "Tool executor was unexpectedly registered while executing"
-        );
-        self.executorAvailability.notify_all();
     }
 
     /// Ensures default or package tools are registered, then reports whether a tool exists.
     #[allow(non_snake_case)]
-    pub fn getToolExecutorOrActivate(&mut self, toolName: &str) -> bool {
+    pub(super) async fn getToolExecutorOrActivate(&mut self, toolName: &str) -> Result<bool, String> {
+        if let Some((packageName, _)) = toolName.split_once(':') {
+            let manager = self.getOrCreatePackageManager();
+            RuntimePackageManager::prepareMcpPackage(&manager, packageName.trim()).await?;
+        }
         if self.hasToolExecutor(toolName) {
             if let Some((packageName, _)) = toolName.split_once(':') {
                 let packageName = packageName.trim();
@@ -569,19 +730,16 @@ impl AIToolHandler {
                     }
                 }
             }
-            return self.hasToolExecutor(toolName);
+            return Ok(self.hasToolExecutor(toolName));
         }
 
         self.registerDefaultTools();
         if self.hasToolExecutor(toolName) {
-            return true;
+            return Ok(true);
         }
 
-        if toolName.contains(':') {
-            let packageName = toolName
-                .split_once(':')
-                .map(|(name, _)| name.trim())
-                .unwrap_or("");
+        if let Some((packageName, _)) = toolName.split_once(':') {
+            let packageName = packageName.trim();
             if !packageName.is_empty() {
                 let packageManager = self.getOrCreatePackageManager();
                 let selectedPackage = {
@@ -606,13 +764,13 @@ impl AIToolHandler {
             }
         }
 
-        self.hasToolExecutor(toolName)
+        Ok(self.hasToolExecutor(toolName))
     }
 
     #[allow(non_snake_case)]
     fn isMcpServiceActive(&self, packageName: &str) -> bool {
         let mcpManager = MCPManager::getInstance(self.getContext());
-        let Some(client) = mcpManager.getOrCreateClient(packageName) else {
+        let Some(client) = mcpManager.getClientForMetadata(packageName) else {
             return false;
         };
         client
@@ -621,8 +779,9 @@ impl AIToolHandler {
             .unwrap_or(false)
     }
 
+    /// Registers package targets once without capturing an execution caller.
     #[allow(non_snake_case)]
-    fn registerPackageTools(
+    pub(crate) fn registerPackageTools(
         &mut self,
         packageManager: Arc<Mutex<RuntimePackageManager>>,
         toolPackage: ToolPackage,
@@ -643,19 +802,18 @@ impl AIToolHandler {
         for packageTool in executableTools {
             let toolName = format!("{}:{}", toolPackage.name, packageTool.name);
             if isMcpPackage {
-                self.registerTool(
+                self.registerAsyncTool(
                     toolName,
                     Box::new(MCPToolExecutor::new(MCPManager::getInstance(
                         context.clone(),
                     ))),
                 );
             } else {
-                self.registerTool(
+                self.registerAsyncTool(
                     toolName,
                     Box::new(PackageToolExecutor::new(
                         toolPackage.clone(),
                         packageManager.clone(),
-                        self.clone(),
                     )),
                 );
             }
@@ -669,6 +827,8 @@ impl AIToolHandler {
         accessSpec: ToolAccessSpec,
     ) -> Result<ToolAccessSpec, ToolResult> {
         let permissionSystem = self.getToolPermissionSystem();
+        let chatId = ToolExecutionManager::currentToolRuntimeContext()
+            .and_then(|context| context.callerChatId);
         let mode = permissionSystem
             .getAiPermissionMode()
             .map_err(|error| ToolResult {
@@ -677,7 +837,8 @@ impl AIToolHandler {
                 result: stringResultData(""),
                 error: Some(error.to_string()),
             })?;
-        let workspaceBoundary = Self::checkWorkspaceBoundary(&mode, tool, &accessSpec);
+        let context = self.getContext();
+        let workspaceBoundary = Self::checkWorkspaceBoundary(&mode, tool, &accessSpec, context.runtimeStorageHost.as_ref());
         let policyOverrideReason = match (mode.allowsEffect(accessSpec.effect), workspaceBoundary) {
             (_, Err(WorkspaceBoundaryError::InvalidRequest(error))) => {
                 return Err(ToolResult {
@@ -697,7 +858,7 @@ impl AIToolHandler {
         };
         let policyOverrideApproved = if let Some(reason) = policyOverrideReason.as_deref() {
             let approved = permissionSystem
-                .checkSandboxEscapeApprovalAsync(tool)
+                .checkSandboxEscapeApprovalAsync(tool, chatId.clone())
                 .await
                 .map_err(|error| ToolResult {
                     toolName: tool.name.clone(),
@@ -727,7 +888,7 @@ impl AIToolHandler {
             && !policyOverrideApproved
         {
             let approved = permissionSystem
-                .checkSandboxEscapeApprovalAsync(tool)
+                .checkSandboxEscapeApprovalAsync(tool, chatId.clone())
                 .await
                 .map_err(|error| ToolResult {
                     toolName: tool.name.clone(),
@@ -760,6 +921,7 @@ impl AIToolHandler {
         mode: &AiPermissionMode,
         tool: &AITool,
         accessSpec: &ToolAccessSpec,
+        storage: Option<&Arc<dyn operit_host_api::RuntimeStorageHost>>,
     ) -> Result<(), WorkspaceBoundaryError> {
         if *mode == AiPermissionMode::Full {
             return Ok(());
@@ -767,14 +929,14 @@ impl AIToolHandler {
         match &accessSpec.boundary {
             ToolBoundary::None => Ok(()),
             ToolBoundary::FilePath { effect } => {
-                Self::checkWorkspaceWritePath(tool, "path", *effect)
+                Self::checkWorkspaceWritePath(tool, "path", *effect, storage)
             }
             ToolBoundary::FilePair {
                 source,
                 destination,
             } => {
-                Self::checkWorkspaceWritePath(tool, "source", *source)?;
-                Self::checkWorkspaceWritePath(tool, "destination", *destination)
+                Self::checkWorkspaceWritePath(tool, "source", *source, storage)?;
+                Self::checkWorkspaceWritePath(tool, "destination", *destination, storage)
             }
         }
     }
@@ -784,6 +946,7 @@ impl AIToolHandler {
         tool: &AITool,
         parameterName: &str,
         effect: ToolEffect,
+        storage: Option<&Arc<dyn operit_host_api::RuntimeStorageHost>>,
     ) -> Result<(), WorkspaceBoundaryError> {
         if effect == ToolEffect::READ {
             return Ok(());
@@ -822,8 +985,16 @@ impl AIToolHandler {
             ));
         }
 
-        let paths = RuntimeStorePaths::default();
-        let mapper = PathMapper::new(paths.runtime_dir().to_path_buf(), paths.workspace_dir());
+        let storage = storage.ok_or_else(|| WorkspaceBoundaryError::RequiresApproval(
+            "File tool execution requires its runtime storage Host".to_string()
+        ))?;
+        let runtimeRoot = storage.runtimeRootDir().ok_or_else(|| WorkspaceBoundaryError::InvalidRequest(
+            "Runtime storage Host does not expose its runtime root".to_string()
+        ))?;
+        let workspaceRoot = storage.workspaceRootDir().ok_or_else(|| WorkspaceBoundaryError::InvalidRequest(
+            "Runtime storage Host does not expose its workspace root".to_string()
+        ))?;
+        let mapper = PathMapper::new(runtimeRoot, workspaceRoot, storage.clone());
         let resolvedPath = mapper
             .resolve(path)
             .map_err(WorkspaceBoundaryError::InvalidRequest)?;
@@ -845,340 +1016,131 @@ impl AIToolHandler {
         )));
     }
 
-    /// Executes an AI-originated tool through permission checks and a resolved executor.
+    /// Executes every caller through one pipeline, with hooks and permissions selected by native AI policy.
     #[allow(non_snake_case)]
-    pub async fn executeToolSafelyWithResolvedExecutor(
+    pub async fn executeToolInvocation(
         &mut self,
-        tool: &AITool,
-    ) -> Option<Vec<ToolResult>> {
-        self.executeToolWithResolvedExecutor(tool, ToolExecutionAccess::AiPermission)
-            .await
+        request: &ToolCall,
+        policy: ToolExecutionPolicy,
+    ) -> Result<Vec<ToolResult>, String> {
+        let context = ToolInvocationContext::capture(self.clone());
+        context.clone().scope(self.executeInvocationInContext(request, policy, &context)).await
     }
 
-    /// Executes a non-AI tool directly through a resolved executor.
-    #[allow(non_snake_case)]
-    pub async fn executeToolDirectlyWithResolvedExecutor(
-        &mut self,
-        tool: &AITool,
-    ) -> Option<Vec<ToolResult>> {
-        self.executeToolWithResolvedExecutor(tool, ToolExecutionAccess::Direct)
-            .await
-    }
-
-    /// Executes a streamed tool call according to its caller-owned access policy.
-    #[allow(non_snake_case)]
-    async fn executeToolWithResolvedExecutor(
-        &mut self,
-        tool: &AITool,
-        access: ToolExecutionAccess,
-    ) -> Option<Vec<ToolResult>> {
-        let parameterSummary = Self::summarizeToolParameters(tool);
-        ChainLogger::info(
-            TOOL_CHAIN,
-            "tool.stream.request",
-            &[
-                ("tool", tool.name.clone()),
-                ("parameterCount", tool.parameters.len().to_string()),
-                ("parameters", parameterSummary.clone()),
-            ],
-        );
-        if !self.getToolExecutorOrActivate(&tool.name) {
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.stream.not_found",
-                &[("tool", tool.name.clone())],
-            );
-            return None;
-        }
-
-        let Some(mut executor) = self.takeToolExecutorForExecution(&tool.name) else {
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.stream.not_registered",
-                &[("tool", tool.name.clone())],
-            );
-            return None;
+    /// Executes under the native caller context and dispatches lifecycle hooks only for AI requests.
+    async fn executeInvocationInContext(&mut self, request: &ToolCall, policy: ToolExecutionPolicy, context: &ToolInvocationContext) -> Result<Vec<ToolResult>, String> {
+        let entryTool = request.toLegacyTool();
+        let resolved = request.resolveTarget(context)?;
+        let request = &resolved;
+        let tool = request.toLegacyTool();
+        let tool = &tool;
+        let isAiInvocation = matches!(policy, ToolExecutionPolicy::Ai { .. } | ToolExecutionPolicy::Device);
+        let logExecution = if isAiInvocation {
+            ChainLogger::info
+        } else {
+            ChainLogger::verbose
         };
-
-        let validationResult = executor.validateParameters(tool);
+        let _lifecycle = if isAiInvocation {
+            let lifecycle = ToolInvocationLifecycle {
+                context: context.clone(),
+                tool: tool.clone(),
+            };
+            self.notifyToolCallRequested(tool);
+            Some(lifecycle)
+        } else {
+            None
+        };
         let startMs = operit_host_api::TimeUtils::currentTimeMillis();
-        let collected = if validationResult.valid {
-            match access {
-                ToolExecutionAccess::AiPermission => {
-                    let accessSpec = executor.accessSpec(tool).map_err(|error| ToolResult {
-                        toolName: tool.name.clone(),
-                        success: false,
-                        result: stringResultData(""),
-                        error: Some(format!("Tool access declaration failed: {error}")),
-                    });
-                    match accessSpec {
-                        Ok(accessSpec) => {
-                            match self.executeAccessPreflightAsync(tool, accessSpec).await {
-                                Ok(accessSpec) => {
-                                    ChainLogger::info(
-                                        TOOL_CHAIN,
-                                        "tool.stream.start",
-                                        &[
-                                            ("tool", tool.name.clone()),
-                                            ("parameters", parameterSummary.clone()),
-                                            ("effect", format!("{:?}", accessSpec.effect)),
-                                        ],
-                                    );
-                                    executor.invokeAndStream(tool)
-                                }
-                                Err(errorResult) => vec![errorResult],
-                            }
-                        }
-                        Err(errorResult) => vec![errorResult],
-                    }
-                }
-                ToolExecutionAccess::Direct => {
-                    ChainLogger::info(
-                        TOOL_CHAIN,
-                        "tool.stream.start",
-                        &[
-                            ("tool", tool.name.clone()),
-                            ("parameters", parameterSummary.clone()),
-                            ("access", "direct".to_string()),
-                        ],
-                    );
-                    executor.invokeAndStream(tool)
-                }
-            }
-        } else {
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.stream.validation_failed",
-                &[
-                    ("tool", tool.name.clone()),
-                    ("error", validationResult.errorMessage.clone()),
-                ],
-            );
-            vec![ToolResult {
-                toolName: tool.name.clone(),
-                success: false,
-                result: stringResultData(""),
-                error: Some(format!(
-                    "Invalid parameters: {}",
-                    validationResult.errorMessage
-                )),
-            }]
-        };
-
-        self.restoreToolExecutorAfterExecution(tool.name.clone(), executor);
-        let elapsedMs = operit_host_api::TimeUtils::currentTimeMillis().saturating_sub(startMs);
-        let finalResult = collected.last().cloned();
-        if let Some(finalResult) = finalResult {
-            if finalResult.success {
-                ChainLogger::info(
-                    TOOL_CHAIN,
-                    "tool.stream.done",
-                    &[
-                        ("tool", tool.name.clone()),
-                        ("resultCount", collected.len().to_string()),
-                        ("elapsedMs", elapsedMs.to_string()),
-                        (
-                            "resultChars",
-                            ChainLogger::lenField(&finalResult.result.toString()),
-                        ),
-                    ],
-                );
-            } else if let Some(error) = finalResult.error.clone() {
-                ChainLogger::error(
-                    TOOL_CHAIN,
-                    "tool.stream.error",
-                    &[
-                        ("tool", tool.name.clone()),
-                        ("resultCount", collected.len().to_string()),
-                        ("elapsedMs", elapsedMs.to_string()),
-                        ("parameters", parameterSummary.clone()),
-                        ("error", error),
-                        (
-                            "resultChars",
-                            ChainLogger::lenField(&finalResult.result.toString()),
-                        ),
-                    ],
-                );
-            } else {
-                ChainLogger::error(
-                    TOOL_CHAIN,
-                    "tool.stream.error",
-                    &[
-                        ("tool", tool.name.clone()),
-                        ("resultCount", collected.len().to_string()),
-                        ("elapsedMs", elapsedMs.to_string()),
-                        ("parameters", parameterSummary.clone()),
-                        (
-                            "resultChars",
-                            ChainLogger::lenField(&finalResult.result.toString()),
-                        ),
-                    ],
-                );
-            }
-        } else {
-            ChainLogger::error(
-                TOOL_CHAIN,
-                "tool.stream.empty_result",
-                &[
-                    ("tool", tool.name.clone()),
-                    ("elapsedMs", elapsedMs.to_string()),
-                ],
-            );
-        }
-        if elapsedMs >= 3000 {
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.stream.slow",
-                &[
-                    ("tool", tool.name.clone()),
-                    ("elapsedMs", elapsedMs.to_string()),
-                    ("parameters", parameterSummary.clone()),
-                ],
-            );
-        }
-        Some(collected)
-    }
-
-    /// Resolves and directly executes a non-AI tool request through the registered tool chain.
-    #[allow(non_snake_case)]
-    pub fn executeTool(&mut self, tool: AITool) -> ToolResult {
-        ChainLogger::info(
+        logExecution(
             TOOL_CHAIN,
             "tool.execute.request",
-            &[
-                ("tool", tool.name.clone()),
-                ("parameterCount", tool.parameters.len().to_string()),
-            ],
+            &[("tool", tool.name.clone()), ("policy", format!("{policy:?}"))],
         );
-        self.notifyToolCallRequested(&tool);
-        let interception = self.checkToolInterception(&tool);
-        if let AIToolHookDecision::Block(_) = interception {
-            let result = Self::toolInterceptionResult(&tool, interception);
-            self.notifyToolExecutionResult(&tool, &result);
-            self.notifyToolExecutionFinished(&tool);
-            return result;
-        }
-        self.getToolExecutorOrActivate(&tool.name);
-        let Some(mut executor) = self.takeToolExecutorForExecution(&tool.name) else {
-            let notFoundResult = ToolResult {
-                toolName: tool.name.clone(),
-                success: false,
-                result: stringResultData(""),
-                error: Some(format!("Tool not found: {}", tool.name)),
+        let execution = async {
+            if let ToolExecutionPolicy::Ai { exposure } = &policy {
+                if let Some(denied) = ToolExecutionManager::buildToolExposureDeniedResult(&entryTool, exposure.clone()) {
+                    return Ok(vec![denied]);
+                }
+            }
+            if isAiInvocation {
+                let interception = self.checkToolInterception(tool).await?;
+                if let AIToolHookDecision::Block(_) = interception {
+                    return Ok(vec![Self::toolInterceptionResult(tool, interception)]);
+                }
+            }
+            if !self.getToolExecutorOrActivate(&tool.name).await? {
+                return Ok(vec![Self::failedInvocation(tool, format!("Tool not found: {}", tool.name))]);
+            }
+            let mut executor = self.takeToolExecutorForExecution(&tool.name).await
+                .ok_or_else(|| format!("Registered executor disappeared: {}", tool.name))?;
+            let prepared = match executor.prepare(request, context, isAiInvocation) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(vec![Self::failedInvocation(tool, format!("Invalid tool invocation: {error}"))]),
             };
-            self.notifyToolExecutionResult(&tool, &notFoundResult);
-            self.notifyToolExecutionFinished(&tool);
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.execute.not_found",
-                &[("tool", tool.name.clone())],
-            );
-            return notFoundResult;
-        };
-
-        let validationResult = executor.validateParameters(&tool);
-        if !validationResult.valid {
-            let validationError = validationResult.errorMessage;
-            let validationFailedResult = ToolResult {
-                toolName: tool.name.clone(),
-                success: false,
-                result: stringResultData(""),
-                error: Some(validationError.clone()),
-            };
-            self.notifyToolExecutionResult(&tool, &validationFailedResult);
-            self.notifyToolExecutionFinished(&tool);
-            ChainLogger::warn(
-                TOOL_CHAIN,
-                "tool.execute.validation_failed",
-                &[("tool", tool.name.clone()), ("error", validationError)],
-            );
-            self.restoreToolExecutorAfterExecution(tool.name.clone(), executor);
-            return validationFailedResult;
-        }
-
-        self.notifyToolExecutionStarted(&tool);
-        ChainLogger::info(
-            TOOL_CHAIN,
-            "tool.execute.start",
-            &[("tool", tool.name.clone())],
-        );
-        let collected = executor.invokeAndStream(&tool);
-        if collected.is_empty() {
-            ChainLogger::error(
-                TOOL_CHAIN,
-                "tool.execute.empty_result",
-                &[("tool", tool.name.clone())],
-            );
-        }
-        let result = collected
-            .last()
-            .cloned()
-            .expect("ToolExecutor.invokeAndStream must return at least one ToolResult");
-        self.notifyToolExecutionResult(&tool, &result);
-        self.notifyToolExecutionFinished(&tool);
-        if result.success {
-            ChainLogger::info(
-                TOOL_CHAIN,
-                "tool.execute.done",
-                &[
-                    ("tool", tool.name.clone()),
-                    (
-                        "resultChars",
-                        ChainLogger::lenField(&result.result.toString()),
-                    ),
-                ],
-            );
-        } else {
-            if let Some(error) = result.error.as_ref() {
-                ChainLogger::error(
+            if isAiInvocation {
+                if let Some(access) = prepared.access {
+                    if let Err(denied) = self.executeAccessPreflightAsync(tool, access).await {
+                        return Ok(vec![denied]);
+                    }
+                }
+                self.notifyToolExecutionStarted(tool);
+            }
+            let collected = prepared.invoke.await;
+            if let Some(name) = BuiltinToolName::from_name(&request.name) {
+                for result in &collected {
+                    assert!(result.toolName == request.name,
+                        "Built-in executor returned another tool's result");
+                    assert!(!result.success || name.accepts_runtime_result(&result.result),
+                        "Built-in executor returned an incompatible successful result: {name}");
+                    assert!(result.success || result.error.is_some(), "Failed result must carry its execution error");
+                }
+            }
+            if collected.is_empty() {
+                return Err(format!("Tool executor returned no results: {}", tool.name));
+            }
+            Ok(collected)
+        }.await;
+        match &execution {
+            Ok(results) => {
+                if isAiInvocation {
+                    for result in results {
+                        self.notifyToolExecutionResult(tool, result);
+                    }
+                }
+                logExecution(
                     TOOL_CHAIN,
-                    "tool.execute.error",
-                    &[
-                        ("tool", tool.name.clone()),
-                        ("error", error.clone()),
-                        (
-                            "resultChars",
-                            ChainLogger::lenField(&result.result.toString()),
-                        ),
-                    ],
-                );
-            } else {
-                ChainLogger::error(
-                    TOOL_CHAIN,
-                    "tool.execute.error",
-                    &[
-                        ("tool", tool.name.clone()),
-                        (
-                            "resultChars",
-                            ChainLogger::lenField(&result.result.toString()),
-                        ),
-                    ],
+                    "tool.execute.completed",
+                    &[("tool", tool.name.clone()), ("resultCount", results.len().to_string()),
+                      ("elapsedMs", operit_host_api::TimeUtils::currentTimeMillis().saturating_sub(startMs).to_string())],
                 );
             }
+            Err(error) => {
+                if isAiInvocation {
+                    self.notifyToolExecutionError(tool, error);
+                }
+                ChainLogger::error(TOOL_CHAIN, "tool.execute.error", &[("tool", tool.name.clone()), ("error", error.clone())]);
+            }
         }
-        self.restoreToolExecutorAfterExecution(tool.name.clone(), executor);
-        result
+        execution
     }
 
-    #[allow(non_snake_case)]
-    /// Removes all registered executors and returns their ownership to the caller.
-    pub fn takeExecutors(&mut self) -> BTreeMap<String, Box<dyn ToolExecutor>> {
-        let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
-        if !guard.defaultToolsRegistered {
-            drop(guard);
-            self.registerDefaultTools();
-            guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
+    /// Creates an explicit failed result for a rejected invocation.
+    fn failedInvocation(tool: &AITool, error: String) -> ToolResult {
+        ToolResult {
+            toolName: tool.name.clone(),
+            success: false,
+            result: stringResultData(""),
+            error: Some(error),
         }
-        std::mem::take(&mut guard.availableTools)
     }
 
+    /// Adapts a direct caller's terminal result from the common invocation pipeline.
     #[allow(non_snake_case)]
-    /// Restores a previously removed executor registry.
-    pub fn restoreExecutors(&mut self, executors: BTreeMap<String, Box<dyn ToolExecutor>>) {
-        self.inner
-            .lock()
-            .expect("AIToolHandler mutex poisoned")
-            .availableTools = executors;
+    pub async fn executeTool(&mut self, tool: AITool) -> ToolResult {
+        match self.executeToolInvocation(&ToolCall::from(&tool), ToolExecutionPolicy::Direct).await {
+            Ok(results) => results.into_iter().last().expect("The invocation pipeline rejects empty results"),
+            Err(error) => Self::failedInvocation(&tool, error),
+        }
     }
 
     /// Clears registered tools and runtime-only handler state.
@@ -1186,7 +1148,6 @@ impl AIToolHandler {
         let mut guard = self.inner.lock().expect("AIToolHandler mutex poisoned");
         guard.availableTools.clear();
         guard.toolVisibility.clear();
-        guard.unavailableBuiltinTools.clear();
         guard.defaultToolsRegistered = false;
     }
 }
@@ -1199,47 +1160,206 @@ impl AIToolHandlerState {
     }
 }
 
+
 impl JsExecutionHost for AIToolHandler {
-    /// Executes an SDK JavaScript tool request through the registered Operit tool chain.
-    fn execute_tool_call(&self, request: JsToolCallRequest) -> JsToolCallResult {
-        let tool = AITool {
-            name: request.qualified_tool_name(),
-            parameters: request
-                .parameters
-                .into_iter()
-                .map(|(name, value)| ToolParameter {
-                    name,
-                    value: match value {
-                        serde_json::Value::Null => String::new(),
-                        serde_json::Value::String(value) => value,
-                        value => value.to_string(),
-                    },
-                })
-                .collect(),
-        };
-        let mut handler = self.clone();
-        let result = handler.executeTool(tool);
-        let data = match result.result {
-            ToolResultData::BinaryResultData(data) => JsToolCallResultData::Binary(data.value),
-            ToolResultData::StringResultData(data) => {
-                JsToolCallResultData::Value(serde_json::Value::String(data.value))
-            }
-            ToolResultData::BooleanResultData(data) => {
-                JsToolCallResultData::Value(serde_json::Value::Bool(data.value))
-            }
-            ToolResultData::IntResultData(data) => JsToolCallResultData::Value(
-                serde_json::Value::Number(serde_json::Number::from(data.value)),
-            ),
-            data => JsToolCallResultData::Value(
-                serde_json::from_str(&data.toJson())
-                    .expect("ToolResultData JSON conversion must succeed"),
-            ),
-        };
-        JsToolCallResult {
-            success: result.success,
-            data,
-            error: result.error,
+    /// Captures native turn and hook scopes before JavaScript execution crosses its Host scheduler.
+    fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost> {
+        let mut host = self.clone();
+        host.invocationSnapshot = ToolInvocationContext::capture(self.clone()).snapshot();
+        Arc::new(host)
+    }
+
+    /// Authenticates the actual registered container before binding an immutable per-engine owner.
+    fn for_toolpkg_execution_context(
+        &self,
+        context: &operit_plugin_sdk::javascript::ToolPkgExecutionContext,
+    ) -> Result<Arc<dyn JsExecutionHost>, String> {
+        if context.context_key.trim().is_empty() || context.container_package_name.trim().is_empty()
+        {
+            return Err("ToolPkg extension execution context is incomplete".to_string());
         }
+        let manager = self.getOrCreatePackageManager();
+        let registry = manager.lock().expect("package manager mutex poisoned");
+        registry.packageRegistryReadiness().require_ready()?;
+        registry
+            .getToolPkgContainerRuntime(&context.container_package_name)
+            .ok_or_else(|| {
+                format!(
+                    "ToolPkg extension owner is not registered: {}",
+                    context.container_package_name
+                )
+            })?;
+        if !registry.getEnabledToolPkgContainerRuntimes().iter()
+            .any(|runtime| runtime.packageName == context.container_package_name)
+        {
+            return Err(format!(
+                "ToolPkg extension owner is disabled: {}",
+                context.container_package_name
+            ));
+        }
+        if let Some(owner) = &self.authenticatedExtensionOwner {
+            if owner != &context.container_package_name { return Err("Cannot rebind an authenticated engine to another package".to_owned()); }
+            return Ok(Arc::new(self.clone()));
+        }
+        let mut host = self.clone();
+        host.authenticatedExtensionOwner = Some(context.container_package_name.clone());
+        host.storageSession = operit_store::PluginStorage::PluginStorageSession::default();
+        host.deviceTransportScope = Default::default();
+        host.chatObservations = Arc::new(Mutex::new(BTreeMap::new()));
+        host.coreRoutePushes = Default::default();
+        host.coreRouteWatches = Arc::new(Mutex::new(BTreeMap::new()));
+        Ok(Arc::new(host))
+    }
+
+    /// Returns executable built-in and package tools with their declared parameters.
+    fn get_tool_catalog(&self) -> Result<Value, String> {
+        let mut handler = self.clone();
+        handler.registerDefaultTools();
+        let language = self.package_language()?;
+        let useEnglish = language.to_ascii_lowercase().starts_with("en");
+        let hostEnvironment = self.getHostEnvironmentDescriptor();
+        let categories = self
+            .runtimeSupport()
+            .buildBuiltinAndInternalCategories(useEnglish, &hostEnvironment);
+        let mut tools = Vec::new();
+        for category in categories {
+            for tool in category.tools {
+                let parameters = tool
+                    .parametersStructured
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|parameter| {
+                        json!({
+                            "name": parameter.name,
+                            "type": parameter.r#type,
+                            "description": parameter.description,
+                            "required": parameter.required,
+                            "default": parameter.default,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tools.push(json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": parameters,
+                    "category": category.categoryName,
+                    "source": "builtin",
+                }));
+            }
+        }
+
+        let packageManager = self.getOrCreatePackageManager();
+        let packageNames = packageManager
+            .lock()
+            .map_err(|_| "package manager mutex poisoned".to_string())?
+            .getAvailablePackages()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for packageName in packageNames {
+            let package = packageManager
+                .lock()
+                .map_err(|_| "package manager mutex poisoned".to_string())?
+                .getEffectivePackageTools(&packageName);
+            let Some(package) = package else {
+                continue;
+            };
+            for tool in package.tools.into_iter().filter(|tool| !tool.advice) {
+                let parameters = tool
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| {
+                        json!({
+                            "name": parameter.name,
+                            "type": parameter.parameter_type,
+                            "description": parameter.description.resolve(useEnglish),
+                            "required": parameter.required,
+                            "default": Value::Null,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tools.push(json!({
+                    "name": format!("{}:{}", packageName, tool.name),
+                    "description": tool.description.resolve(useEnglish),
+                    "parameters": parameters,
+                    "category": package.category,
+                    "source": "package",
+                    "packageName": packageName,
+                }));
+            }
+        }
+        Ok(json!({ "tools": tools }))
+    }
+
+    /// Executes an SDK JavaScript tool request through the registered Operit tool chain.
+    fn execute_tool_call(
+        &self,
+        mut request: JsToolCallRequest,
+    ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<JsToolCallResult> {
+        if request.device.as_ref().is_some_and(|device| device.action == operit_plugin_sdk::javascript::JsDeviceToolAction::Transport) {
+            self.deviceTransportScope.bind(&self.runtimeSupport());
+            request.parameters.insert("__transport_owner".into(), serde_json::Value::String(self.deviceTransportScope.id.clone()));
+        }
+        if request.device.as_ref().is_some_and(|device| device.action == operit_plugin_sdk::javascript::JsDeviceToolAction::Transport)
+            && !matches!(request.parameters.get("op").and_then(serde_json::Value::as_str), Some("open" | "call")) {
+            return self.runtimeSupport().executeDeviceTool(request, None);
+        }
+        if let Some(device) = &request.device {
+            if !matches!(
+                device.action,
+                operit_plugin_sdk::javascript::JsDeviceToolAction::Execute
+                    | operit_plugin_sdk::javascript::JsDeviceToolAction::Port
+                    | operit_plugin_sdk::javascript::JsDeviceToolAction::Transport
+            ) {
+                return self.runtimeSupport().executeDeviceTool(request, None);
+            }
+            let host = self.clone();
+            let tool = crate::tools::DeviceTools::tool_from_request(&request);
+            // Mirrors the AI path: interception hooks read the invocation scope, so the
+            // device path must capture and install one before the JS host awaits it.
+            let context = ToolInvocationContext::capture(self.clone());
+            let preflight = Box::pin(async move {
+                match context.scope(host.checkToolInterception(&tool)).await? {
+                    AIToolHookDecision::Block(reason) => Err(reason),
+                    _ => Ok(()),
+                }
+            });
+            return self.runtimeSupport().executeDeviceTool(request, Some(preflight));
+        }
+        let host = self.clone();
+        Box::pin(async move {
+            let call = ToolCall {
+                name: request.qualified_tool_name(),
+                parameters: request.parameters,
+            };
+            let mut handler = host;
+            let result = match handler.executeToolInvocation(&call, ToolExecutionPolicy::Direct).await {
+                Ok(results) => results.into_iter().last().expect("The invocation pipeline rejects empty results"),
+                Err(error) => Self::failedInvocation(&call.toLegacyTool(), error),
+            };
+            let data = match result.result {
+                ToolResultData::JsonResultData(data) => JsToolCallResultData::Value(data.value),
+                ToolResultData::BinaryResultData(data) => JsToolCallResultData::Binary(data.value),
+                ToolResultData::StringResultData(data) => {
+                    JsToolCallResultData::Value(serde_json::Value::String(data.value))
+                }
+                ToolResultData::BooleanResultData(data) => {
+                    JsToolCallResultData::Value(serde_json::Value::Bool(data.value))
+                }
+                ToolResultData::IntResultData(data) => JsToolCallResultData::Value(
+                    serde_json::Value::Number(serde_json::Number::from(data.value)),
+                ),
+                data => JsToolCallResultData::Value(
+                    serde_json::from_str(&data.toJson())
+                        .expect("ToolResultData JSON conversion must succeed"),
+                ),
+            };
+            JsToolCallResult {
+                success: result.success,
+                data,
+                error: result.error,
+            }
+        })
     }
 
     /// Returns the current host language.
@@ -1261,35 +1381,74 @@ impl JsExecutionHost for AIToolHandler {
             .writeEnvironmentVariable(key, value)
     }
 
-    /// Returns the plugin configuration directory.
+    /// Resolves unscoped native configuration access explicitly within this device.
     fn plugin_config_dir(&self, plugin_id: &str) -> Result<String, String> {
-        let configDir = OperitPaths::pluginConfigDir(plugin_id)?;
-        let configDirPath = configDir
-            .to_str()
-            .ok_or_else(|| "Plugin config directory is not valid UTF-8".to_string())?;
+        let configDir = operit_util::OperitPaths::pluginConfigDir(plugin_id)?;
+        let path = configDir.to_string_lossy().replace('\\', "/");
+        let absolute = RuntimeStorePaths::default().runtime_storage_path(&path);
         self.getContext()
             .fileSystemHost
-            .clone()
-            .ok_or_else(|| "FileSystemHost is required for plugin configuration".to_string())?
-            .makeDirectory(configDirPath, true)
-            .map_err(|error| error.to_string())?;
-        let runtimeRoot = RuntimeStorePaths::default().runtime_dir().to_path_buf();
-        let relativePath = configDir
-            .strip_prefix(runtimeRoot)
-            .map_err(|_| "Plugin configuration directory is outside runtime storage".to_string())?;
-        let relativePath = relativePath
-            .to_str()
-            .ok_or_else(|| "Plugin configuration directory is not valid UTF-8".to_string())?;
-        PathMapper::joinVfsPath("/app/data", relativePath)
+            .as_ref()
+            .ok_or("FileSystemHost is required for plugin configuration")?
+            .makeDirectory(&absolute.to_string_lossy(), true)
+            .map_err(|e| e.to_string())?;
+        let relative = path
+            .strip_prefix("runtime/")
+            .ok_or("Configuration is outside runtime storage")?;
+        PathMapper::joinVfsPath("/app/data", relative)
+    }
+
+    /// Resolves the executing package owner while keeping arbitrary configuration aliases supported.
+    fn scoped_plugin_config_dir(&self, owner_id: &str, plugin_id: &str) -> Result<String, String> {
+        // Host callbacks must not acquire the package manager lock held by script callers.
+        let store = operit_store::ExtensionStore::ExtensionStore::default();
+        let owner = store.packageOwner(owner_id)?;
+        self.createPackageConfigDirectory(&owner.id, plugin_id, &owner.scope)
+    }
+
+    /// Creates registration configuration from its selected scope without querying runtime state.
+    fn registration_plugin_config_dir(
+        &self,
+        owner_id: &str,
+        plugin_id: &str,
+        scope: ToolPkgConfigScope,
+    ) -> Result<String, String> {
+        self.createPackageConfigDirectory(owner_id, plugin_id, scope.as_str())
+    }
+
+    /// Resolves the current package container for its persistent device-local data directory.
+    fn plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String> {
+        let owner = operit_store::ExtensionStore::ExtensionStore::default().packageOwner(owner_id)?;
+        self.createPackageDataDirectory(&owner.id, "device")
+    }
+
+    /// Creates registration-local data using the owner validated by the engine without package manager locks.
+    fn registration_plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String> {
+        self.createPackageDataDirectory(owner_id, "device")
+    }
+
+    /// Resolves the current package's shared data without changing its installation scope.
+    fn plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String> {
+        let owner = operit_store::ExtensionStore::ExtensionStore::default().packageOwner(owner_id)?;
+        self.createPackageDataDirectory(&owner.id, "space")
+    }
+
+    /// Creates shared data for registration without accessing installed package state.
+    fn registration_plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String> {
+        self.createPackageDataDirectory(owner_id, "space")
     }
 
     /// Reads one ToolPkg text resource.
-    fn read_toolpkg_text_resource(&self, target: &str, path: &str) -> Result<String, String> {
-        self.getOrCreatePackageManager()
+    fn read_toolpkg_text_resource(
+        &self,
+        target: &str,
+        path: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .getOrCreatePackageManager()
             .lock()
             .expect("package manager mutex poisoned")
-            .readToolPkgTextResource(target, path, true)
-            .ok_or_else(|| format!("ToolPkg text resource not found: {target}/{path}"))
+            .readToolPkgTextResource(target, path, true))
     }
 
     /// Materializes one ToolPkg binary resource.
@@ -1314,25 +1473,40 @@ impl JsExecutionHost for AIToolHandler {
     /// Dispatches one Compose DSL controller command.
     fn handle_compose_webview_controller_command(
         &self,
-        payload_json: &str,
-    ) -> Result<String, String> {
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         self.getContext()
             .composeDslWebViewHost
             .as_ref()
             .ok_or_else(|| "ComposeDslWebViewHost is not registered".to_string())?
-            .handleControllerCommand(payload_json)
+            .handleControllerCommand(payload)
             .map_err(|error| error.to_string())
     }
 
-    /// Decodes and forwards one Compose DSL file-picker request to the registered host owner.
-    fn open_compose_file_picker(&self, payload_json: &str) -> Result<String, String> {
-        let request = operit_host_api::ComposeDslFilePickerRequest::parse(payload_json)
+    /// Validates and forwards one structured file-picker request to the registered host owner.
+    fn open_compose_file_picker(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let request = operit_host_api::ComposeDslFilePickerRequest::fromValue(payload.clone())
             .map_err(|error| error.to_string())?;
         self.getContext()
             .composeDslWebViewHost
             .as_ref()
             .ok_or_else(|| "ComposeDslWebViewHost is not registered".to_string())?
             .openFilePicker(request)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Validates and forwards an export to the registered host file-save owner.
+    fn save_compose_file(&self, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let request = operit_host_api::ComposeDslFileSaveRequest::fromValue(payload.clone())
+            .map_err(|error| error.to_string())?;
+        self.getContext()
+            .composeDslWebViewHost
+            .as_ref()
+            .ok_or_else(|| "ComposeDslWebViewHost is not registered".to_string())?
+            .saveFile(request)
             .map_err(|error| error.to_string())
     }
 
@@ -1404,55 +1578,194 @@ impl JsExecutionHost for AIToolHandler {
             .ok_or_else(|| {
                 "HostRuntimeTaskSchedulerHost is required for ToolPkg IPC".to_string()
             })?;
-        ChainLogger::info(
-            TOOL_CHAIN,
-            "toolpkg.ipc.submit",
-            &[
-                ("package", packageTarget.clone()),
-                ("channel", channel.clone()),
-                ("targetContext", targetContextKey.clone()),
-                ("targetRuntime", targetRuntime.clone()),
-            ],
-        );
         scheduler
             .scheduleHostRuntimeAsyncTask(
                 "operit-toolpkg-ipc",
                 Box::new(move || {
                     Box::pin(async move {
-                        let startedMs = operit_host_api::TimeUtils::currentTimeMillis();
-                        ChainLogger::info(
-                            TOOL_CHAIN,
-                            "toolpkg.ipc.target_start",
-                            &[
-                                ("package", packageTarget.clone()),
-                                ("channel", channel.clone()),
-                                ("targetContext", targetContextKey.clone()),
-                                ("targetRuntime", targetRuntime.clone()),
-                            ],
-                        );
                         let result =
                             crate::tools::ToolJsRuntime::invokeToolPkgIpc(&toolHandler, request)
                                 .await;
-                        let elapsedMs = operit_host_api::TimeUtils::currentTimeMillis()
-                            .saturating_sub(startedMs);
-                        let outcome = if result.is_ok() { "success" } else { "error" };
-                        ChainLogger::info(
-                            TOOL_CHAIN,
-                            "toolpkg.ipc.target_finish",
-                            &[
-                                ("package", packageTarget),
-                                ("channel", channel),
-                                ("targetContext", targetContextKey),
-                                ("targetRuntime", targetRuntime),
-                                ("elapsedMs", elapsedMs.to_string()),
-                                ("outcome", outcome.to_string()),
-                            ],
-                        );
+                        if let Err(error) = &result {
+                            ChainLogger::error(
+                                TOOL_CHAIN,
+                                "toolpkg.ipc.target_finish",
+                                &[
+                                    ("package", packageTarget),
+                                    ("channel", channel),
+                                    ("targetContext", targetContextKey),
+                                    ("targetRuntime", targetRuntime),
+                                    ("outcome", "error".to_string()),
+                                    ("error", error.clone()),
+                                ],
+                            );
+                        }
                         completion(result);
                     })
                 }),
             )
             .map_err(|error| error.to_string())
+    }
+
+    /// Resolves the package installation and delegates the Binding decision to the Rust route runtime.
+    fn should_route_toolpkg(&self, binding: String, streaming: bool) -> Result<bool, String> {
+        let owner = self.authenticatedExtensionOwner.as_ref().ok_or("Plugin routes require an authenticated engine")?;
+        let record = operit_store::ExtensionStore::ExtensionStore::default().record("package", owner)?;
+        if record.scope == "device" { return Ok(false); }
+        let args = operit_link::toCoreValue(serde_json::json!({ "bindingKey": binding })).map_err(|error| error.to_string())?;
+        let runtime = operit_link::coreRouteRuntime().ok_or("Core route runtime is not installed")?;
+        if streaming {
+            let remote = runtime.shouldRouteWatch("watchToolPkgRoute", &args).map_err(|error| error.message)?;
+            let local = runtime.shouldUseLocalWatchSource("watchToolPkgRoute", &args).map_err(|error| error.message)?;
+            Ok(remote || local)
+        } else { runtime.shouldRoute("callToolPkgRoute", &args).map_err(|error| error.message) }
+    }
+
+    /// Adds the authenticated package identity to the private route argument envelope.
+    fn call_core_route(&self, target: String, method: String, args: Value)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let owner = self.authenticatedExtensionOwner.clone();
+        Box::pin(async move {
+            if target != "callToolPkgRoute" { return Err("Invalid plugin Call entry point".into()); }
+            let args = toolPkgRouteArguments(owner, method, args)?;
+            let runtime = operit_link::coreRouteRuntime().ok_or("Core route runtime is not installed")?;
+            let request = CoreCallRequest::new(operit_link::nextCoreRouteRequestId(&target), operit_link::CORE_INTERNAL_TARGET, target, args);
+            let value = runtime.call(request).await.result.map_err(|error| error.message)?;
+            operit_link::fromCoreValue(value).map_err(|error| error.to_string())
+        })
+    }
+
+    /// Obtains a normal Core embedded stream and opens its existing Watch descriptor.
+    fn open_core_route_watch(&self, target: String, method: String, args: Value)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let owner = self.authenticatedExtensionOwner.clone();
+        let watches = self.coreRouteWatches.clone();
+        Box::pin(async move {
+            if target != "watchToolPkgRoute" { return Err("Invalid plugin Watch entry point".into()); }
+            let args = toolPkgRouteArguments(owner, method, args)?;
+            let runtime = operit_link::coreRouteRuntime().ok_or("Core route runtime is not installed")?;
+            let value = runtime.call(CoreCallRequest::new(operit_link::nextCoreRouteRequestId(&target), operit_link::CORE_INTERNAL_TARGET, target.clone(), args.clone())).await.result.map_err(|error| error.message)?;
+            let descriptor = operit_link::fromCoreValue::<operit_link::CoreStream<Value>>(value).map_err(|error| error.to_string())?.descriptor;
+            let openArgs = operit_rslink_runtime::core_route_embedded_stream_open_args(
+                descriptor.args, "call", target, args,
+            ).map_err(|error| error.message)?;
+            let request = CoreWatchRequest::new(operit_link::nextCoreRouteRequestId("plugin-watch"), descriptor.target, descriptor.propertyName, openArgs);
+            let stream = runtime.watch(request).await.map_err(|error| error.message)?;
+            let id = Uuid::new_v4().to_string();
+            watches.lock().map_err(|_| "Core route watch registry is poisoned")?.insert(id.clone(), Arc::new(CoreRouteWatch {
+                stream: tokio::sync::Mutex::new(stream), closed: tokio::sync::Notify::new(), value: Mutex::new(None),
+            }));
+            Ok(serde_json::json!({ "subscriptionId": id }))
+        })
+    }
+
+    /// Opens one ordered input stream through the existing Core Link Push abstraction.
+    fn open_toolpkg_route_push(&self, method: String, args: Value)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let owner = self.authenticatedExtensionOwner.clone();
+        let pushes = self.coreRoutePushes.clone();
+        Box::pin(async move {
+            let args = toolPkgRouteArguments(owner, method, args)?;
+            let runtime = operit_link::coreRouteRuntime().ok_or("Core route runtime is not installed")?;
+            let request = operit_link::CorePushRequest::new(operit_link::nextCoreRouteRequestId("plugin-push"), operit_link::CORE_INTERNAL_TARGET, "pushToolPkgRoute").withArgs(args);
+            let session = runtime.openPush(request).await.map_err(|error| error.message)?;
+            let id = Uuid::new_v4().to_string();
+            pushes.lock().map_err(|_| "Core Push registry is poisoned")?.insert(id.clone(), Arc::new(CoreRoutePush {
+                session: tokio::sync::Mutex::new(Some(session)), closed: tokio::sync::Notify::new(),
+            }));
+            Ok(serde_json::json!({ "subscriptionId": id }))
+        })
+    }
+
+    /// Sends exactly one item and preserves Link backpressure for the producer.
+    fn send_toolpkg_route_push(&self, id: String, value: Value)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let pushes = self.coreRoutePushes.clone();
+        Box::pin(async move {
+            let push = pushes.lock().map_err(|_| "Core Push registry is poisoned")?.get(&id).cloned().ok_or("Plugin Push session is not active")?;
+            let mut guard = push.session.try_lock().map_err(|_| "Plugin Push already has a pending send")?;
+            let value = operit_link::toCoreValue(value).map_err(|error| error.to_string())?;
+            let session = guard.as_mut().ok_or("Plugin Push session is closed")?;
+            tokio::select! {
+                biased;
+                _ = push.closed.notified() => { guard.take(); Err("Plugin Push was aborted".into()) },
+                sent = session.send(value) => { sent.map_err(|error| error.message)?; Ok(Value::Null) },
+            }
+        })
+    }
+
+    /// Completes or aborts one authenticated producer and removes its owned session.
+    fn close_toolpkg_route_push(&self, id: String, abort: bool)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let pushes = self.coreRoutePushes.clone();
+        Box::pin(async move {
+            let push = pushes.lock().map_err(|_| "Core Push registry is poisoned")?.remove(&id).ok_or("Plugin Push session is not active")?;
+            if abort { push.closed.notify_one(); }
+            let session = push.session.lock().await.take();
+            if !abort { session.ok_or("Plugin Push session is closed")?.close().await.map_err(|error| error.message)?; }
+            Ok(Value::Null)
+        })
+    }
+
+    /// Waits for a route event or explicit cancellation of the authenticated subscription.
+    fn next_core_route_watch(&self, subscription_id: String)
+        -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let watches = self.coreRouteWatches.clone();
+        Box::pin(async move {
+            let watch = watches.lock()
+                .map_err(|_| "Core route watch registry is poisoned".to_string())?
+                .get(&subscription_id).cloned()
+                .ok_or_else(|| "Core route watch subscription is not active".to_string())?;
+            let mut stream = watch.stream.try_lock()
+                .map_err(|_| "Core route watch already has a pending read".to_string())?;
+            let event = tokio::select! {
+                biased;
+                _ = watch.closed.notified() => None,
+                event = stream.recv() => event,
+            };
+            match event {
+                Some(event) => {
+                    let mut previous = watch.value.lock().map_err(|_| "Core route watch value is poisoned")?;
+                    let value = if event.kind == operit_link::CoreEventKind::Delta {
+                        previous.take().ok_or("Core stream received a delta before its initial value")?.intoIncrementalDelta(&event.value)?
+                    } else { event.value };
+                    *previous = Some(value.clone());
+                    let value: Value = operit_link::fromCoreValue(value).map_err(|error| error.to_string())?;
+                    if let Some(error) = value.get("error").and_then(Value::as_str) { return Err(error.into()); }
+                    Ok(value)
+                },
+                None => {
+                    watches.lock().map_err(|_| "Core route watch registry is poisoned".to_string())?
+                        .remove(&subscription_id);
+                    Ok(Value::Null)
+                }
+            }
+        })
+    }
+
+    /// Cancels a pending watch read and releases its route stream.
+    fn close_core_route_watch(&self, subscription_id: String) -> Result<(), String> {
+        let watch = self.coreRouteWatches.lock()
+            .map_err(|_| "Core route watch registry is poisoned".to_string())?
+            .remove(&subscription_id);
+        if let Some(watch) = watch { watch.closed.notify_one(); }
+        Ok(())
+    }
+
+    /// Observes an exact key using the current engine's authenticated storage handles.
+    fn wait_plugin_storage_record(
+        &self,
+        handle: String,
+        collection: String,
+        key: String,
+        after: Option<operit_host_api::PluginStorage::StorageRecordWatchState>,
+    ) -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> {
+        let session = self.storageSession.clone();
+        Box::pin(async move {
+            let entry = session.waitForRecord(handle, collection, key, after).await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(entry).map_err(|error| error.to_string())
+        })
     }
 
     /// Waits for the runtime scheduler to advance JavaScript work on a later host turn.
@@ -1471,61 +1784,33 @@ pub struct FnToolExecutor {
     pub effect: ToolEffect,
 }
 
-/// Enforces the registered name and successful result contract for one built-in executor.
-struct ContractCheckedBuiltinToolExecutor {
-    name: BuiltinToolName,
-    executor: Box<dyn ToolExecutor>,
+/// Executes a proxy whose nested package invocation returns an asynchronous result.
+pub struct AsyncFnToolExecutor {
+    pub invoke: Arc<
+        dyn Fn(AITool, ToolInvocationContext) -> operit_plugin_sdk::javascript::JsExecutionCompletion<ToolResult>
+            + Send
+            + Sync,
+    >,
+    pub validate: Arc<dyn Fn(&AITool) -> ToolValidationResult + Send + Sync>,
+    pub effect: ToolEffect,
 }
 
-impl ToolExecutor for ContractCheckedBuiltinToolExecutor {
-    /// Validates parameters only for the exact built-in name bound during registration.
+impl AsyncToolExecutor for AsyncFnToolExecutor {
+    /// Validates the proxy request before beginning execution.
     fn validateParameters(&self, tool: &AITool) -> ToolValidationResult {
-        assert_eq!(
-            tool.name,
-            self.name.as_str(),
-            "Built-in executor received a different tool name"
-        );
-        self.executor.validateParameters(tool)
+        (self.validate)(tool)
     }
-
-    /// Delegates access classification after verifying the registered built-in name.
-    fn accessSpec(&self, tool: &AITool) -> Result<ToolAccessSpec, String> {
-        assert_eq!(
-            tool.name,
-            self.name.as_str(),
-            "Built-in executor received a different tool name"
-        );
-        self.executor.accessSpec(tool)
+    /// Declares the proxy's access effect.
+    fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
+        Ok(ToolAccessSpec {
+            effect: self.effect,
+            boundary: ToolBoundary::None,
+        })
     }
-
-    /// Verifies every successful result emitted by the wrapped built-in executor.
-    fn invokeAndStream(&mut self, tool: &AITool) -> Vec<ToolResult> {
-        assert_eq!(
-            tool.name,
-            self.name.as_str(),
-            "Built-in executor received a different tool name"
-        );
-        let results = self.executor.invokeAndStream(tool);
-        for result in &results {
-            if self.name != BuiltinToolName::PackageProxy {
-                assert_eq!(
-                    result.toolName,
-                    self.name.as_str(),
-                    "Built-in executor emitted a result for a different tool name"
-                );
-            }
-            assert!(
-                !result.success || self.name.accepts_runtime_result(&result.result),
-                "Built-in executor emitted an incompatible successful result: {}",
-                self.name
-            );
-            assert!(
-                result.success || result.error.is_some(),
-                "Built-in executor emitted a failed result without an error: {}",
-                self.name
-            );
-        }
-        results
+    /// Awaits the nested invocation on its registered asynchronous path.
+    fn invokeAndStreamAsync<'a>(&'a mut self, tool: &'a AITool, context: &'a crate::ToolExecutionManager::ToolInvocationContext) -> ToolInvocationFuture<'a> {
+        let invocation = (self.invoke)(tool.clone(), context.clone());
+        Box::pin(async move { vec![invocation.await] })
     }
 }
 
@@ -1549,6 +1834,583 @@ impl ToolExecutor for FnToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_support::*;
+    use crate::ToolExecutionManager::{PreparedToolInvocation, ToolExposureMode, ToolRuntimeContext};
+    use operit_model::ToolPrompt::SystemToolPromptCategory;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+
+    /// Verifies accepted storage paths resolve to one canonical identity and reject escapes.
+    #[test]
+    fn directory_paths_resolve_to_canonical_owned_storage() {
+        let roots = RuntimeStorePaths::new(std::path::PathBuf::from("storage-root/runtime"), std::path::PathBuf::from("storage-root/workspaces"));
+        for scope_path in ["device/example/cache.sqlite", "space/example/memory.sqlite"] {
+            let relative = format!("plugin_data/{scope_path}");
+            let expected = format!("runtime/{relative}");
+            for path in [format!("/app/data/{relative}"), expected.clone(), format!("storage-root/runtime/{relative}")] {
+                assert_eq!(crate::tools::defaultTool::standard::StandardStorageTools::resolve_plugin_storage_path(&path, &roots).unwrap(), expected);
+            }
+        }
+        for path in ["/app/workspaces/example/cache.sqlite", "/app/data/../../escape.sqlite", "storage-root/other/cache.sqlite", "/app/database/cache.sqlite"] {
+            assert!(crate::tools::defaultTool::standard::StandardStorageTools::resolve_plugin_storage_path(path, &roots).is_err(), "{path}");
+        }
+    }
+
+
+    /// Rejects business dependencies so lifecycle tests cannot accidentally execute application services.
+    struct UnusedRuntimeSupport {
+        package_assets: Option<&'static [RuntimePluginAsset]>,
+    }
+    impl ToolRuntimeSupport for UnusedRuntimeSupport {
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn bindCoreNodeToolRuntime(&self, runtime: Arc<dyn CoreNodeToolRuntime>) -> Result<(), String> { panic!("Unexpected runtime service: bindCoreNodeToolRuntime") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn coreNodeRouteState(&self) -> Result<RuntimeCoreNodeRouteState, String> { panic!("Unexpected runtime service: coreNodeRouteState") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn bindCoreRouteChangeHandler(&self, handler: CoreRouteChangeHandler) -> Result<(), String> { panic!("Unexpected runtime service: bindCoreRouteChangeHandler") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn requestCoreRouteChange<'a>(
+        &'a self,
+        chatId: String,
+        targetNodeId: String,
+        resumeContext: CoreRouteResumeContext,
+    ) -> ToolRuntimeSupportFuture<'a, Result<(), String>> { panic!("Unexpected runtime service: requestCoreRouteChange") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn listModelSummaries(
+        &self,
+    ) -> Result<Vec<operit_plugin_sdk::js_sdk::models::ModelsSummary>, String> { panic!("Unexpected runtime service: listModelSummaries") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn listTtsConfigs(
+        &self,
+    ) -> Result<Vec<operit_plugin_sdk::js_sdk::tts::TtsConfig>, String> { panic!("Unexpected runtime service: listTtsConfigs") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn listThemeConfigs(&self) -> Result<Vec<operit_plugin_sdk::js_sdk::theme::ThemeConfig>, String> { panic!("Unexpected runtime service: listThemeConfigs") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn applyThemeConfig(&self, id: String) -> Result<operit_plugin_sdk::js_sdk::theme::ThemeConfig, String> { panic!("Unexpected runtime service: applyThemeConfig") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn getCurrentTtsConfigId(&self) -> Result<String, String> { panic!("Unexpected runtime service: getCurrentTtsConfigId") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn setCurrentTtsConfigId(&self, id: String) -> Result<String, String> { panic!("Unexpected runtime service: setCurrentTtsConfigId") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn filterToolCatalog<'a>(
+        &'a self,
+        entries: Vec<crate::tools::climode::CliToolModeSupport::HiddenToolCatalogEntry>,
+        context: crate::ToolExecutionManager::ToolRuntimeContext,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<crate::tools::climode::CliToolModeSupport::HiddenToolCatalogEntry>,
+                        String,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > { panic!("Unexpected runtime service: filterToolCatalog") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn readToolSourceCatalog<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        operit_plugin_sdk::js_sdk::catalog::CatalogToolSources,
+                        String,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > { panic!("Unexpected runtime service: readToolSourceCatalog") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn readEnvironmentVariable(&self, key: &str) -> Result<Option<String>, String> { panic!("Unexpected runtime service: readEnvironmentVariable") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn writeEnvironmentVariable(&self, key: &str, value: &str) -> Result<(), String> { panic!("Unexpected runtime service: writeEnvironmentVariable") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn removeEnvironmentVariable(&self, key: &str) -> Result<(), String> { panic!("Unexpected runtime service: removeEnvironmentVariable") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn buildBuiltinAndInternalCategories(
+        &self,
+        useEnglish: bool,
+        hostEnvironment: &HostEnvironmentDescriptor,
+    ) -> Vec<SystemToolPromptCategory> { panic!("Unexpected runtime service: buildBuiltinAndInternalCategories") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn buildBuiltinToolNameSet(
+        &self,
+        useEnglish: bool,
+        hostEnvironment: &HostEnvironmentDescriptor,
+    ) -> BTreeSet<String> { panic!("Unexpected runtime service: buildBuiltinToolNameSet") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn aiVisibleSkillPackages(&self) -> Vec<RuntimeSkillCatalogEntry> { panic!("Unexpected runtime service: aiVisibleSkillPackages") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn cachedMcpTools(&self, serverName: &str) -> Vec<CachedMcpToolInfo> { panic!("Unexpected runtime service: cachedMcpTools") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn builtinPluginAssets(&self) -> &'static [RuntimePluginAsset] {
+        self.package_assets.expect("Unexpected runtime service: builtinPluginAssets")
+    }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn bundledExternalPluginAssets(&self) -> &'static [RuntimePluginAsset] {
+        self.package_assets.expect("Unexpected runtime service: bundledExternalPluginAssets");
+        &[]
+    }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn bundledExternalSkillAssets(&self) -> &'static [RuntimeBundledExternalSkillAsset] { panic!("Unexpected runtime service: bundledExternalSkillAssets") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn isSkillVisibleToAi(&self, skillName: &str) -> bool { panic!("Unexpected runtime service: isSkillVisibleToAi") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn setSkillVisibleToAi(&self, skillName: &str, visible: bool) -> Result<(), String> { panic!("Unexpected runtime service: setSkillVisibleToAi") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn generateMcpPluginDescription<'a>(
+        &'a self,
+        pluginName: &'a str,
+        toolDescriptions: &'a [String],
+    ) -> ToolRuntimeSupportFuture<'a, Result<String, String>> { panic!("Unexpected runtime service: generateMcpPluginDescription") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn startChatServices(&self) -> Result<(), String> { panic!("Unexpected runtime service: startChatServices") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn stopChatServices(&self) -> Result<(), String> { panic!("Unexpected runtime service: stopChatServices") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn isChatProcessing(&self, chatId: &str) -> Result<bool, String> { panic!("Unexpected runtime service: isChatProcessing") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn switchMainChat<'a>(
+        &'a self,
+        chatId: &'a str,
+    ) -> ToolRuntimeSupportFuture<'a, Result<(), String>> { panic!("Unexpected runtime service: switchMainChat") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn createChatRuntime<'a>(
+        &'a self,
+        setAsCurrentChat: bool,
+        sourceChatId: Option<String>,
+        input: Option<serde_json::Value>,
+    ) -> ToolRuntimeSupportFuture<'a, Result<String, String>> { panic!("Unexpected runtime service: createChatRuntime") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn readChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+    ) -> Result<Option<operit_plugin_sdk::js_sdk::core::JsonObject>, String> { panic!("Unexpected runtime service: readChatExtension") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn writeChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+        value: operit_plugin_sdk::js_sdk::core::JsonObject,
+    ) -> Result<operit_plugin_sdk::js_sdk::core::JsonObject, String> { panic!("Unexpected runtime service: writeChatExtension") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn deleteChatExtension(
+        &self,
+        owner: &str,
+        target: &operit_plugin_sdk::js_sdk::chat::ChatExtensionTarget,
+    ) -> Result<bool, String> { panic!("Unexpected runtime service: deleteChatExtension") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn openPluginChatMessage(
+        &self, owner: &str, request: operit_plugin_sdk::js_sdk::chat::ChatSendRequest, observeParts: bool,
+    ) -> Result<operit_plugin_sdk::js_sdk::JsAsyncIterable<operit_plugin_sdk::js_sdk::chat::ChatSendEvent>, String> { panic!("Unexpected runtime service: openPluginChatMessage") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn requestPluginChatCancellation(
+        &self, owner: &str, chatId: &str,
+    ) -> Result<operit_plugin_sdk::js_sdk::chat::ChatCancelResult, String> { panic!("Unexpected runtime service: requestPluginChatCancellation") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn sendChatMessage<'a>(
+        &'a self,
+        request: RuntimeChatSendRequest,
+    ) -> ToolRuntimeSupportFuture<'a, Result<operit_plugin_sdk::js_sdk::results::MessageSendResultData, String>> { panic!("Unexpected runtime service: sendChatMessage") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn callChatModel<'a>(
+        &'a self,
+        request: RuntimeChatCallRequest,
+    ) -> ToolRuntimeSupportFuture<'a, Result<String, String>> { panic!("Unexpected runtime service: callChatModel") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn processFileBindingOperations(
+        &self,
+        originalContent: &str,
+        operations: &[RuntimeStructuredEditOperation],
+    ) -> (String, String) { panic!("Unexpected runtime service: processFileBindingOperations") }
+        /// Rejects unexpected application service access in execution pipeline tests.
+    fn generateUnifiedDiff(&self, oldContent: &str, newContent: &str) -> String { panic!("Unexpected runtime service: generateUnifiedDiff") }
+    }
+
+    struct PipelineFixture {
+        handler: AIToolHandler,
+        root: std::path::PathBuf,
+    }
+    impl PipelineFixture {
+        /// Builds only real registry, permission and storage components with rejecting business services.
+        fn new() -> Self {
+            Self::with_package_assets(None)
+        }
+
+        /// Supplies optional real package sources for registry isolation tests.
+        fn with_package_assets(package_assets: Option<&'static [RuntimePluginAsset]>) -> Self {
+            static SCHEDULER: std::sync::Once = std::sync::Once::new();
+            SCHEDULER.call_once(|| operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(
+                operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new(),
+            )));
+            let root = std::env::temp_dir().join(format!("operit-tool-pipeline-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let storage = Arc::new(operit_host_native_storage::NativeRuntimeStorageHost::new(
+                root.join("runtime"), root.join("workspaces"),
+            ));
+            let permissions = ToolPermissionSystem::newWithStorage(storage.clone());
+            permissions.saveAiPermissionMode(AiPermissionMode::ReadOnly).unwrap();
+            let handler = AIToolHandler {
+                inner: Arc::new(Mutex::new(AIToolHandlerState {
+                    availableTools: BTreeMap::new(), executingTools: BTreeSet::new(),
+                    toolVisibility: BTreeMap::new(), defaultToolsRegistered: true,
+                    context: HostManager { runtimeStorageHost: Some(storage.clone()), runtimeSqliteHost: Some(storage),
+                        fileSystemHost: Some(Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new())),
+                        hostRuntimeTaskSchedulerHost: Some(operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost()),
+                        ..Default::default() },
+                    runtimeDependencies: ToolRuntimeDependencies::new(
+                        Arc::new(UnusedRuntimeSupport { package_assets }),
+                        Arc::new(operit_js_bridge::javascript::JsExecutionProvider::QuickJsExecutionProvider::new()),
+                    ),
+                    hooks: Vec::new(), toolPermissionSystem: permissions, packageManager: None,
+                })),
+                executorAvailability: Arc::new(tokio::sync::Notify::new()),
+                authenticatedExtensionOwner: Some("engine-owner".into()),
+                invocationSnapshot: Default::default(),
+                storageSession: Default::default(), chatObservations: Default::default(), coreRouteWatches: Default::default(), coreRoutePushes: Default::default(), deviceTransportScope: Default::default(),
+            };
+            Self { handler, root }
+        }
+    }
+    impl Drop for PipelineFixture {
+        /// Removes only this test's checked unique temporary storage root.
+        fn drop(&mut self) {
+            assert_eq!(self.root.parent(), Some(std::env::temp_dir().as_path()));
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    /// A broken theme archive stays visible as an issue while unrelated packages and command snapshots work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn broken_theme_does_not_block_healthy_packages_or_registry_commands() {
+        use std::io::{Cursor, Write};
+        use crate::tools::packTool::RuntimePackageManager::RuntimePackageManager;
+        use operit_store::RuntimeStorageHost::{setDefaultRuntimeStorageHost, setDefaultRuntimeSqliteHost};
+
+        fn archive(manifest: serde_json::Value) -> &'static [u8] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+            zip.start_file("data.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"healthy resource").unwrap();
+            Box::leak(zip.finish().unwrap().into_inner().into_boxed_slice())
+        }
+        let assets = Box::leak(vec![
+            RuntimePluginAsset { name: "healthy.toolpkg", sha256: "", bytes: archive(serde_json::json!({
+                "toolpkg_id":"healthy_plugin", "resources":[{"key":"text","path":"data.txt","mime":"text/plain"}]
+            })) },
+            RuntimePluginAsset { name: "broken_theme.toolpkg", sha256: "", bytes: archive(serde_json::json!({
+                "toolpkg_id":"broken_theme", "themes":[{"id":"default","path":"theme.json","preview":"preview.png","files":[
+                    {"path":"theme.json","mediaType":"application/json"}, {"path":"preview.png","mediaType":"image/png"}
+                ]}]
+            })) },
+        ].into_boxed_slice());
+        operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(
+            operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new(),
+        ));
+        let fixture = PipelineFixture::with_package_assets(Some(assets));
+        let context = fixture.handler.getContext();
+        setDefaultRuntimeStorageHost(context.runtimeStorageHost.clone().unwrap());
+        setDefaultRuntimeSqliteHost(context.runtimeSqliteHost.clone().unwrap());
+        let paths = RuntimeStorePaths::new(fixture.root.join("runtime"), fixture.root.join("workspaces"));
+        let mut manager = RuntimePackageManager::new(paths, fixture.handler.clone());
+        assert!(manager.claimInitialPackageRegistryLoad().unwrap());
+        let readiness = manager.packageRegistryReadiness();
+        let waiter = tokio::spawn(async move { readiness.wait_until_ready().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        manager.loadAvailablePackages();
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+        assert!(manager.getAvailablePackages().contains_key("healthy_plugin"));
+        assert!(!manager.getAvailablePackages().contains_key("broken_theme"));
+        let issues = manager.getToolPkgLoadIssues();
+        assert_eq!(issues.len(), 1, "unexpected package failures: {issues:?}");
+        assert!(issues[0].sourcePath.contains("broken_theme.toolpkg"));
+        let manager = Arc::new(Mutex::new(manager));
+        let snapshot = RuntimePackageManager::readySnapshot(manager.clone()).await.unwrap();
+        assert!(snapshot.getAvailablePackages().contains_key("healthy_plugin"));
+        assert_eq!(snapshot.getToolPkgLoadIssues().len(), 1);
+        // Cached failures and subsequent rescans must preserve the same isolation.
+        manager.lock().unwrap().loadAvailablePackages();
+        let snapshot = RuntimePackageManager::readySnapshot(manager).await.unwrap();
+        assert!(snapshot.getAvailablePackages().contains_key("healthy_plugin"));
+        assert_eq!(snapshot.getToolPkgLoadIssues().len(), 1);
+    }
+
+    #[derive(Default)]
+    struct LifecycleProbe { events: Mutex<Vec<&'static str>> }
+    impl LifecycleProbe {
+        /// Records an event while checking that dispatch enters the actual hook scope.
+        fn record(&self, event: &'static str) {
+            let context = ToolExecutionManager::currentToolInvocationContext().unwrap();
+            assert!(context.isHookActive(self.id()));
+            self.events.lock().unwrap().push(event);
+        }
+        /// Takes the complete event sequence for one invocation.
+        fn take(&self) -> Vec<&'static str> { std::mem::take(&mut *self.events.lock().unwrap()) }
+    }
+    impl AIToolHook for LifecycleProbe {
+        /// Identifies the probe so recursive dispatch can be detected.
+        fn id(&self) -> &str { "test.lifecycle" }
+        /// Records request notification in its native scope.
+        fn onToolCallRequested(&self, _: &AITool) { self.record("requested"); }
+        /// Records admission interception in its native scope.
+        fn onToolCallIntercept(&self, _: &AITool) -> AIToolHookDecision { self.record("intercept"); AIToolHookDecision::Allow }
+        /// Records only real AI permission decisions.
+        fn onToolPermissionChecked(&self, _: &AITool, _: bool, _: Option<&str>) { self.record("permission"); }
+        /// Records actual executor start.
+        fn onToolExecutionStarted(&self, _: &AITool) { self.record("started"); }
+        /// Records one returned result.
+        fn onToolExecutionResult(&self, _: &AITool, _: &ToolResult) { self.record("result"); }
+        /// Records pipeline failure.
+        fn onToolExecutionError(&self, _: &AITool, _: &str) { self.record("error"); }
+        /// Records terminal cleanup, including cancellation outside the future's poll scope.
+        fn onToolExecutionFinished(&self, _: &AITool) { self.record("finished"); }
+    }
+
+    #[derive(Default)]
+    struct SharedProbe {
+        accessCalls: AtomicUsize,
+        calls: AtomicUsize,
+        closed: tokio::sync::Notify,
+    }
+    impl SharedToolExecutor for SharedProbe {
+        /// Prepares a probe once and counts access reads only under the native AI policy.
+        fn prepare<'a>(&'a self, request: &'a ToolCall, context: &'a ToolInvocationContext, checkAccess: bool)
+            -> Result<crate::ToolExecutionManager::PreparedToolInvocation<'a>, String> {
+            let access = checkAccess.then(|| {
+                self.accessCalls.fetch_add(1, Ordering::SeqCst);
+                ToolAccessSpec { effect: ToolEffect::WRITE, boundary: ToolBoundary::None }
+            });
+            let invoke = Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match request.parameters.get("op").and_then(Value::as_str) {
+                    Some("next") => self.closed.notified().await,
+                    Some("close") => self.closed.notify_one(),
+                    _ => {}
+                }
+                let value = json!({
+                    "parameters": request.parameters,
+                    "owner": context.host().authenticatedExtensionOwner,
+                    "turn": context.turnSnapshot(),
+                    "hookActive": context.isHookActive("outer-hook"),
+                });
+                vec![ToolResult { toolName: request.name.clone(), success: true,
+                    result: ToolResultData::JsonResultData(operit_plugin_sdk::js_sdk::results::JsonResultData { value }), error: None }]
+            });
+            Ok(crate::ToolExecutionManager::PreparedToolInvocation { access, invoke })
+        }
+    }
+
+    /// Creates the exact structured request consumed by the production JS execution adapter.
+    fn probeRequest(parameters: Value) -> JsToolCallRequest {
+        JsToolCallRequest { tool_type: "default".into(), tool_name: "pipeline_probe".into(),
+            parameters: serde_json::from_value(parameters).unwrap(), device: None }
+    }
+
+    /// Proves AI and JS share lifecycle admission while only AI asks permission for the same executor.
+    #[tokio::test]
+    async fn ai_and_js_share_one_lifecycle_but_not_ai_permissions() {
+        let mut fixture = PipelineFixture::new();
+        let probe = Arc::new(SharedProbe::default());
+        let hooks = Arc::new(LifecycleProbe::default());
+        fixture.handler.registerSharedTool("pipeline_probe".into(), probe.clone(), ToolRegistrationVisibility::PUBLIC);
+        fixture.handler.addToolHook(hooks.clone());
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let approvalsInCallback = approvals.clone();
+        fixture.handler.getToolPermissionSystem().setAsyncPermissionRequester(move |_, _, _| {
+            approvalsInCallback.fetch_add(1, Ordering::SeqCst);
+            async { crate::tools::ToolPermissionSystem::PermissionRequestResult::DENY }
+        });
+        let payload = json!({"null":null,"array":[1,false,{"value":null}],"text":"{\"key\":null}",
+            "integer":{"kind":"integer","value":"9223372036854775807"},"blob":{"kind":"blob","value":[0,255]}});
+        let request = probeRequest(payload.clone());
+        let denied = fixture.handler.executeToolInvocation(&ToolCall { name: request.qualified_tool_name(), parameters: request.parameters.clone() },
+            ToolExecutionPolicy::Ai { exposure: ToolExposureMode::FULL }).await.unwrap();
+        assert!(!denied[0].success);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.take(), ["requested","intercept","permission","result","finished"]);
+        let result = fixture.handler.execute_tool_call(request).await;
+        assert!(result.success, "{:?}", result.error);
+        let JsToolCallResultData::Value(value) = result.data else { panic!("Expected structured JSON") };
+        assert_eq!(value["parameters"], payload);
+        assert_eq!(probe.accessCalls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        assert!(hooks.take().is_empty());
+    }
+
+    /// Proves a pending shared pull cannot occupy the registry and prevent the same executor's close call.
+    #[tokio::test]
+    async fn shared_pull_does_not_block_close_through_the_same_registry() {
+        let mut fixture = PipelineFixture::new();
+        fixture.handler.registerSharedTool("pipeline_probe".into(), Arc::new(SharedProbe::default()), ToolRegistrationVisibility::INTERNAL);
+        let mut next = fixture.handler.execute_tool_call(probeRequest(json!({"op":"next"})));
+        assert!(futures_util::poll!(&mut next).is_pending());
+        let mut close = fixture.handler.execute_tool_call(probeRequest(json!({"op":"close"})));
+        assert!(futures_util::poll!(&mut close).is_ready());
+        assert!(futures_util::poll!(&mut next).is_ready());
+    }
+
+    /// Proves Direct cancellation releases an exclusive executor without dispatching lifecycle hooks.
+    #[tokio::test]
+    async fn direct_cancellation_restores_exclusive_executor_without_hooks() {
+        let mut fixture = PipelineFixture::new();
+        let hooks = Arc::new(LifecycleProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.registerAsyncTool("pipeline_probe".into(), Box::new(AsyncFnToolExecutor {
+            validate: Arc::new(|_| ToolValidationResult { valid:true,errorMessage:String::new() }),
+            invoke: Arc::new(|_, _| Box::pin(std::future::pending())), effect: ToolEffect::WRITE,
+        }));
+        for _ in 0..2 {
+            let mut pending = fixture.handler.execute_tool_call(probeRequest(json!({})));
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            assert!(fixture.handler.inner.lock().unwrap().executingTools.contains("pipeline_probe"));
+            drop(pending);
+            assert!(fixture.handler.inner.lock().unwrap().availableTools.contains_key("pipeline_probe"));
+            assert!(fixture.handler.inner.lock().unwrap().executingTools.is_empty());
+            assert!(hooks.take().is_empty());
+        }
+        assert!(ToolExecutionManager::currentToolInvocationContext().is_none());
+    }
+
+    /// Proves captured hosts retain turn and hook state independently across a scheduler boundary.
+    #[tokio::test]
+    async fn captured_callers_share_executors_without_sharing_identity_or_snapshot() {
+        let mut fixture = PipelineFixture::new();
+        let hooks = Arc::new(LifecycleProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.registerSharedTool("pipeline_probe".into(), Arc::new(SharedProbe::default()), ToolRegistrationVisibility::INTERNAL);
+        let turn = ToolRuntimeContext { callerChatId: Some("chat-A".into()), callerParticipantId:None,
+            workspacePath:None,workspaceFolders:Vec::new(),toolExposureMode:ToolExposureMode::FULL,
+            extensionOwner:"configuration-owner".into(),messageExtension:json!({"saved":null}).as_object().unwrap().clone() };
+        let a = ToolExecutionManager::scopeToolRuntimeContext(turn.clone(), async {
+            ToolInvocationContext::capture(fixture.handler.clone()).withHook("outer-hook")
+                .scope(async { fixture.handler.capture_tool_invocation_host() }).await
+        }).await;
+        let mut b = fixture.handler.clone();
+        b.authenticatedExtensionOwner = Some("engine-B".into());
+        b.storageSession = Default::default();
+        b.chatObservations = Default::default();
+        assert!(Arc::ptr_eq(&fixture.handler.inner, &b.inner));
+        assert!(!Arc::ptr_eq(&fixture.handler.chatObservations, &b.chatObservations));
+        let b = b.capture_tool_invocation_host();
+        assert!(ToolExecutionManager::currentToolInvocationContext().is_none());
+        for (host, owner, expectedTurn, activeHook) in [
+            (a,"engine-owner",serde_json::to_value(&turn).unwrap(),true),
+            (b,"engine-B",Value::Null,false),
+        ] {
+            let result = host.execute_tool_call(probeRequest(json!({"owner":"forged"}))).await;
+            assert!(result.success);
+            let JsToolCallResultData::Value(value) = result.data else { panic!("Expected structured JSON") };
+            assert_eq!(value["owner"],owner);
+            assert_eq!(value["turn"],expectedTurn);
+            assert_eq!(value["hookActive"],activeHook);
+            assert!(hooks.take().is_empty());
+        }
+    }
+
+
+    /// Proves registered typed execution decodes once, defers business work until admission, and preserves null.
+    #[tokio::test]
+    async fn typed_registration_prepares_once_and_never_executes_before_permission() {
+        static DECODED: AtomicUsize = AtomicUsize::new(0);
+        static EXECUTED: AtomicUsize = AtomicUsize::new(0);
+        let mut fixture = PipelineFixture::new();
+        let hooks = Arc::new(LifecycleProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.getToolPermissionSystem().setAsyncPermissionRequester(|_, _, _| async {
+            crate::tools::ToolPermissionSystem::PermissionRequestResult::DENY
+        });
+        struct TypedProbe;
+        impl SharedToolExecutor for TypedProbe {
+            fn prepare<'a>(&'a self, request: &'a ToolCall, _: &'a ToolInvocationContext, checkAccess: bool)
+                -> Result<PreparedToolInvocation<'a>, String> {
+                DECODED.fetch_add(1, Ordering::SeqCst);
+                let args = request.parameters.clone();
+                Ok(crate::tools::ToolInvocation::prepareInvocation(request, checkAccess, ToolEffect::WRITE, async move {
+                    EXECUTED.fetch_add(1, Ordering::SeqCst);
+                    Ok(ToolResultData::JsonResultData(operit_plugin_sdk::js_sdk::results::JsonResultData { value: serde_json::to_value(args).unwrap() }))
+                }))
+            }
+        }
+        fixture.handler.registerSharedTool("typed_probe".into(), Arc::new(TypedProbe), ToolRegistrationVisibility::INTERNAL);
+        let request = ToolCall { name:"typed_probe".into(),parameters:BTreeMap::from([("value".into(),Value::Null)]) };
+        let denied = fixture.handler.executeToolInvocation(&request, ToolExecutionPolicy::Ai { exposure:ToolExposureMode::FULL }).await.unwrap();
+        assert!(!denied[0].success);
+        assert_eq!(DECODED.load(Ordering::SeqCst),1);
+        assert_eq!(EXECUTED.load(Ordering::SeqCst),0);
+        assert_eq!(hooks.take(),["requested","intercept","permission","result","finished"]);
+        let allowed = fixture.handler.executeToolInvocation(&request,ToolExecutionPolicy::Direct).await.unwrap();
+        assert!(allowed[0].success);
+        assert_eq!(DECODED.load(Ordering::SeqCst),2);
+        assert_eq!(EXECUTED.load(Ordering::SeqCst),1);
+        assert!(hooks.take().is_empty());
+    }
+
+    /// Ensures every Tools method selects a built-in checked by the registration build contract.
+    #[test]
+    fn sdk_bindings_use_the_canonical_builtin_catalog() {
+        use operit_plugin_sdk::js_sdk::runtime_bindings::JS_TOOL_BINDINGS;
+        for binding in JS_TOOL_BINDINGS {
+            assert_eq!(BuiltinToolName::from_name(binding.target.as_str()), Some(binding.target));
+        }
+    }
+
+    /// A Direct SDK call reaches the common executor validation without dispatching AI hooks.
+    #[tokio::test]
+    async fn sdk_builtin_tools_use_common_validation_without_ai_hooks() {
+        let mut fixture = PipelineFixture::new();
+        let hooks = Arc::new(LifecycleProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.registerBuiltinTool(BuiltinToolName::TtsSetCurrentConfigId,
+            RegisteredToolExecutor::Shared(Arc::new(crate::tools::defaultTool::standard::StandardTtsTools::TtsToolExecutor { operation: crate::tools::defaultTool::standard::StandardTtsTools::TtsToolOperation::SetCurrentConfigId })),
+            ToolRegistrationVisibility::INTERNAL);
+        let result = fixture.handler.execute_tool_call(JsToolCallRequest {
+            tool_type: "default".into(), tool_name: "tts_set_current_config_id".into(),
+            parameters: BTreeMap::from([("id".into(), json!({"nested":[null,true]}))]),
+            device: None,
+        }).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid tool invocation"));
+        assert!(hooks.take().is_empty());
+        assert!(fixture.handler.hasToolExecutor("tts_set_current_config_id"));
+    }
+
+    /// Proves CLI aliases resolve once, with hooks and permission admission restricted to AI calls.
+    #[tokio::test]
+    async fn proxy_resolution_does_not_execute_a_second_lifecycle() {
+        let mut fixture = PipelineFixture::new();
+        let hooks = Arc::new(LifecycleProbe::default());
+        let probe = Arc::new(SharedProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.registerSharedTool("pipeline_probe".into(),probe.clone(),ToolRegistrationVisibility::PUBLIC);
+        fixture.handler.getToolPermissionSystem().setAsyncPermissionRequester(|_, _, _| async {
+            crate::tools::ToolPermissionSystem::PermissionRequestResult::DENY
+        });
+        let turn = ToolRuntimeContext { callerChatId:Some("chat".into()),callerParticipantId:None,
+            workspacePath:None,workspaceFolders:Vec::new(),toolExposureMode:ToolExposureMode::CLI,
+            extensionOwner:"config-owner".into(),messageExtension:Default::default() };
+        let request = ToolCall { name:"proxy".into(),parameters:BTreeMap::from([
+            ("tool_name".into(),Value::String("pipeline_probe".into())),("params".into(),json!({"nullable":null}))
+        ]) };
+        let denied = ToolExecutionManager::scopeToolRuntimeContext(turn.clone(), fixture.handler.executeToolInvocation(
+            &request,ToolExecutionPolicy::Ai { exposure:ToolExposureMode::CLI })).await.unwrap();
+        assert!(!denied[0].success);
+        assert_eq!(denied[0].toolName,"pipeline_probe");
+        assert_eq!(hooks.take(),["requested","intercept","permission","result","finished"]);
+        assert_eq!(probe.calls.load(Ordering::SeqCst),0);
+        let allowed = ToolExecutionManager::scopeToolRuntimeContext(turn, fixture.handler.executeToolInvocation(&request,ToolExecutionPolicy::Direct)).await.unwrap();
+        assert!(allowed[0].success);
+        assert!(hooks.take().is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst),1);
+        assert_eq!(probe.accessCalls.load(Ordering::SeqCst),1);
+    }
 
     /// Builds a file-path access declaration for workspace boundary tests.
     fn filePathAccessSpec(effect: ToolEffect) -> ToolAccessSpec {
@@ -1576,6 +2438,7 @@ mod tests {
             &AiPermissionMode::Full,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
 
         assert_eq!(result, Ok(()));
@@ -1588,11 +2451,13 @@ mod tests {
             &AiPermissionMode::ReadOnly,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
         let workspaceWriteResult = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::WorkspaceWrite,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
 
         assert_eq!(readOnlyResult, Ok(()));
@@ -1606,6 +2471,7 @@ mod tests {
             &AiPermissionMode::WorkspaceWrite,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::WRITE),
+            None,
         );
 
         assert_eq!(

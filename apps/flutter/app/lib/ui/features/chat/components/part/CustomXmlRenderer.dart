@@ -17,6 +17,7 @@ import '../../../../common/markdown/StreamMarkdownRenderer.dart';
 import '../../../../common/markdown/XmlRenderPluginRegistry.dart';
 import '../../../../../util/ChatMarkupRegex.dart';
 import '../../../packages/screens/ToolPkgUiLauncherScreen.dart';
+import '../ChatRuntimeScope.dart';
 import 'DetailsTagRenderer.dart';
 import 'DialogComponents.dart';
 import 'FileDiffDisplay.dart';
@@ -71,11 +72,18 @@ class CustomXmlRenderer extends StatelessWidget {
       return pluginRender;
     }
     return _ToolPkgXmlRenderBridge(
+      key: ValueKey((
+        parsed.tagName,
+        ChatRuntimeScope.maybeOf(context),
+        ChatRuntimeScope.maybeChatIdOf(context),
+      )),
       tagName: parsed.tagName,
       xmlContent: xmlContent,
       isStreaming: isStreaming,
       textColor: textColor,
       splitMarkdownContent: splitMarkdownContent,
+      chatCore: ChatRuntimeScope.maybeOf(context),
+      chatId: ChatRuntimeScope.maybeChatIdOf(context),
       defaultBuilder: (context) => _buildDefaultXml(context, parsed),
     );
   }
@@ -184,12 +192,15 @@ class CustomXmlRenderer extends StatelessWidget {
 
 class _ToolPkgXmlRenderBridge extends StatefulWidget {
   const _ToolPkgXmlRenderBridge({
+    super.key,
     required this.tagName,
     required this.xmlContent,
     required this.isStreaming,
     required this.textColor,
     required this.defaultBuilder,
     required this.splitMarkdownContent,
+    required this.chatCore,
+    required this.chatId,
   });
 
   final String tagName;
@@ -198,6 +209,8 @@ class _ToolPkgXmlRenderBridge extends StatefulWidget {
   final Color textColor;
   final WidgetBuilder defaultBuilder;
   final MarkdownContentSplitter splitMarkdownContent;
+  final GeneratedChatRuntimeHolderMainCoreProxy? chatCore;
+  final String? chatId;
 
   @override
   State<_ToolPkgXmlRenderBridge> createState() =>
@@ -209,22 +222,68 @@ class _ToolPkgXmlRenderBridgeState extends State<_ToolPkgXmlRenderBridge> {
     ProxyCoreRuntimeBridge(),
   );
 
-  late Future<Object?> _renderFuture = _loadRender();
+  late Future<Object?> _renderFuture;
+  StreamSubscription<int>? _revisionSubscription;
+  int _subscriptionGeneration = 0;
+  int _renderGeneration = 0;
 
+  /// Loads the XML once and observes hooks even when none currently handle this tag.
+  @override
+  void initState() {
+    super.initState();
+    _renderFuture = _loadRender();
+    _subscribeToRegistry();
+  }
+
+  /// Follows the current runtime and reloads changed XML inputs without replacing its host.
   @override
   void didUpdateWidget(covariant _ToolPkgXmlRenderBridge oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.chatCore != widget.chatCore) {
+      _subscribeToRegistry();
+      _renderGeneration++;
+    }
     if (oldWidget.tagName != widget.tagName ||
-        oldWidget.xmlContent != widget.xmlContent) {
+        oldWidget.xmlContent != widget.xmlContent ||
+        oldWidget.chatCore != widget.chatCore ||
+        oldWidget.chatId != widget.chatId) {
       _renderFuture = _loadRender();
     }
   }
 
+  /// Invalidates cached XML output only after the runtime publishes committed hooks.
+  void _subscribeToRegistry() {
+    final generation = ++_subscriptionGeneration;
+    unawaited(_revisionSubscription?.cancel());
+    _revisionSubscription = (widget.chatCore ?? _clients.chatRuntimeHolderMain)
+        .xmlRenderRegistryRevisionFlow()
+        .distinct()
+        .listen((revision) {
+          if (!mounted || generation != _subscriptionGeneration) {
+            return;
+          }
+          setState(() {
+            // A registry change invalidates DSL hosts as well as previously unhandled XML.
+            _renderGeneration++;
+            _renderFuture = _loadRender();
+          });
+        });
+  }
+
+  /// Releases the revision watch when the message XML node leaves the widget tree.
+  @override
+  void dispose() {
+    _subscriptionGeneration++;
+    unawaited(_revisionSubscription?.cancel());
+    super.dispose();
+  }
+
   /// Requests ToolPkg XML render output from the active Core runtime.
   Future<Object?> _loadRender() {
-    return _clients.chatRuntimeHolderMain.renderToolPkgXml(
+    return (widget.chatCore ?? _clients.chatRuntimeHolderMain).renderToolPkgXml(
       tagName: widget.tagName,
       xmlContent: widget.xmlContent,
+      chatId: widget.chatId,
     );
   }
 
@@ -232,11 +291,12 @@ class _ToolPkgXmlRenderBridgeState extends State<_ToolPkgXmlRenderBridge> {
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<Object?>(
+      key: ValueKey(_renderGeneration),
       future: _renderFuture,
       builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done ||
-            snapshot.hasError ||
-            snapshot.data == null) {
+        // A new XML chunk must not unmount the resolved DSL host while its
+        // replacement is pending. FutureBuilder retains the previous data.
+        if (snapshot.hasError || snapshot.data == null) {
           return widget.defaultBuilder(context);
         }
         final data = snapshot.data;
@@ -261,16 +321,20 @@ class _ToolPkgXmlRenderBridgeState extends State<_ToolPkgXmlRenderBridge> {
           final containerPackageName = data['containerPackageName'];
           final screen = data['screen'];
           if (containerPackageName is String && screen is String) {
-            return _ToolPkgXmlComposeDslRender(
-              clients: _clients,
-              containerPackageName: containerPackageName,
-              screen: screen,
-              initialState: _requiredJsonObject(data['state'], 'state'),
-              initialMemo: _requiredJsonObject(data['memo'], 'memo'),
-              initialModuleSpec: data['moduleSpec'] == null
-                  ? null
-                  : _requiredJsonObject(data['moduleSpec'], 'moduleSpec'),
-              defaultBuilder: widget.defaultBuilder,
+            final providedModuleSpec = data['moduleSpec'] == null
+                ? null
+                : _requiredJsonObject(data['moduleSpec'], 'moduleSpec');
+            return SelectionContainer.disabled(
+              child: _ToolPkgXmlComposeDslRender(
+                key: ValueKey((containerPackageName, screen)),
+                clients: _clients,
+                containerPackageName: containerPackageName,
+                screen: screen,
+                initialState: _requiredJsonObject(data['state'], 'state'),
+                initialMemo: _requiredJsonObject(data['memo'], 'memo'),
+                initialModuleSpec: providedModuleSpec,
+                defaultBuilder: widget.defaultBuilder,
+              ),
             );
           }
         }
@@ -282,6 +346,7 @@ class _ToolPkgXmlRenderBridgeState extends State<_ToolPkgXmlRenderBridge> {
 
 class _ToolPkgXmlComposeDslRender extends StatefulWidget {
   const _ToolPkgXmlComposeDslRender({
+    super.key,
     required this.clients,
     required this.containerPackageName,
     required this.screen,
@@ -305,9 +370,14 @@ class _ToolPkgXmlComposeDslRender extends StatefulWidget {
 }
 
 class _ToolPkgXmlComposeDslRenderState
-    extends State<_ToolPkgXmlComposeDslRender> {
+    extends State<_ToolPkgXmlComposeDslRender>
+    with AutomaticKeepAliveClientMixin<_ToolPkgXmlComposeDslRender> {
   late Future<core_proxy.ToolPkgContainerRuntime?> _pluginFuture =
       _loadPlugin();
+
+  /// Keeps the resolved DSL host alive while its chat list item is off-screen.
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void didUpdateWidget(covariant _ToolPkgXmlComposeDslRender oldWidget) {
@@ -329,6 +399,16 @@ class _ToolPkgXmlComposeDslRenderState
   /// Builds an embedded Compose DSL surface for XML-render hook output.
   @override
   Widget build(BuildContext context) {
+    super.build(context);
+    final moduleSpec =
+        widget.initialModuleSpec ??
+        <String, Object?>{
+          'id': 'xml_render',
+          'runtime': 'compose_dsl',
+          'screen': widget.screen,
+          'title': widget.screen,
+          'toolPkgId': widget.containerPackageName,
+        };
     return FutureBuilder<core_proxy.ToolPkgContainerRuntime?>(
       future: _pluginFuture,
       builder: (context, snapshot) {
@@ -341,11 +421,12 @@ class _ToolPkgXmlComposeDslRenderState
         return ToolPkgUiLauncherScreen(
           clients: widget.clients,
           plugin: plugin,
-          initialRouteId: widget.screen,
+          initialRouteId: 'xml_render',
+          embeddedScreenPath: widget.screen,
           showLauncherChrome: false,
           initialState: widget.initialState,
           initialMemo: widget.initialMemo,
-          initialModuleSpec: widget.initialModuleSpec,
+          initialModuleSpec: moduleSpec,
         );
       },
     );

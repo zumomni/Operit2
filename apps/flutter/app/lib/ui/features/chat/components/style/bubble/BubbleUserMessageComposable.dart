@@ -5,7 +5,7 @@ import 'package:operit2/l10n/generated/app_localizations.dart';
 
 import '../../../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../../../util/ChatMarkupRegex.dart';
-import '../../../../../common/CharacterAvatar.dart';
+import '../../../../../common/ChatAvatarImage.dart';
 import '../../../../../theme/OperitTheme.dart';
 import '../../../../../theme/OperitThemeAssets.dart';
 import '../../attachments/AttachmentViewerDialog.dart';
@@ -76,9 +76,7 @@ class _BubbleUserMessageComposableState
       isUser: true,
     );
     final effectiveBubbleImageStyle =
-        isHiddenPlaceholder || widget.transparentSurface
-        ? null
-        : widget.bubbleImageStyle;
+        isHiddenPlaceholder ? null : widget.bubbleImageStyle;
     final bubbleShape = widget.bubbleRoundedCornersEnabled
         ? const BorderRadius.all(Radius.circular(16))
         : BorderRadius.zero;
@@ -603,7 +601,7 @@ class _MessageAvatar extends StatelessWidget {
       ),
       clipBehavior: Clip.antiAlias,
       child: isProxySender
-          ? CharacterAvatarImage(avatarUri: avatarImagePath, fit: BoxFit.cover)
+          ? ChatAvatarImage(avatarUri: avatarImagePath, fit: BoxFit.cover)
           : avatarImagePath != null && avatarImagePath.isNotEmpty
           ? ThemeAssetImage(storagePath: avatarImagePath, fit: BoxFit.cover)
           : Icon(icon, color: tint, size: 22),
@@ -669,8 +667,9 @@ class _AttachmentMatch {
   final RegExpMatch match;
 }
 
+/// Extracts message decorations and trims the remaining display text.
 MessageParseResult parseMessageContent(String content) {
-  var cleanedContent = content.replaceAll(ChatMarkupRegex.memoryTag, '').trim();
+  var cleanedContent = content.trim();
 
   final proxySenderMatch = ChatMarkupRegex.proxySenderTag.firstMatch(
     cleanedContent,
@@ -695,7 +694,8 @@ MessageParseResult parseMessageContent(String content) {
           mediaLink.type == 'file')
         AttachmentData(
           id: mediaLink.id,
-          filename: mediaLink.fileName ??
+          filename:
+              mediaLink.fileName ??
               (mediaLink.type == 'audio' ? 'Audio' : 'Video'),
           type: switch (mediaLink.type) {
             'audio' => 'audio/*',
@@ -805,9 +805,9 @@ MessageParseResult parseMessageContent(String content) {
   for (var index = 0; index < matches.length; index++) {
     final match = matches[index].match;
     final startIndex = match.start;
-    final id = match.group(1)!;
-    final filename = match.group(2)!;
-    final type = match.group(3)!;
+    final id = decodeChatXmlText(match.group(1)!);
+    final filename = decodeChatXmlText(match.group(2)!);
+    final type = decodeChatXmlText(match.group(3)!);
     final size = _parseLong(match.group(4));
     final attachmentContent = decodeChatXmlText(match.group(5) ?? '');
     final attachment = AttachmentData(
@@ -846,7 +846,7 @@ MessageParseResult parseMessageContent(String content) {
   }
 
   return MessageParseResult(
-    processedText: messageText.toString(),
+    processedText: messageText.toString().trim(),
     trailingAttachments: <AttachmentData>[
       ...workspaceAttachments,
       ...mediaLinkAttachments,

@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:webview_all_linux/webview_all_linux.dart';
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
 import 'package:operit2/ui/features/packages/screens/ToolPkgComposeDslWebView.dart';
+import 'package:operit2/ui/features/packages/screens/ToolPkgUiLauncherScreen.dart';
 
 /// Verifies native preference delivery and browser-preserving theme updates.
 void main() {
@@ -55,16 +56,150 @@ void main() {
       expect(events, ['theme:dark']);
       ready.complete();
       await tester.pumpAndSettle();
-      expect(events, ['theme:dark', 'load:https://example.com']);
+      expect(events, [
+        'theme:dark',
+        'document-start',
+        'load:https://example.com',
+      ]);
       await tester.pumpWidget(screen(Brightness.light));
       await tester.pumpAndSettle();
-      expect(events, ['theme:dark', 'load:https://example.com', 'theme:light']);
+      expect(events, [
+        'theme:dark',
+        'document-start',
+        'load:https://example.com',
+        'theme:light',
+      ]);
       await tester.pumpWidget(screen(Brightness.light));
       await tester.pumpAndSettle();
-      expect(events.length, 3);
+      expect(events.length, 4);
       await tester.pumpWidget(const SizedBox());
+      await tester.pumpAndSettle();
+      expect(events.last, 'remove-document-start');
     },
   );
+  testWidgets('navigation awaits channel and native script registration', (
+    tester,
+  ) async {
+    final platform = _ThemeTestPlatform();
+    WebViewPlatform.instance = platform;
+    final channelReady = Completer<void>();
+    final scriptReady = Completer<void>();
+    platform.controller.channelRegistration = channelReady.future;
+    platform.controller.scriptRegistration = scriptReady.future;
+    const themeChannel = MethodChannel('operit/webview_theme');
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      themeChannel,
+      (_) async => null,
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        themeChannel,
+        null,
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ComposeDslWebView(
+          props: const {'url': 'https://example.com'},
+          onAction: (id, [payload]) async => null,
+          hostContext: null,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(platform.controller.events, isEmpty);
+    channelReady.complete();
+    await tester.pumpAndSettle();
+    expect(platform.controller.events, ['document-start']);
+    scriptReady.complete();
+    await tester.pumpAndSettle();
+    expect(platform.controller.events, [
+      'document-start',
+      'load:https://example.com',
+    ]);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    expect(platform.controller.events.last, 'remove-document-start');
+  });
+  testWidgets('DSL action errors do not dispose or reload the mounted WebView', (
+    tester,
+  ) async {
+    final platform = _ThemeTestPlatform();
+    WebViewPlatform.instance = platform;
+    final actions = <Object?>[];
+    const channel = MethodChannel('operit/webview_theme');
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      channel,
+      (_) async => null,
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      ),
+    );
+    final host = ComposeDslWebViewHostContext(
+      packageName: 'regression',
+      routeInstanceId: 'page',
+      executionContextKey: 'webview-error',
+      dispatchAction: (id, [payload]) async {
+        actions.add(payload);
+        return null;
+      },
+      runtimeOptionsProvider: () => {},
+    );
+    const tree = <String, Object?>{
+      'type': 'WebView',
+      'props': {
+        'url': 'https://example.com',
+        'onLifecycleEvent': {'__actionId': 'lifecycle'},
+      },
+      'children': [],
+    };
+
+    /// Drives actual error presentation without replacing the production WebView widget.
+    Future<void> show(String? error) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: buildComposeDslHostForTest(
+              node: tree,
+              hostContext: host,
+              error: error,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    await show(null);
+    final browser = tester.element(find.byType(ComposeDslWebView));
+    actions.clear();
+    for (var index = 0; index < 3; index++) {
+      await show('compose action not found: __action_3');
+      expect(find.text('compose action not found: __action_3'), findsOneWidget);
+      expect(tester.element(find.byType(ComposeDslWebView)), same(browser));
+      await show(null);
+      expect(tester.element(find.byType(ComposeDslWebView)), same(browser));
+    }
+    expect(actions, isEmpty);
+    expect(
+      platform.controller.events
+          .where((event) => event == 'load:https://example.com')
+          .length,
+      1,
+    );
+    expect(
+      platform.controller.events,
+      isNot(contains('remove-document-start')),
+    );
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    expect(platform.controller.events.last, 'remove-document-start');
+    expect(actions, isNotEmpty);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 class _ThemeTestPlatform extends WebViewPlatform {
@@ -103,6 +238,8 @@ class _ThemeTestController extends PlatformWebViewController {
   _ThemeTestController()
     : super.implementation(const PlatformWebViewControllerCreationParams());
   List<String> events = [];
+  Future<void> channelRegistration = Future<void>.value();
+  Future<void> scriptRegistration = Future<void>.value();
 
   /// Records navigation for detecting unexpected page reloads.
   @override
@@ -113,6 +250,27 @@ class _ThemeTestController extends PlatformWebViewController {
   /// Accepts the blank page used during disposal.
   @override
   Future<void> loadHtmlString(String html, {String? baseUrl}) async {}
+
+  /// Emulates native registration before the first page is permitted to load.
+  @override
+  Future<String> addUserScript(WebViewUserScript userScript) async {
+    expect(
+      userScript.injectionTime,
+      WebViewUserScriptInjectionTime.documentStart,
+    );
+    expect(userScript.forMainFrameOnly, false);
+    expect(userScript.source, contains('var initialInterfaces'));
+    events.add('document-start');
+    await scriptRegistration;
+    return 'test-document-start-script';
+  }
+
+  /// Verifies ownership-based cleanup of the native document-start handle.
+  @override
+  Future<void> removeUserScript(String identifier) async {
+    expect(identifier, 'test-document-start-script');
+    events.add('remove-document-start');
+  }
 
   /// Accepts page bridge injection.
   @override
@@ -134,7 +292,8 @@ class _ThemeTestController extends PlatformWebViewController {
 
   /// Accepts the page bridge channel.
   @override
-  Future<void> addJavaScriptChannel(JavaScriptChannelParams params) async {}
+  Future<void> addJavaScriptChannel(JavaScriptChannelParams params) =>
+      channelRegistration;
 
   /// Accepts console observation.
   @override

@@ -106,20 +106,15 @@ impl Esp32Board {
         self.robotFaceHost.paintTerminal()
     }
 
-    /// Paints one document-driven UI-library screen on the board display.
-    pub fn paintScreen(&self, screen: &operit_ui::Screen) -> HostResult<()> {
-        self.robotFaceHost.paintScreen(screen)
-    }
-
-    /// Flushes an LVGL RGB565 region to the physical display.
-    pub fn flushLvgl(&self, rect: FaceRect, pixels: &[u8]) -> HostResult<()> {
+    /// Flushes a self-drawn UI RGB565 region to the physical display.
+    pub fn flushUi(&self, rect: FaceRect, pixels: &[u8]) -> HostResult<()> {
         self.robotFaceHost.flushRgb565(rect, pixels)
     }
 
-    /// Switches the physical panel to LVGL ownership after board startup.
-    pub fn activateLvgl(&self) {
-        self.screenMirror.activateLvgl();
-        self.robotFaceHost.activateLvgl();
+    /// Switches the physical panel to self-drawn UI ownership after board startup.
+    pub fn activateUi(&self) {
+        self.screenMirror.activateUi();
+        self.robotFaceHost.activateUi();
     }
 
     /// Reads one calibrated touch sample, if the panel is pressed.

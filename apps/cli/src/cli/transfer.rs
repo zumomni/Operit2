@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-use operit_model::ImportStrategy;
 use operit_runtime::services::ArchiveTransferManager::StagedArchive;
 use operit_util::stream::ReverseStream::ReverseStream;
 use tokio::io::AsyncReadExt;
@@ -23,12 +22,10 @@ pub(super) async fn run_export_command(core: &mut CliCore, args: &[String]) -> R
                 .get(1)
                 .ok_or_else(|| "usage: operit2 export memory <path> <owner-key>".to_string())?;
             let ownerKey = memory_owner_key_arg_for_transfer(args.get(2))?;
-            let content = core
-                .repository_memory_repository(&ownerKey)
-                .exportMemoriesToJson()
-                .await
-                .map_err(|error| error.to_string())?;
-            write_text(path, &content)?;
+            let result = run_memory_plugin_command(core, &ownerKey, &["export".to_string()]).await?;
+            let content = result.get("content").and_then(serde_json::Value::as_str)
+                .ok_or("Memory plugin export result is missing content")?;
+            write_text(path, content)?;
             if cli_json_mode() {
                 emit_cli_json(serde_json::json!({ "path": Path::new(path), "format": "memory" }));
             } else {
@@ -73,21 +70,16 @@ pub(super) async fn run_import_command(core: &mut CliCore, args: &[String]) -> R
                 "usage: operit2 import memory <path> <SKIP|UPDATE|CREATE_NEW> <owner-key>"
                     .to_string()
             })?;
-            let strategy = parse_import_strategy(args.get(2))?;
+            let strategy = args.get(2).ok_or("Memory import strategy is required")?.clone();
             let ownerKey = memory_owner_key_arg_for_transfer(args.get(3))?;
             let content = read_text(path)?;
-            let result = core
-                .repository_memory_repository(&ownerKey)
-                .importMemoriesFromJson(content, strategy)
-                .await
-                .map_err(|error| error.to_string())?;
+            let result = run_memory_plugin_command(core, &ownerKey, &["import".to_string(), strategy, content]).await?;
+            let report = result.get("result").ok_or("Memory plugin import result is missing its report")?;
             if cli_json_mode() {
-                emit_cli_json(serde_json::json!(result));
+                emit_cli_json(report.clone());
             } else {
-                println!("New memories: {}", result.newMemories);
-                println!("Updated memories: {}", result.updatedMemories);
-                println!("Skipped memories: {}", result.skippedMemories);
-                println!("New links: {}", result.newLinks);
+                println!("Imported memory backup for {}", ownerKey);
+                println!("{}", serde_json::to_string_pretty(report).map_err(|error| error.to_string())?);
             }
             Ok(())
         }
@@ -197,24 +189,41 @@ pub(super) async fn run_backup_command(core: &mut CliCore, args: &[String]) -> R
     }
 }
 
-/// Exports a raw runtime snapshot to a local archive file.
+/// Copies a host-backed snapshot to the requested file without loading its bytes into memory.
 async fn export_snapshot(core: &mut CliCore, path: Option<&String>) -> Result<(), String> {
     let path = path.ok_or_else(|| "usage: operit2 export snapshot <path>".to_string())?;
-    let bytes = core
+    let file = core
         .services_snapshot_import_manager()
         .exportRawSnapshot()
         .await
         .map_err(|error| error.to_string())?;
-    write_bytes(path, &bytes)?;
+    let result = (|| {
+        if let Some(parent) = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let written = fs::copy(&file.fileReference, path).map_err(|error| error.to_string())?;
+        if i64::try_from(written).map_err(|error| error.to_string())? != file.archive.byteLength {
+            return Err("Saved snapshot length does not match the exported archive".to_string());
+        }
+        Ok(())
+    })();
+    core.services_archive_transfer_manager()
+        .discardArchiveUpload(file.archive.archiveId)
+        .await
+        .map_err(|error| error.to_string())?;
+    result?;
     if cli_json_mode() {
         emit_cli_json(
-            serde_json::json!({ "path": Path::new(path), "bytes": bytes.len(), "format": "snapshot" }),
+            serde_json::json!({ "path": Path::new(path), "bytes": file.archive.byteLength, "format": "snapshot" }),
         );
     } else {
         println!(
             "Exported snapshot to {} ({} bytes)",
             Path::new(path).display(),
-            bytes.len()
+            file.archive.byteLength
         );
     }
     Ok(())
@@ -362,6 +371,7 @@ async fn finishStagedArchive<T>(
     }
 }
 
+/// Requires the explicit memory scope passed to a file transfer.
 fn memory_owner_key_arg_for_transfer(value: Option<&String>) -> Result<String, String> {
     value
         .map(|ownerKey| ownerKey.trim().to_string())
@@ -369,20 +379,23 @@ fn memory_owner_key_arg_for_transfer(value: Option<&String>) -> Result<String, S
         .ok_or_else(|| "owner-key is required, use character:<id> or shared:<id>".to_string())
 }
 
-fn parse_import_strategy(value: Option<&String>) -> Result<ImportStrategy, String> {
-    match value
-        .ok_or_else(|| {
-            "usage: operit2 import memory <path> <SKIP|UPDATE|CREATE_NEW> <owner-key>".to_string()
-        })?
-        .as_str()
-    {
-        "SKIP" => Ok(ImportStrategy::SKIP),
-        "UPDATE" => Ok(ImportStrategy::UPDATE),
-        "CREATE_NEW" => Ok(ImportStrategy::CREATE_NEW),
-        other => Err(format!(
-            "invalid import strategy: {other}; expected SKIP | UPDATE | CREATE_NEW"
-        )),
+/// Delegates memory file transfers to the registered plugin command and preserves explicit failures.
+async fn run_memory_plugin_command(core: &mut CliCore, ownerKey: &str, operation: &[String]) -> Result<serde_json::Value, String> {
+    let (namespace, ownerId) = ownerKey.split_once(':').ok_or("Memory owner must be character:<id> or shared:<id>")?;
+    if !matches!(namespace, "character" | "shared") || ownerId.trim().is_empty() {
+        return Err("Memory owner must be character:<id> or shared:<id>".to_string());
     }
+    let mut args = vec!["memory".to_string(), namespace.to_string(), ownerId.to_string()];
+    args.extend_from_slice(operation);
+    args.push("--json".to_string());
+    let output = core.runCoreCommand(&args).await.map_err(core_command_error_message)?;
+    let result: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| error.to_string())?;
+    if result.get("ok") == Some(&serde_json::Value::Bool(false)) {
+        let message = result.get("error").and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str).ok_or("Plugin command failure is missing its message")?;
+        return Err(message.to_string());
+    }
+    Ok(result)
 }
 
 fn read_text(path: &str) -> Result<String, String> {
@@ -390,15 +403,6 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn write_text(path: &str, content: &str) -> Result<(), String> {
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-    }
-    fs::write(path, content).map_err(|error| error.to_string())
-}
-
-fn write_bytes(path: &str, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;

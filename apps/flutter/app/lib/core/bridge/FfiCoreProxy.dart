@@ -26,6 +26,11 @@ class FfiCoreProxy extends CoreProxy {
   CoreByteTransport get _transport =>
       _providedTransport ?? FfiCoreTransport.instance;
 
+  /// Calls the independent storage-maintenance ABI through the platform owner.
+  @override
+  Future<Object?> dataRescue(Map<String, Object?> request) =>
+      _host.dataRescue(request);
+
   /// Reads default roots through the platform host.
   @override
   Future<Map<Object?, Object?>> runtimeStorageDefaults() =>
@@ -142,7 +147,7 @@ class _FfiPushSink implements CorePushSink {
       decodeNativeCoreVoidResult(
         await _transport.request(
           CoreTransportOperation.pushClose,
-          Uint8List.fromList(utf8.encode(_id)),
+          CoreLinkMessage.bytes(utf8.encode(_id)),
         ),
       );
     }

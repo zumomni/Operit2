@@ -15,6 +15,7 @@ import { WebSettings } from './WebSettingsHostApiImpl';
 import { WebViewClient } from './WebViewClientHostApiImpl';
 import { WebViewFlutterApiImpl } from './WebViewFlutterApiImpl';
 import { WebViewSettings } from './WebViewSettings';
+import { buildPageZoomScript } from './PageZoomScript';
 
 const TAG: string = 'WebViewPlatformView';
 
@@ -75,11 +76,27 @@ class OhosSslAuthHandler implements SslAuthHandler {
   }
 }
 
+/** Completes registration when the ArkUI Web component binds its script host. */
+class DocumentStartScriptHostWaiter {
+  /** Retains promise callbacks until the platform component attaches. */
+  constructor(
+    readonly resolve: (host: (scripts: Array<ScriptItem>) => Promise<void>) => void,
+    readonly reject: (error: Error) => void,
+  ) {}
+}
+
 export class WebViewPlatformView extends PlatformView {
   private readonly cookieManager: web_webview.WebCookieManager = new web_webview.WebCookieManager();
   private readonly controller: web_webview.WebviewController = new web_webview.WebviewController();
   private readonly webViewFlutterApi: WebViewFlutterApiImpl;
   private readonly javaScriptChannels: Map<string, JavaScriptChannel> = new Map();
+
+  private documentStartScripts: Map<string, ScriptItem> = new Map();
+  private nextDocumentStartScriptIdentifier: number = 0;
+  private pageZoomFactor: number = 1;
+  private documentStartScriptHost?: (scripts: Array<ScriptItem>) => Promise<void>;
+  private documentStartScriptHostWaiters: Array<DocumentStartScriptHostWaiter> = [];
+  private documentStartScriptHostDisposed: boolean = false;
 
   private url: string = '';
   private downloadListener: DownloadListener | null = null;
@@ -105,6 +122,24 @@ export class WebViewPlatformView extends PlatformView {
     super();
     this.webViewFlutterApi = new WebViewFlutterApiImpl(binaryMessenger, instanceManager);
   }
+
+  localResourceHandler?: (request: WebResourceRequest) => WebResourceResponse;
+  onLocalResourceDispose?: () => void;
+
+  onInterceptRequest = (event: ESObject): WebResourceResponse | null => {
+    const request = event.request as WebResourceRequest;
+    // Only virtual HTTPS hosts are routed to Dart. The loader validates the
+    // exact plugin-owned host; unrelated network traffic stays native.
+    const match = /^https:\/\/([^/?#:]+)(?::443)?(?:[/?#]|$)/i.exec(request.getRequestUrl());
+    if (match == null || !match[1].toLowerCase().endsWith('.operit.invalid')) return null;
+    if (this.localResourceHandler != null) return this.localResourceHandler(request);
+    const response = new WebResourceResponse();
+    response.setResponseCode(403);
+    response.setReasonMessage('Forbidden');
+    response.setResponseMimeType('text/plain');
+    response.setResponseData('');
+    return response;
+  };
 
   onDownloadStart = (event: ESObject): void => {
     if (this.downloadListener) {
@@ -320,7 +355,80 @@ export class WebViewPlatformView extends PlatformView {
     return new WrappedBuilder(WebBuilder);
   }
 
+  /** Binds the ArkUI component that commits native document-start script lists. */
+  bindDocumentStartScriptHost(host: (scripts: Array<ScriptItem>) => Promise<void>): void {
+    this.documentStartScriptHost = host;
+    this.documentStartScriptHostWaiters.forEach((waiter: DocumentStartScriptHostWaiter): void => waiter.resolve(host));
+    this.documentStartScriptHostWaiters = [];
+  }
+
+  /** Restores existing native registrations when an ArkUI Web component reattaches. */
+  getDocumentStartScripts(): Array<ScriptItem> {
+    const scripts = Array.from(this.documentStartScripts.values());
+    if (this.pageZoomFactor !== 1) {
+      scripts.unshift({ script: buildPageZoomScript(this.pageZoomFactor), scriptRules: ['*'] });
+    }
+    return scripts;
+  }
+
+  /** Retains page zoom across documents without changing Flutter paint scaling. */
+  async setPageZoomFactor(factor: number): Promise<void> {
+    if (!Number.isFinite(factor) || factor <= 0) throw new Error('Invalid page zoom factor');
+    const host = await this.waitDocumentStartScriptHost();
+    this.pageZoomFactor = factor;
+    await host(this.getDocumentStartScripts());
+    await this.waitControllerAttached();
+    await this.controller.runJavaScript(buildPageZoomScript(factor));
+  }
+
+  /** Stops new registrations from targeting a component that has disappeared. */
+  unbindDocumentStartScriptHost(): void {
+    this.documentStartScriptHost = undefined;
+  }
+
+  /** Waits for the real Web component instead of racing page navigation. */
+  private waitDocumentStartScriptHost(): Promise<(scripts: Array<ScriptItem>) => Promise<void>> {
+    if (this.documentStartScriptHostDisposed) return Promise.reject(new Error('WebView script host is disposed'));
+    const host = this.documentStartScriptHost;
+    if (host !== undefined) return Promise.resolve(host);
+    return new Promise((resolve, reject) => {
+      this.documentStartScriptHostWaiters.push(new DocumentStartScriptHostWaiter(resolve, reject));
+    });
+  }
+
+  /** Registers a native ArkWeb script and waits for the render commit before replying. */
+  async addDocumentStartScript(source: string): Promise<string> {
+    const host = await this.waitDocumentStartScriptHost();
+    const identifier = 'operit-user-script-' + (++this.nextDocumentStartScriptIdentifier);
+    this.documentStartScripts.set(identifier, { script: source, scriptRules: ['*'] });
+    await host(this.getDocumentStartScripts());
+    return identifier;
+  }
+
+  /** Removes one application registration from future ArkWeb documents. */
+  async removeDocumentStartScript(identifier: string): Promise<void> {
+    const host = await this.waitDocumentStartScriptHost();
+    if (!this.documentStartScripts.delete(identifier)) throw new Error('Unknown script handle');
+    await host(this.getDocumentStartScripts());
+  }
+
+  /** Clears application registrations without changing native JavaScript proxies. */
+  async removeAllDocumentStartScripts(): Promise<void> {
+    const host = await this.waitDocumentStartScriptHost();
+    this.documentStartScripts.clear();
+    await host(this.getDocumentStartScripts());
+  }
+
+  /** Rejects pending script-host registration when the native view is destroyed. */
   dispose(): void {
+    this.documentStartScriptHostDisposed = true;
+    this.documentStartScriptHost = undefined;
+    this.documentStartScriptHostWaiters.forEach((waiter: DocumentStartScriptHostWaiter): void => waiter.reject(new Error('WebView script host is disposed')));
+    this.documentStartScriptHostWaiters = [];
+    this.documentStartScripts.clear();
+    this.localResourceHandler = undefined;
+    this.onLocalResourceDispose?.();
+    this.onLocalResourceDispose = undefined;
     this.controller.stopAllMedia();
     if (this.onDisposeCallback) {
       this.onDisposeCallback();

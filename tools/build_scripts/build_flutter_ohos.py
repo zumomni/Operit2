@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-from contextlib import contextmanager
 import io
 import json
 import os
@@ -14,7 +13,6 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
 
 from common import (
     DIST_DIR,
@@ -23,12 +21,10 @@ from common import (
     copy_required_file,
     host_platform,
     node_package_command,
-    ohos_fvm_flutter_sdk_dir,
-    prepare_web_access_embedded_assets,
+    flutter_command,
+    flutter_pub_get,
     read_properties,
-    remove_direct_dependencies_from_pubspec,
     run,
-    run_ohos_fvm_flutter,
 )
 
 
@@ -96,7 +92,6 @@ def parse_args() -> argparse.Namespace:
 # Builds the signed OpenHarmony HAP through the FVM-selected Flutter SDK.
 def main() -> int:
     args = parse_args()
-    prepare_web_access_embedded_assets()
     if not OHOS_PROJECT_DIR.is_dir():
         raise RuntimeError(
             "OpenHarmony Flutter project not found at "
@@ -105,36 +100,13 @@ def main() -> int:
     verify_ohos_sdk_preflight()
     build_ohos_rust_bridge()
     env = ohos_hvigor_env()
-    with staged_ohos_release_dependencies():
-        run_ohos_fvm_flutter(["pub", "get"], env)
-        if args.enforce_lockfile:
-            run_ohos_fvm_flutter(["pub", "get", "--enforce-lockfile"], env)
-        prepare_ohos_package_dependencies()
-        build_unsigned_ohos_hap(args, env)
+    flutter_pub_get(enforce_lockfile=args.enforce_lockfile, env=env)
+    prepare_ohos_package_dependencies()
+    build_unsigned_ohos_hap(args, env)
     sign_ohos_hap()
     copy_required_file(OHOS_HAP_PATH, args.output)
     print(f"OpenHarmony HAP: {args.output}", flush=True)
     return 0
-
-
-# Stages the OpenHarmony release dependency view without Flutter test plugins.
-@contextmanager
-def staged_ohos_release_dependencies() -> Iterator[None]:
-    pubspec = FLUTTER_APP_DIR / "pubspec.yaml"
-    pubspec_lock = FLUTTER_APP_DIR / "pubspec.lock"
-    original_pubspec = remove_direct_dependencies_from_pubspec(
-        pubspec,
-        frozenset({"integration_test"}),
-        frozenset({"dev_dependencies"}),
-    )
-    original_pubspec_lock = pubspec_lock.read_text(encoding="utf-8")
-    try:
-        yield
-    finally:
-        with pubspec.open("w", encoding="utf-8", newline="") as output:
-            output.write(original_pubspec)
-        with pubspec_lock.open("w", encoding="utf-8", newline="") as output:
-            output.write(original_pubspec_lock)
 
 
 # Builds the unsigned OpenHarmony HAP with Flutter and Hvigor.
@@ -154,7 +126,7 @@ def build_unsigned_ohos_hap(args: argparse.Namespace, env: dict[str, str]) -> No
         + (["--build-name", args.build_name] if args.build_name else [])
         + (["--build-number", args.build_number] if args.build_number else [])
     )
-    run_ohos_fvm_flutter(command, env)
+    run([flutter_command(), *command], cwd=FLUTTER_APP_DIR, env=env)
     if not OHOS_UNSIGNED_HAP_PATH.is_file():
         raise RuntimeError(f"OpenHarmony unsigned HAP was not produced: {OHOS_UNSIGNED_HAP_PATH}")
 
@@ -333,7 +305,7 @@ def prepare_ohos_package_dependencies() -> None:
 # Copies the Flutter engine HAR files required by a release arm64 HAP.
 def copy_ohos_flutter_hars() -> None:
     engine_dir = (
-        ohos_fvm_flutter_sdk_dir()
+        Path(flutter_command()).parent.parent
         / "bin"
         / "cache"
         / "artifacts"

@@ -192,14 +192,20 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "15.3.0"
+  webview_flutter_platform_interface:
+    dependency: transitive
+    description:
+      path: "../webview_flutter_platform_interface"
+      relative: true
+    source: path
+    version: "2.15.1"
   webview_platform_interface:
     dependency: "direct main"
     description:
-      name: webview_platform_interface
-      sha256: "50b00322919bdae4b27cdb6e1d0ad9bf4348d26a592bf6bab6610e36af083335"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.1"
+      path: "../webview_platform_interface"
+      relative: true
+    source: path
+    version: "1.4.0"
 sdks:
   dart: ">=3.9.0 <4.0.0"
   flutter: ">=3.35.0"

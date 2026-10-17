@@ -20,22 +20,11 @@ struct AppLifecycleReplayEvent {
 pub struct ToolPkgAppLifecycleHookBridge;
 
 impl ToolPkgAppLifecycleHookBridge {
-    /// Registers app lifecycle hooks for one application runtime.
-    pub fn register(runtime: ToolPkgBridgeRuntime) {
-        let manager = runtime.package_manager();
-        manager.addToolPkgRuntimeChangeListener(std::sync::Arc::new(move |activeContainers| {
-            ToolPkgAppLifecycleHookBridge::syncAndReplayToolPkgRegistrations(
-                &runtime,
-                activeContainers,
-            );
-        }));
-    }
-
     /// Synchronizes app lifecycle hooks and replays application events to newly added hooks.
     #[allow(non_snake_case)]
     pub fn syncAndReplayToolPkgRegistrations(
         runtime: &ToolPkgBridgeRuntime,
-        activeContainers: Vec<ToolPkgContainerRuntime>,
+        activeContainers: &[ToolPkgContainerRuntime],
     ) {
         let previousHooks = APP_LIFECYCLE_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
@@ -149,50 +138,66 @@ fn runAppLifecycleHook(
     eventName: &str,
     eventPayload: Value,
 ) {
-    let manager = runtime.package_manager();
-    ChainLogger::info(
-        PLUGIN_CHAIN,
-        "plugin.toolpkg.app_lifecycle.run.start",
-        &[
-            ("event", eventName.to_string()),
-            ("package", hook.containerPackageName.clone()),
-            ("hookId", hook.hookId.clone()),
-            ("function", hook.functionName.clone()),
-        ],
+    let runtime = runtime.to_owned();
+    let hook = hook.to_owned();
+    let eventName = eventName.to_owned();
+    super::ToolPkgHookBridgeSupport::scheduleToolPkgNotification(
+        "operit-toolpkg-notification",
+        move || {
+            Box::pin(async move {
+                let runtime = &runtime;
+                let hook = &hook;
+                let eventName = &eventName;
+                let manager = runtime.package_manager();
+                ChainLogger::info(
+                    PLUGIN_CHAIN,
+                    "plugin.toolpkg.app_lifecycle.run.start",
+                    &[
+                        ("event", eventName.to_string()),
+                        ("package", hook.containerPackageName.clone()),
+                        ("hookId", hook.hookId.clone()),
+                        ("function", hook.functionName.clone()),
+                    ],
+                );
+                match manager
+                    .runToolPkgMainHook(
+                        &hook.containerPackageName,
+                        &hook.functionName,
+                        eventName,
+                        Some(eventName),
+                        Some(&hook.hookId),
+                        hook.functionSource.as_deref(),
+                        eventPayload,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => ChainLogger::info(
+                        PLUGIN_CHAIN,
+                        "plugin.toolpkg.app_lifecycle.run.done",
+                        &[
+                            ("event", eventName.to_string()),
+                            ("package", hook.containerPackageName.clone()),
+                            ("hookId", hook.hookId.clone()),
+                        ],
+                    ),
+                    Err(error) => ChainLogger::error(
+                        PLUGIN_CHAIN,
+                        "plugin.toolpkg.app_lifecycle.run.error",
+                        &[
+                            ("event", eventName.to_string()),
+                            ("package", hook.containerPackageName.clone()),
+                            ("hookId", hook.hookId.clone()),
+                            ("function", hook.functionName.clone()),
+                            ("error", error),
+                        ],
+                    ),
+                }
+            })
+        },
     );
-    match manager.runToolPkgMainHook(
-        &hook.containerPackageName,
-        &hook.functionName,
-        eventName,
-        Some(eventName),
-        Some(&hook.hookId),
-        hook.functionSource.as_deref(),
-        eventPayload,
-        None,
-        None,
-        None,
-    ) {
-        Ok(_) => ChainLogger::info(
-            PLUGIN_CHAIN,
-            "plugin.toolpkg.app_lifecycle.run.done",
-            &[
-                ("event", eventName.to_string()),
-                ("package", hook.containerPackageName.clone()),
-                ("hookId", hook.hookId.clone()),
-            ],
-        ),
-        Err(error) => ChainLogger::error(
-            PLUGIN_CHAIN,
-            "plugin.toolpkg.app_lifecycle.run.error",
-            &[
-                ("event", eventName.to_string()),
-                ("package", hook.containerPackageName.clone()),
-                ("hookId", hook.hookId.clone()),
-                ("function", hook.functionName.clone()),
-                ("error", error),
-            ],
-        ),
-    }
 }
 
 /// Compares two app lifecycle hook registrations by their stable dispatch identity.

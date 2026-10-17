@@ -9,23 +9,22 @@ import type {LayoutDocument} from '../layout/project-model.mts';
 const root = new URL('../../../../', import.meta.url);
 
 export const editableSources = [
-  'apps/esp32/lvgl_port/operit_lvgl.c',
-  'apps/esp32/lvgl_port/operit_lvgl.h',
+  'apps/esp32/ui_port/operit_mini_ui.c',
+  'apps/esp32/ui_port/operit_ui.h',
+  'apps/esp32/ui_port/operit_mini_ui.h',
+  'apps/esp32/src/ui.rs',
   'apps/esp32/src/main.rs',
   'tools/esp32-editor/src/layout/routes.mts',
   'tools/esp32-editor/src/layout/layout-model.mts',
   'tools/esp32-editor/src/layout/project-model.mts',
-  'tools/esp32-editor/src/compile-layout.mts',
-  'tools/esp32-editor/web/editor.js',
+  'tools/esp32-editor/web/editor.ts',
   'tools/esp32-editor/web/index.html',
   'tools/esp32-editor/web/style.css',
-  'tools/esp32-editor/web/app.js',
-  'tools/esp32-editor/web/pages.js',
-  'apps/esp32/lvgl_port/layout_store.c',
-  'apps/esp32/lvgl_port/layout_store.h',
-  'apps/esp32/src/ui_deploy.rs',
+  'tools/esp32-editor/web/app.ts',
+  'tools/esp32-editor/web/pages.ts',
+  'apps/esp32/src/ui_capabilities.rs',
   'tools/esp32-editor/src/layout/package-layout.mts',
-  'tools/esp32-editor/web/deploy.js',
+  'tools/esp32-editor/web/deploy.ts',
 ] as const;
 
 export type EditableSource = (typeof editableSources)[number];
@@ -177,7 +176,7 @@ async function develop(input: DevelopInput, signal: AbortSignal): Promise<{
   }
   if (validate(context?.document).length) throw new Error('当前布局无效');
   const system =
-    `You implement Operit ESP32 UI projects. Reply in Chinese. Context contains the actual project, active page/component and source references. Use read_source to inspect existing source before proposing code changes. No shell execution. Return a JSON object {summary,operations:[],codeEdits:[]} without markdown. Layout operations: add (pageId,node), update (id,changes), remove(id), document(changes), addPage(page:{id,name,background,nodes,swipeLeft?,swipeRight?}), updatePage(id,changes), removePage(id). Root nodes are home; pages are additional pages. version2 enabled:true entryPage controls boot. All IDs unique globally, page IDs <=18 ASCII chars. 320x240, max12 pages,24 nodes/page,complexity40/page. Parent must earlier panel in same page. Text ASCII. Optional label binding clock/connection/expression and fontSize14/48. Actions go:PAGE_ID or registered routes. Composite buttons use panel + child buttons, not opaque buttonmatrix. Code edits use {path,revision,find,replace}, exact unique find from read_source. Propose only necessary changes. The user reviews before applying. Need implement new routes in shared C and catalogue; do not claim saved/built. Available sources: ${JSON.stringify(editableSources)}. Components: ${JSON.stringify(catalog)}. Routes: ${JSON.stringify(routes)}.`;
+    `You implement Operit ESP32 UI projects. Reply in Chinese. Context contains the actual project, active page/component and source references. Use read_source to inspect existing source before proposing code changes. No shell execution. Return a JSON object {summary,operations:[],codeEdits:[]} without markdown. Layout operations: add (pageId,node), update (id,changes), remove(id), document(changes), addPage(page:{id,name,background,nodes,swipeLeft?,swipeRight?}), updatePage(id,changes), removePage(id). Root nodes are home; pages are additional pages. version2 enabled:true entryPage controls boot. All IDs unique globally, page IDs <=18 ASCII chars. 320x240, max12 pages,24 nodes/page,complexity40/page. Parent must earlier panel in same page. Text ASCII. Optional label binding clock/connection/expression/theme/pairing/space/chat and fontSize14/48. Actions go:PAGE_ID or registered routes. Composite buttons use panel + child buttons, not opaque buttonmatrix. Code edits use {path,revision,find,replace}, exact unique find from read_source. Propose only necessary changes. The user reviews before applying. Need implement new routes in shared C and catalogue; do not claim saved/built. Available sources: ${JSON.stringify(editableSources)}. Components: ${JSON.stringify(catalog)}. Routes: ${JSON.stringify(routes)}.`;
   const messages: ChatMessage[] = [
     {role: 'system', content: system},
     {role: 'user', content: JSON.stringify({task, context})},

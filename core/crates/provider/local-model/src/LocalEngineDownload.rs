@@ -833,6 +833,11 @@ mod tests {
     struct RejectingHttpHost;
 
     impl HttpHost for RejectingHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Rejects buffered HTTP because embedded engine installation must remain offline.
         fn executeHttpRequest(&self, _request: HttpRequestData) -> HostResult<HttpResponseData> {
             panic!("embedded engine installation called executeHttpRequest")
@@ -846,6 +851,25 @@ mod tests {
             _onProgress: operit_host_api::HttpDownloadProgressCallback,
         ) -> HostResult<HttpDownloadResult> {
             panic!("embedded engine installation called downloadFiles")
+        }
+    }
+
+    impl operit_host_api::HttpStreamHost for RejectingHttpHost {
+        /// Rejects HTTP byte streams because embedded engine installation must remain offline.
+        fn openHttpByteStream(
+            &self,
+            _streamId: String,
+            _request: HttpRequestData,
+            _onOpened: operit_host_api::HttpStreamOpenedCallback,
+            _onChunk: operit_host_api::HttpStreamChunkCallback,
+            _onClosed: operit_host_api::HttpStreamClosedCallback,
+        ) -> HostResult<()> {
+            panic!("embedded engine installation called openHttpByteStream")
+        }
+
+        /// Rejects stream closure because no stream can be opened offline.
+        fn closeHttpByteStream(&self, _streamId: &str) -> HostResult<()> {
+            panic!("embedded engine installation called closeHttpByteStream")
         }
     }
 

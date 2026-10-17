@@ -16,7 +16,7 @@ class ToolPkgDesktopWidgetFrame {
     required String instanceId,
     required bool useEnglish,
   }) async {
-    final raw = await clients.application
+    final snapshot = await clients.application
         .packageManager()
         .renderToolPkgDesktopWidget(
           containerPackageName: definition.containerPackageName,
@@ -24,12 +24,10 @@ class ToolPkgDesktopWidgetFrame {
           instanceId: instanceId,
           useEnglish: useEnglish,
         );
-    final snapshot = (jsonDecode(raw) as Map).cast<String, Object?>();
+    final store = _ComposeDslNodeStore()..apply(snapshot.renderUpdate);
     return ToolPkgDesktopWidgetFrame._(
-      core_proxy.ToolPkgDesktopWidget.fromJson(
-        (snapshot['widget'] as Map).cast<String, Object?>(),
-      ),
-      _ComposeDslRenderResult.parse(jsonEncode(snapshot['renderResult'])),
+      snapshot.widget,
+      _ComposeDslRenderResult(tree: store.root, actionResult: null),
     );
   }
 
@@ -55,8 +53,11 @@ class ToolPkgDesktopWidgetFrame {
           child: _ComposeDslRenderer(
             node: _render.tree,
             nodePath: 'desktop-widget:$instanceId',
+            dispatchOnLoad: false,
             onAction: openRoute,
+            onTextInput: openRoute,
             webViewHostContext: ComposeDslWebViewHostContext(
+              packageName: definition.containerPackageName,
               routeInstanceId: instanceId,
               executionContextKey: 'desktop-widget:$instanceId',
               dispatchAction: openRoute,
@@ -97,7 +98,8 @@ class ToolPkgDesktopWidgetView extends StatefulWidget {
       _ToolPkgDesktopWidgetViewState();
 }
 
-class _ToolPkgDesktopWidgetViewState extends State<ToolPkgDesktopWidgetView> {
+class _ToolPkgDesktopWidgetViewState extends State<ToolPkgDesktopWidgetView>
+    with PageActivityMixin<ToolPkgDesktopWidgetView> {
   Timer? _timer;
   ToolPkgDesktopWidgetFrame? _render;
   String? _error;
@@ -129,6 +131,19 @@ class _ToolPkgDesktopWidgetViewState extends State<ToolPkgDesktopWidgetView> {
     }
   }
 
+  /// Suspends plugin render polling while the cached presentation is hidden.
+  @override
+  void onPageActivityChanged(bool active) {
+    if (active && _language != null) {
+      _restart();
+    } else if (!active) {
+      _timer?.cancel();
+      _timer = null;
+      _generation += 1;
+      _loading = false;
+    }
+  }
+
   /// Starts a new render generation and a non-overlapping periodic refresh schedule.
   void _restart() {
     if (widget.refreshInterval <= Duration.zero) {
@@ -137,6 +152,7 @@ class _ToolPkgDesktopWidgetViewState extends State<ToolPkgDesktopWidgetView> {
     _timer?.cancel();
     _generation++;
     _loading = false;
+    if (!isPageActive) return;
     unawaited(_refresh());
     _timer = Timer.periodic(widget.refreshInterval, (_) {
       if (!_loading) unawaited(_refresh());
@@ -145,7 +161,7 @@ class _ToolPkgDesktopWidgetViewState extends State<ToolPkgDesktopWidgetView> {
 
   /// Executes the registered render route and its onLoad before exposing the snapshot.
   Future<void> _refresh() async {
-    if (_loading) return;
+    if (_loading || !isPageActive) return;
     final generation = _generation;
     setState(() {
       _loading = true;

@@ -3,9 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use operit_access_runtime::RemoteDeviceInfo;
+use operit_link::protocol::LinkDeviceInfo;
 use operit_core_application::{CoreApplication, CoreApplicationConfig};
 use operit_host_api::HostManager::HostManager;
+use operit_host_api::{HostResult, ToastHost};
 #[cfg(target_os = "linux")]
 use operit_host_linux_native::{
     LinuxAudioPlaybackHost as NativeAudioPlaybackHost, LinuxBluetoothHost as NativeBluetoothHost,
@@ -59,8 +60,40 @@ compile_error!("operit2 CLI host is implemented for Windows, Linux, and macOS.")
 
 /// Creates the CLI host manager with the configured runtime and workspace roots.
 pub(crate) fn create_cli_host_manager() -> HostManager {
+    create_cli_host_manager_with_toast_host(Arc::new(console_toast))
+}
+
+/// Writes one non-TUI toast into the active CLI terminal.
+fn console_toast(message: &str) -> HostResult<()> {
+    eprintln!("{message}");
+    Ok(())
+}
+
+/// Isolates explicit CLI profiles across all native IPC carriers.
+fn create_cli_plugin_sdk_ipc_host(
+    runtimeRoot: &std::path::Path,
+) -> Arc<dyn operit_host_api::PluginSdkIpcHost> {
+    if env::var_os("OPERIT_CLI_CONFIG_DIR").is_some_and(|path| !path.is_empty())
+        && !env::var_os("OPERIT_PLUGIN_SDK_INSTANCE").is_some_and(|value| !value.is_empty())
+    {
+        use sha2::{Digest, Sha256};
+        let key = format!(
+            "{:x}",
+            Sha256::digest(runtimeRoot.as_os_str().as_encoded_bytes())
+        );
+        return Arc::new(NativePluginSdkIpcHost::withInstance(&key[..16]));
+    }
+    Arc::new(NativePluginSdkIpcHost::new())
+}
+
+/// Creates the CLI host manager with frontend-owned toast presentation.
+fn create_cli_host_manager_with_toast_host(toastHost: Arc<dyn ToastHost>) -> HostManager {
+    static LEASE: std::sync::OnceLock<operit_host_data_rescue::StorageLease> = std::sync::OnceLock::new();
+    LEASE.get_or_init(|| operit_host_data_rescue::StorageLease::acquire(&NativeRuntimeStorageHost::defaultRuntimeRoot(), false)
+        .unwrap_or_else(|error| panic!("Storage access denied: {error}")));
     let storageConfig = CliStorageConfig::read();
     let (runtimeRoot, workspaceRoot) = storageConfig.activeRoots();
+    let pluginSdkIpcHost = create_cli_plugin_sdk_ipc_host(&runtimeRoot);
     let archiveStagingHost = Arc::new(operit_host_native_common::NativeArchiveStagingHost::new(
         runtimeRoot.clone(),
     ));
@@ -69,10 +102,17 @@ pub(crate) fn create_cli_host_manager() -> HostManager {
         workspaceRoot.clone(),
     ));
     let runtimeStorageWriteHost = Arc::new(
-        operit_host_native_common::NativeRuntimeStorageHost::new(runtimeRoot, workspaceRoot),
+        operit_host_native_common::NativeRuntimeStorageHost::new(runtimeRoot.clone(), workspaceRoot),
     );
     let runtimeSqliteHost = runtimeStorageHost.clone();
-    let hostSecretStore = runtimeStorageHost.clone();
+    let hostSecretStore: Arc<dyn operit_host_api::HostSecretStore> =
+        if env::var("OPERIT_CLI_SECRET_STORE").as_deref() == Ok("file") {
+            Arc::new(operit_host_native_common::NativeFileSecretStore(
+                runtimeRoot.join("secrets"),
+            ))
+        } else {
+            runtimeStorageHost.clone()
+        };
     let mut context = HostManager::withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
         Arc::new(NativeFileSystemHost::new()),
         Arc::new(NativeWebVisitHost::new()),
@@ -82,10 +122,17 @@ pub(crate) fn create_cli_host_manager() -> HostManager {
         runtimeStorageHost,
         runtimeSqliteHost,
     )
+    .withToastHost(toastHost)
     .withHostSecretStore(hostSecretStore)
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
     .withWebSocketHost(Arc::new(NativeHttpHost::new()))
+    .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
-    .withRuntimeStorageWriteHost(runtimeStorageWriteHost);
+    .withRuntimeStorageWriteHost(runtimeStorageWriteHost)
+    .withServiceDiscoveryHost(Arc::new(
+        operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::default(),
+    ));
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         context = context.withTerminalHost(Arc::new(NativeTerminalHost::new()));
@@ -103,13 +150,37 @@ pub(crate) fn create_cli_host_manager() -> HostManager {
     context =
         context.withHostJavaScriptRuntimeHost(Arc::new(NativeHostJavaScriptRuntimeHost::new()));
     context = context.withBrowserAutomationHost(Arc::new(NativeBrowserAutomationHost::new()));
-    context = context.withPluginSdkIpcHost(Arc::new(NativePluginSdkIpcHost::new()));
+    context = context.withPluginSdkIpcHost(pluginSdkIpcHost);
     let commandContext = context.clone();
     context.withCoreCommandExecutor(Arc::new(move |args: Vec<String>| {
-        let output =
-            operit_command_core::run_core_command_with_context(commandContext.clone(), &args)?;
-        persist_cli_storage_config(&output.stdout)?;
-        Ok(output.stdout)
+        let commandContext = commandContext.clone();
+        // JS/plugin command futures stay on their owning local runtime; the host boundary awaits a Send receipt.
+        let executionContext = operit_tools::ToolExecutionManager::ToolExecutionManager::currentToolRuntimeContext();
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        let scheduler = commandContext.hostRuntimeTaskSchedulerHost.clone()
+            .expect("CLI requires its configured host runtime task scheduler");
+        let scheduled = scheduler.scheduleHostRuntimeAsyncTask("cli-core-command", Box::new(move || {
+                Box::pin(async move {
+                    let command = async move {
+                        let output = operit_command_core::run_core_command_with_context(commandContext, &args).await?;
+                        persist_cli_storage_config(&output.stdout)?;
+                        Ok(output.stdout)
+                    };
+                    let result = async { match executionContext {
+                        Some(context) => operit_tools::ToolExecutionManager::ToolExecutionManager::scopeToolRuntimeContext(context, command).await,
+                        None => command.await,
+                    } };
+                    tokio::select! {
+                        biased;
+                        _ = sender.closed() => {},
+                        result = result => { let _ = sender.send(result); }
+                    }
+                })
+            }));
+        Box::pin(async move {
+            scheduled.map_err(|error| format!("CLI command scheduling failed: {error}"))?;
+            receiver.await.map_err(|error| format!("CLI command ended without a result: {error}"))?
+        })
     }))
 }
 
@@ -124,7 +195,7 @@ pub(crate) async fn create_cli_core_application(
 ) -> Result<CoreApplication, String> {
     CoreApplication::start(CoreApplicationConfig::new(
         create_cli_host_manager(),
-        RemoteDeviceInfo::nativeCli(deviceName),
+        LinkDeviceInfo::nativeCli(deviceName),
     ))
     .await
 }
@@ -133,14 +204,19 @@ pub(crate) async fn create_cli_core_application(
 pub(crate) async fn create_cli_core_application_without_space_sync(
     deviceName: &str,
 ) -> Result<CoreApplication, String> {
-    CoreApplication::start(
-        CoreApplicationConfig::new(
-            create_cli_host_manager(),
-            RemoteDeviceInfo::nativeCli(deviceName),
-        )
-        .withSpaceSync(false),
-    )
-    .await
+    create_cli_core_application_with_node_services(deviceName, None).await
+}
+
+/// 外围装配可注入核心或测试替身；不在 CLI 中创建另一份配对状态。
+pub(crate) async fn create_cli_core_application_with_node_services(
+    deviceName: &str,
+    services: Option<operit_node_runtime::NodeServices::NodeServices>,
+) -> Result<CoreApplication, String> {
+    let mut config = CoreApplicationConfig::new(
+        create_cli_host_manager(), LinkDeviceInfo::nativeCli(deviceName),
+    ).withSpaceSync(false);
+    if let Some(services) = services { config = config.withNodeServices(services); }
+    CoreApplication::start(config).await
 }
 
 /// Starts the CLI Core tree after configuring its local client.
@@ -151,7 +227,23 @@ pub(crate) async fn create_cli_core_application_configured(
     CoreApplication::start(
         CoreApplicationConfig::new(
             create_cli_host_manager(),
-            RemoteDeviceInfo::nativeCli(deviceName),
+            LinkDeviceInfo::nativeCli(deviceName),
+        )
+        .withLocalClientConfigurator(configurator),
+    )
+    .await
+}
+
+/// Starts the CLI Core tree with a frontend toast host and local-client configuration.
+pub(crate) async fn create_cli_core_application_configured_with_toast_host(
+    deviceName: &str,
+    toastHost: Arc<dyn ToastHost>,
+    configurator: impl FnOnce(&mut LocalCoreProxy) -> Result<(), String> + Send + 'static,
+) -> Result<CoreApplication, String> {
+    CoreApplication::start(
+        CoreApplicationConfig::new(
+            create_cli_host_manager_with_toast_host(toastHost),
+            LinkDeviceInfo::nativeCli(deviceName),
         )
         .withLocalClientConfigurator(configurator),
     )
@@ -475,6 +567,11 @@ fn cli_storage_config_path() -> PathBuf {
 
 /// Returns the CLI configuration directory.
 fn cli_config_dir() -> PathBuf {
+    // Isolate CLI profiles without changing HOME (which also selects the
+    // macOS login Keychain and unrelated platform credentials).
+    if let Some(path) = env::var_os("OPERIT_CLI_CONFIG_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     #[cfg(windows)]
     {
         let appdata = env::var_os("APPDATA").expect("APPDATA is required for Operit2 CLI config");
@@ -506,8 +603,8 @@ mod tests {
     use operit_tools::tools::ToolResultDataClasses::ToolResultData;
     use operit_tools::ToolExecutionManager::{AITool, ToolParameter};
 
-    #[test]
-    fn direct_terminal_tool_chain_executes_visible_terminal() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_terminal_tool_chain_executes_visible_terminal() {
         let application = create_cli_application();
         let mut handler = application.toolHandler.clone();
         handler.registerDefaultTools();
@@ -525,36 +622,40 @@ mod tests {
             "direct-tool-ok\ntty=yes",
         );
 
-        let createResult = handler.executeTool(AITool {
-            name: "create_terminal_session".to_string(),
-            parameters: vec![ToolParameter {
-                name: "session_name".to_string(),
-                value: sessionName.to_string(),
-            }],
-        });
+        let createResult = handler
+            .executeTool(AITool {
+                name: "create_terminal_session".to_string(),
+                parameters: vec![ToolParameter {
+                    name: "session_name".to_string(),
+                    value: sessionName.to_string(),
+                }],
+            })
+            .await;
         assert!(createResult.success, "{:?}", createResult.error);
         let sessionId = match createResult.result {
             ToolResultData::TerminalSessionCreationResultData(data) => data.sessionId,
             data => panic!("create result data type mismatch: {}", data.toJson()),
         };
 
-        let executeResult = handler.executeTool(AITool {
-            name: "execute_in_terminal_session".to_string(),
-            parameters: vec![
-                ToolParameter {
-                    name: "session_id".to_string(),
-                    value: sessionId.clone(),
-                },
-                ToolParameter {
-                    name: "command".to_string(),
-                    value: command.to_string(),
-                },
-                ToolParameter {
-                    name: "timeout_ms".to_string(),
-                    value: "3000".to_string(),
-                },
-            ],
-        });
+        let executeResult = handler
+            .executeTool(AITool {
+                name: "execute_in_terminal_session".to_string(),
+                parameters: vec![
+                    ToolParameter {
+                        name: "session_id".to_string(),
+                        value: sessionId.clone(),
+                    },
+                    ToolParameter {
+                        name: "command".to_string(),
+                        value: command.to_string(),
+                    },
+                    ToolParameter {
+                        name: "timeout_ms".to_string(),
+                        value: "3000".to_string(),
+                    },
+                ],
+            })
+            .await;
         assert!(executeResult.success, "{:?}", executeResult.error);
         match executeResult.result {
             ToolResultData::TerminalCommandResultData(data) => {
@@ -565,13 +666,15 @@ mod tests {
             data => panic!("execute result data type mismatch: {}", data.toJson()),
         }
 
-        let screenResult = handler.executeTool(AITool {
-            name: "get_terminal_session_screen".to_string(),
-            parameters: vec![ToolParameter {
-                name: "session_id".to_string(),
-                value: sessionId,
-            }],
-        });
+        let screenResult = handler
+            .executeTool(AITool {
+                name: "get_terminal_session_screen".to_string(),
+                parameters: vec![ToolParameter {
+                    name: "session_id".to_string(),
+                    value: sessionId,
+                }],
+            })
+            .await;
         assert!(screenResult.success, "{:?}", screenResult.error);
         match screenResult.result {
             ToolResultData::TerminalSessionScreenResultData(data) => {
@@ -582,3 +685,26 @@ mod tests {
         }
     }
 }
+
+/// Returns native roots for offline rescue without constructing the CLI Host manager.
+pub(crate) fn rescue_default_runtime() -> PathBuf { NativeRuntimeStorageHost::defaultRuntimeRoot() }
+
+/// Reads explicit CLI storage roots without creating missing configuration or identities.
+pub(crate) fn rescue_roots() -> Result<operit_host_data_rescue::RescueRoots, String> {
+    let bytes = fs::read(cli_storage_config_path()).map_err(|error| error.to_string())?;
+    let config: CliStorageConfig = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(operit_host_data_rescue::RescueRoots { runtime_root: config.runtimeRoot, workspace_root: config.workspaceRoot, cli_config_root: Some(cli_config_dir()) })
+}
+
+/// Returns the CLI configuration directory for an explicitly selected damaged-config rescue.
+pub(crate) fn rescue_config_root() -> PathBuf { cli_config_dir() }
+
+/// Creates only the selected secret-store adapter for a CLI maintenance session.
+pub(crate) fn rescue_secret_store(root: &std::path::Path) -> Option<Arc<dyn operit_host_api::HostSecretStore>> {
+    if env::var("OPERIT_CLI_SECRET_STORE").as_deref() == Ok("file") {
+        // Every identity's file-backed secrets are already included in the raw runtime namespace.
+        return None;
+    }
+    Some(Arc::new(NativeRuntimeStorageHost::new(root.to_path_buf(), root.with_file_name("workspaces"))))
+}
+

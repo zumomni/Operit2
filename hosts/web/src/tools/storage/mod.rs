@@ -78,6 +78,11 @@ impl RuntimeStorageHost for WebRuntimeStorageHost {
         Ok(())
     }
 
+    /// The worker flushes the new OPFS record before publishing its index entry.
+    fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        self.writeBytes(path, content)
+    }
+
     /// Appends bytes to worker-owned OPFS runtime storage.
     fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
         call_storage(
@@ -280,6 +285,12 @@ impl RuntimeSqliteTransaction for WebRuntimeSqliteTransaction {
 
     fn commit(self: Box<Self>) -> HostResult<()> {
         call_sqlite("commitTransaction", &[JsValue::from_str(&self.id)])?;
+        Ok(())
+    }
+
+    /// Aborts the exact browser transaction through the registered JavaScript SQLite host.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        call_sqlite("rollbackTransaction", &[JsValue::from_str(&self.id)])?;
         Ok(())
     }
 }

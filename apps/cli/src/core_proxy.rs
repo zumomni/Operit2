@@ -31,12 +31,13 @@ impl CoreLinkClient for SharedLocalCore {
         CoreLinkSharedClient::watch(self.0.as_ref(), request).await
     }
 
+    /// Opens an input stream through the same shared Core client used by calls and watches.
     #[allow(non_snake_case)]
     async fn openPush(
         &mut self,
         request: operit_link::CorePushRequest,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-        self.0.openPushLocal(request)
+        CoreLinkSharedClient::openPush(self.0.as_ref(), request).await
     }
 }
 
@@ -65,6 +66,9 @@ impl CliCore {
             .as_ref()
             .ok_or_else(|| "this CLI command requires an in-process runtime".to_string())
     }
+
+
+
 }
 
 impl Deref for CliCore {

@@ -306,14 +306,14 @@ host bridge boundary
 权限拦截分成四个具体位置：
 
 ```text
-1. app session
+1. peer session
    位置：
-     apps/flutter/native/operit-flutter-bridge/src/access.rs
-     apps/flutter/app/lib/core/link_host/LinkHostConfig.dart
+     core/crates/node/runtime/src/HostRuntimePeerService.rs
+     core/crates/node/runtime/src/peer/dispatch.rs
    作用：
-     验证本机、配对设备、CLI、Web Access 的 session。
-     把请求交给当前 Host 的 runtime。
-     不在这里扩展 AI 能力语义。
+     验证节点配对、认证会话和当前通道授权。
+     经标准 Link dispatch 把请求交给 PeerRouter。
+     业务权限由 Router 校验。
 
 2. tool invocation approval
    位置：
@@ -471,7 +471,7 @@ Host bridge 上下文传递
   用于把 AiPermissionMode 带到默认工具、MCP、终端、文件等具体执行边界。
 
 插件内部 toolCall
-  JsNativeInterfaceDelegates.callToolSync
+  JsEngine.dispatchStructuredToolCall
   会把 toolCall(...) 解析成 AITool 后直接调用 AIToolHandler.executeTool。
   AIToolHandler.executeTool 不调用 ToolExecutionManager.checkToolPermission。
   所以插件内部 Tools.* 调用不应该被描述成用户逐次批准。
@@ -657,7 +657,7 @@ AI calls packageName:toolName
   -> JsToolManager.executeScript(PackageTool.script)
   -> JS Tools.Files.write
   -> toolCall("write_file")
-  -> JsNativeInterfaceDelegates.callToolSync
+  -> JsEngine.dispatchStructuredToolCall
   -> AIToolHandler.executeTool(write_file)
   -> AIToolHandler carries AiPermissionMode
   -> StandardFileSystemTools.writeFile
@@ -930,7 +930,7 @@ core/crates/runtime/application/src/core/tools/javascript/JsTools.rs
   新模型不在这里塞逐调用审批。
   这里应继续表现为包运行环境里的文件 API。
 
-core/crates/runtime/application/src/core/tools/javascript/JsNativeInterfaceDelegates.rs
+core/crates/plugin/javascript-bridge/src/javascript/JsHostOperations.rs
   当前 callToolSync 把 JS toolCall 转成 AITool 后直接 executeTool。
   这条直接执行链路可以保留。
   它代表 PackageTool 脚本内部 toolCall 触达具体工具执行链路，不代表沙盒，也不作为 ToolPkg 容器拦截点。
@@ -967,13 +967,11 @@ core/crates/runtime/application/src/core/tools/mcp/MCPManager.rs
   作为 MCP 服务启停、配置和连接管理的执行点。
   由本机 owner 直接管理；企业部署交给外层 Operit Server Manager。
 
-apps/flutter/app/lib/core/link_host/LinkHostConfig.dart
-  InboundLinkSessionRecord 只保留 session、device、origin、过期时间和连接状态。
-  不扩展内部多用户权限字段。
+core/crates/node/runtime/src/PeerStateStore.rs
+  保存节点配对记录和入站、出站认证凭证，不扩展内部多用户权限字段。
 
-apps/flutter/native/operit-flutter-bridge/src/access.rs
-  /link/session、/link/space/adopt、/link/peer/channel/* 验证 session。
-  不构造内部用户权限系统。
+core/crates/node/runtime/src/peer/dispatch.rs
+  在标准 Link 业务入口重校认证通道授权，交给 PeerRouter 执行业务权限检查。
 
 apps/flutter/app/android/app/src/main/kotlin/app/operit/AndroidPlatformChannel.kt
   hostOnboardingPermissionSnapshot(hostId: android) 返回 Android requirement id 到 status 的 map：

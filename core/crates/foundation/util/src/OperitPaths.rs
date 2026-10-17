@@ -8,17 +8,12 @@ pub struct OperitPaths;
 
 pub const CONFIG_PREFERENCES_DIR_PATH: &str = Layout::CONFIG_PREFERENCES_DIR_PATH;
 
-pub const DATA_MEMORY_CHARACTERS_DIR_PATH: &str = Layout::DATA_MEMORY_CHARACTERS_DIR_PATH;
-pub const DATA_MEMORY_SHARED_DIR_PATH: &str = Layout::DATA_MEMORY_SHARED_DIR_PATH;
 pub const RUNTIME_USER_ASSETS_DIR_PATH: &str = Layout::RUNTIME_USER_ASSETS_DIR_PATH;
-pub const RUNTIME_CHARACTER_AVATARS_DIR_PATH: &str = Layout::RUNTIME_CHARACTER_AVATARS_DIR_PATH;
 pub const RUNTIME_THEME_ASSETS_DIR_PATH: &str = Layout::RUNTIME_THEME_ASSETS_DIR_PATH;
 pub const RUNTIME_SHARE_IMAGE_DIR_PATH: &str = Layout::RUNTIME_SHARE_IMAGE_DIR_PATH;
 pub const RUNTIME_WORKSPACE_VIDEO_DIR_PATH: &str = Layout::RUNTIME_WORKSPACE_VIDEO_DIR_PATH;
 pub const RUNTIME_COMPOSE_DSL_WEBVIEW_FILES_DIR_PATH: &str =
     Layout::RUNTIME_COMPOSE_DSL_WEBVIEW_FILES_DIR_PATH;
-pub const RUNTIME_LINK_ACCESS_WEB_ASSETS_DIR_PATH: &str =
-    Layout::RUNTIME_LINK_ACCESS_WEB_ASSETS_DIR_PATH;
 pub const RUNTIME_CLIENT_LOG_PATH: &str = Layout::RUNTIME_CLIENT_LOG_PATH;
 pub const RUNTIME_SHARE_IMAGE_EXPORTS_DIR_PATH: &str = Layout::RUNTIME_SHARE_IMAGE_EXPORTS_DIR_PATH;
 
@@ -52,6 +47,7 @@ pub const USER_PREFERENCES_PATH: &str = Layout::USER_PREFERENCES_PATH;
 pub const API_PREFERENCES_PATH: &str = Layout::API_PREFERENCES_PATH;
 pub const ENV_PREFERENCES_PATH: &str = Layout::ENV_PREFERENCES_PATH;
 pub const GITHUB_AUTH_PREFERENCES_PATH: &str = Layout::GITHUB_AUTH_PREFERENCES_PATH;
+pub const CODEX_AUTH_PREFERENCES_PATH: &str = Layout::CODEX_AUTH_PREFERENCES_PATH;
 pub const MODEL_CONFIGS_PREFERENCES_PATH: &str = Layout::MODEL_CONFIGS_PREFERENCES_PATH;
 pub const FUNCTIONAL_CONFIGS_PREFERENCES_PATH: &str = Layout::FUNCTIONAL_CONFIGS_PREFERENCES_PATH;
 pub const PACKAGE_MANAGER_PREFERENCES_PATH: &str = Layout::PACKAGE_MANAGER_PREFERENCES_PATH;
@@ -60,11 +56,6 @@ pub const SQLITE_DATABASE_PATH: &str = Layout::SQLITE_DATABASE_PATH;
 pub const MCP_CONFIG_PATH: &str = Layout::MCP_CONFIG_PATH;
 pub const MCP_SERVER_STATUS_PATH: &str = Layout::MCP_SERVER_STATUS_PATH;
 
-const MEMORY_USER_MARKDOWN_FILE_NAME: &str = "USER.md";
-const MEMORY_SQLITE_FILE_NAME: &str = "Memory.sqlite";
-const MEMORY_LINK_SQLITE_FILE_NAME: &str = "MemoryLink.sqlite";
-const MEMORY_AUTO_SAVE_CANDIDATE_SQLITE_FILE_NAME: &str = "MemoryAutoSaveCandidate.sqlite";
-const MEMORY_SEARCH_SETTINGS_FILE_PATH: &str = "settings/memory_search_settings.preferences.json";
 
 #[allow(non_snake_case)]
 pub fn operitRootDir() -> Result<PathBuf, String> {
@@ -89,15 +80,7 @@ pub fn preferencesDir() -> Result<PathBuf, String> {
     relativeDir(CONFIG_PREFERENCES_DIR_PATH)
 }
 
-#[allow(non_snake_case)]
-pub fn memoryCharactersDir() -> Result<PathBuf, String> {
-    relativeDir(DATA_MEMORY_CHARACTERS_DIR_PATH)
-}
 
-#[allow(non_snake_case)]
-pub fn memorySharedDir() -> Result<PathBuf, String> {
-    relativeDir(DATA_MEMORY_SHARED_DIR_PATH)
-}
 
 #[allow(non_snake_case)]
 /// Returns the directory used for imported UI theme assets.
@@ -112,6 +95,12 @@ pub fn pluginConfigsDir() -> Result<PathBuf, String> {
 
 #[allow(non_snake_case)]
 pub fn pluginConfigDir(pluginId: &str) -> Result<PathBuf, String> {
+    Ok(pluginConfigsDir()?.join(pluginConfigDirName(pluginId)?))
+}
+
+/// Resolves the stable config directory name without requiring a process-global runtime root.
+#[allow(non_snake_case)]
+pub fn pluginConfigDirName(pluginId: &str) -> Result<String, String> {
     let trimmed = pluginId.trim();
     if trimmed.is_empty() {
         return Err("plugin id must not be blank".to_string());
@@ -127,7 +116,7 @@ pub fn pluginConfigDir(pluginId: &str) -> Result<PathBuf, String> {
     } else {
         format!("{safeBaseName}-{:x}", javaStringHashCode(trimmed))
     };
-    Ok(pluginConfigsDir()?.join(safeName))
+    Ok(safeName)
 }
 
 #[allow(non_snake_case)]
@@ -214,6 +203,11 @@ pub fn githubAuthPreferencesPath() -> Result<PathBuf, String> {
 }
 
 #[allow(non_snake_case)]
+pub fn codexAuthPreferencesPath() -> Result<PathBuf, String> {
+    relativeFile(CODEX_AUTH_PREFERENCES_PATH)
+}
+
+#[allow(non_snake_case)]
 pub fn modelConfigsPreferencesPath() -> Result<PathBuf, String> {
     relativeFile(MODEL_CONFIGS_PREFERENCES_PATH)
 }
@@ -259,120 +253,6 @@ pub fn mcpConfigPath() -> Result<PathBuf, String> {
 #[allow(non_snake_case)]
 pub fn mcpServerStatusPath() -> Result<PathBuf, String> {
     relativeFile(MCP_SERVER_STATUS_PATH)
-}
-
-#[allow(non_snake_case)]
-pub fn memoryStoreRootPath(ownerKey: &str) -> Result<PathBuf, String> {
-    let owner = parseMemoryOwnerKey(ownerKey)?;
-    let ownerRelativePath = match owner.kind {
-        MemoryOwnerKind::Character => format!(
-            "{}/{}",
-            DATA_MEMORY_CHARACTERS_DIR_PATH,
-            sanitizeMemoryOwnerId(&owner.id)
-        ),
-        MemoryOwnerKind::Shared => format!(
-            "{}/{}",
-            DATA_MEMORY_SHARED_DIR_PATH,
-            sanitizeMemoryOwnerId(&owner.id)
-        ),
-    };
-    relativeDir(&ownerRelativePath)
-}
-
-#[allow(non_snake_case)]
-pub fn userMarkdownPath(ownerKey: &str) -> Result<PathBuf, String> {
-    Ok(memoryStoreRootPath(ownerKey)?.join(MEMORY_USER_MARKDOWN_FILE_NAME))
-}
-
-#[allow(non_snake_case)]
-pub fn memorySqlitePath(ownerKey: &str) -> Result<PathBuf, String> {
-    Ok(memoryStoreRootPath(ownerKey)?.join(MEMORY_SQLITE_FILE_NAME))
-}
-
-#[allow(non_snake_case)]
-pub fn memoryLinkSqlitePath(ownerKey: &str) -> Result<PathBuf, String> {
-    Ok(memoryStoreRootPath(ownerKey)?.join(MEMORY_LINK_SQLITE_FILE_NAME))
-}
-
-/// Returns the candidate queue database path for one memory owner.
-#[allow(non_snake_case)]
-pub fn memoryAutoSaveCandidateSqlitePath(ownerKey: &str) -> Result<PathBuf, String> {
-    Ok(memoryStoreRootPath(ownerKey)?.join(MEMORY_AUTO_SAVE_CANDIDATE_SQLITE_FILE_NAME))
-}
-
-#[allow(non_snake_case)]
-pub fn memorySearchSettingsPath(ownerKey: &str) -> Result<PathBuf, String> {
-    let path = memoryStoreRootPath(ownerKey)?.join(MEMORY_SEARCH_SETTINGS_FILE_PATH);
-    Ok(path)
-}
-
-/// Builds a host-relative storage path for one memory search configuration.
-#[allow(non_snake_case)]
-pub fn memorySearchSettingsStoragePath(ownerKey: &str) -> Result<String, String> {
-    let owner = parseMemoryOwnerKey(ownerKey)?;
-    let ownerPath = match owner.kind {
-        MemoryOwnerKind::Character => format!(
-            "{}/{}",
-            DATA_MEMORY_CHARACTERS_DIR_PATH,
-            sanitizeMemoryOwnerId(&owner.id)
-        ),
-        MemoryOwnerKind::Shared => format!(
-            "{}/{}",
-            DATA_MEMORY_SHARED_DIR_PATH,
-            sanitizeMemoryOwnerId(&owner.id)
-        ),
-    };
-    Ok(format!("{ownerPath}/{MEMORY_SEARCH_SETTINGS_FILE_PATH}"))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemoryOwnerKind {
-    Character,
-    Shared,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParsedMemoryOwnerKey {
-    pub kind: MemoryOwnerKind,
-    pub id: String,
-}
-
-#[allow(non_snake_case)]
-pub fn parseMemoryOwnerKey(ownerKey: &str) -> Result<ParsedMemoryOwnerKey, String> {
-    let (kind, id) = ownerKey
-        .split_once(':')
-        .ok_or_else(|| format!("invalid memory owner key: {ownerKey}"))?;
-    let trimmedId = id.trim();
-    if trimmedId.is_empty() {
-        return Err(format!("invalid memory owner id: {ownerKey}"));
-    }
-    let kind = match kind {
-        "character" => MemoryOwnerKind::Character,
-        "shared" => MemoryOwnerKind::Shared,
-        other => return Err(format!("invalid memory owner kind: {other}")),
-    };
-    Ok(ParsedMemoryOwnerKey {
-        kind,
-        id: trimmedId.to_string(),
-    })
-}
-
-#[allow(non_snake_case)]
-pub fn characterMemoryOwnerKey(characterCardId: &str) -> Result<String, String> {
-    let id = characterCardId.trim();
-    if id.is_empty() {
-        return Err("character memory owner id is empty".to_string());
-    }
-    Ok(format!("character:{id}"))
-}
-
-#[allow(non_snake_case)]
-pub fn sharedMemoryOwnerKey(sharedMemoryId: &str) -> Result<String, String> {
-    let id = sharedMemoryId.trim();
-    if id.is_empty() {
-        return Err("shared memory owner id is empty".to_string());
-    }
-    Ok(format!("shared:{id}"))
 }
 
 #[allow(non_snake_case)]
@@ -444,21 +324,4 @@ fn javaStringHashCode(value: &str) -> i32 {
     value.encode_utf16().fold(0_i32, |hash, unit| {
         hash.wrapping_mul(31).wrapping_add(unit as i32)
     })
-}
-
-#[allow(non_snake_case)]
-pub fn sanitizeMemoryOwnerId(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "_".to_string()
-    } else {
-        out
-    }
 }

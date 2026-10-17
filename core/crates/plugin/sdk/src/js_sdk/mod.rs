@@ -13,16 +13,23 @@ pub type JsAny = serde_json::Value;
 pub type JsObject = serde_json::Value;
 
 pub mod chat;
+pub mod edge;
 pub mod compose_dsl;
 pub mod compose_dsl_material3_generated;
 pub mod core;
 pub mod files;
 pub mod material_icons;
-pub mod memory;
 pub mod network;
 pub mod results;
 pub mod runtime_bindings;
 pub mod software_settings;
+pub mod models;
+pub mod tts;
+pub mod stt;
+pub mod theme;
+pub mod catalog;
+pub mod storage;
+pub mod storage_facade;
 pub mod system;
 pub mod tool_types;
 pub mod toolpkg;
@@ -58,6 +65,48 @@ pub type JsHostResult<T> = Result<T, JsHostError>;
 
 /// Represents a JavaScript promise returned by an SDK operation.
 pub type JsFuture<T> = Pin<Box<dyn Future<Output = JsHostResult<T>> + Send>>;
+
+/// Pulls one event at a time and separates observer disposal from business cancellation.
+pub trait JsAsyncIterator<T>: Send + Sync {
+    /// Waits for the next event or the authoritative end of observation.
+    fn next(&self) -> JsFuture<Option<T>>;
+    /// Detaches observation without cancelling the accepted operation.
+    fn close(&self) -> JsFuture<()>;
+}
+
+/// Represents the single-consumer JavaScript async iterable returned by a streaming operation.
+pub type JsAsyncIterable<T> = std::sync::Arc<dyn JsAsyncIterator<T>>;
+
+/// Represents a standard JavaScript async iterable iterator at the SDK boundary.
+pub struct JsAsyncIterableIterator<T>(std::marker::PhantomData<T>);
+/// Represents a JavaScript arbitrary precision integer.
+pub struct JsBigInt;
+/// Represents a JavaScript byte array.
+pub struct JsUint8Array;
+
+/// Represents a standard TypeScript method decorator that preserves its method signature.
+pub struct JsMethodDecorator;
+
+/// Retains a rejected stream opening as the original iterator rejection, not a fabricated event.
+struct RejectedJsAsyncIterator<T> {
+    error: JsHostError,
+    item: std::marker::PhantomData<T>,
+}
+
+impl<T: Send + Sync + 'static> JsAsyncIterator<T> for RejectedJsAsyncIterator<T> {
+    /// Rejects observation with the exact opening error.
+    fn next(&self) -> JsFuture<Option<T>> {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
+    }
+    /// Releases a failed opening that never acquired a live observation.
+    fn close(&self) -> JsFuture<()> { Box::pin(async { Ok(()) }) }
+}
+
+/// Creates an explicitly rejected iterator when a synchronous host opening fails.
+pub fn rejected_js_async_iterable<T: Send + Sync + 'static>(error: JsHostError) -> JsAsyncIterable<T> {
+    std::sync::Arc::new(RejectedJsAsyncIterator { error, item: std::marker::PhantomData })
+}
 
 /// Represents a JavaScript Date value on the SDK boundary.
 pub type JsDate = String;
@@ -264,41 +313,6 @@ where
     }
 }
 
-/// Requires an embedding host to implement every namespace exposed by the global Tools object.
-pub trait JsToolsHost:
-    files::FilesHost
-    + network::NetHost
-    + network::NetCookieManager
-    + system::SystemHost
-    + system::SystemBluetoothHost
-    + system::SystemBluetoothBleHost
-    + system::SystemTerminalHost
-    + system::SystemMusicHost
-    + software_settings::SoftwareSettingsHost
-    + chat::ChatHost
-    + memory::MemoryHost
-    + Send
-    + Sync
-{
-}
-
-impl<T> JsToolsHost for T where
-    T: files::FilesHost
-        + network::NetHost
-        + network::NetCookieManager
-        + system::SystemHost
-        + system::SystemBluetoothHost
-        + system::SystemBluetoothBleHost
-        + system::SystemTerminalHost
-        + system::SystemMusicHost
-        + software_settings::SoftwareSettingsHost
-        + chat::ChatHost
-        + memory::MemoryHost
-        + Send
-        + Sync
-{
-}
-
 /// Collects declarations reserved for host capabilities that are not active runtime Tools yet.
 pub trait JsFutureToolsHost: network::NetFutureHost + ui::UIHost + Send + Sync {}
 
@@ -306,15 +320,11 @@ impl<T> JsFutureToolsHost for T where T: network::NetFutureHost + ui::UIHost + S
 
 /// Requires an embedding host to implement the complete ToolPkg runtime API.
 pub trait ToolPkgHost:
-    toolpkg::ToolPkgRegistryMethods + toolpkg::ToolPkgIpcApiMethods + toolpkg::GlobalHost + Send + Sync
+    toolpkg::ToolPkgRegistryMethods + toolpkg::ToolPkgIpcApiMethods + Send + Sync
 {
 }
 
 impl<T> ToolPkgHost for T where
-    T: toolpkg::ToolPkgRegistryMethods
-        + toolpkg::ToolPkgIpcApiMethods
-        + toolpkg::GlobalHost
-        + Send
-        + Sync
+    T: toolpkg::ToolPkgRegistryMethods + toolpkg::ToolPkgIpcApiMethods + Send + Sync
 {
 }

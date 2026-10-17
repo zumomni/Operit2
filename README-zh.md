@@ -71,7 +71,9 @@ Operit2 的扩展面已经从“内置工具集合”逐步抽象为可管理的
 
 Web Access 让浏览器访问一个已运行的 CoreNode；打开页面不会自动让浏览器成为 Space 中的独立节点。浏览器 Host 与 WebAssembly 运行时是另一条工程路径，两者的能力和部署方式需要分别看待。
 
-本地开发方式见下方“Web Access 开发”，访问与部署说明见 [`apps/web_access/README.md`](apps/web_access/README.md)。
+本地开发方式见下方“Web Access 开发”。GitHub Actions 中保留独立的
+`Deploy Web Experience` 工作流，用标准 Flutter Web 构建并发布到
+`gh-pages`；访问与部署说明见 [`apps/flutter/app/web/README.md`](apps/flutter/app/web/README.md)。
 
 ### 数据备份与迁移
 
@@ -97,7 +99,7 @@ operit2 cli backup restore <snapshot.zip>
 | Web Access | 访问某个已运行 CoreNode 的浏览器入口 | 不是自动加入 Space 的浏览器节点，也不是中心化 Agent Server |
 | WebAssembly/browser Host | 浏览器运行时的本地能力边界 | 与 Web Access 访问面分开，具体能力取决于浏览器和当前 Web 构建模式 |
 | Linux 云端设备 | Space 中的普通 CoreNode | 长期在线可以承担更多任务，但不因此拥有中心身份 |
-| ESP32 Edge Node | 设备侧 Edge Service 能力节点 | 不是完整 CoreNode，不持有 OperitApplication、Chat、Store、Identity 或 Space 同步 |
+| ESP32 Edge Node | 设备侧 Edge Service 能力节点 | 不是完整 CoreNode；仅保存节点身份、配对与设备空间控制状态，不运行 Chat/Store 业务，也不复制业务数据 |
 | Server | 未来的部署形态和 Host 方向 | 当前仓库还没有可以直接发布的完整 Server 产品 |
 
 仓库包含多平台 Host 适配路径，但“能够构建”不等于“已经完成跨设备互操作验证”。平台构建、签名和发布条件请以 [`BUILDING.md`](BUILDING.md) 与对应 workflow 为准。
@@ -175,7 +177,7 @@ cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- tui
 ```powershell
 cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli
 cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli link
-cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli web
+cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli web open
 ```
 
 ### Flutter App
@@ -212,7 +214,7 @@ apps/
 ├── cli/                 Rust CLI/TUI 入口
 ├── pb_sbc01_h3/         PB_SBC01_H3 硬件主控入口
 ├── flutter/app/         Flutter App 入口
-├── web_access/          Web Access 前端边界和共享 bundle
+├── flutter/app/web/     web.operit.app 的标准 Flutter Web 前端
 └── server/              Server 形态预留目录
 
 core/
@@ -236,7 +238,7 @@ docs/                    架构、权限、Link、迁移和版本文档
 - [Link、Access 与 Space 边界](docs/link-access-architecture.md)
 - [权限、AI 能力与 sandbox 边界](docs/permission-access-architecture.md)
 - [平台 Host 实现边界](hosts/README.md)
-- [Web Access 前端与部署要求](apps/web_access/README.md)
+- [Web Access 前端与部署要求](apps/flutter/app/web/README.md)
 - [插件作者文档](plugins/docs/README.md)
 - [版本、tag、渠道与发布资产](docs/release-versioning.md)
 - [当前 crate 拆分与迁移计划](docs/core-module-crate-layout.md)

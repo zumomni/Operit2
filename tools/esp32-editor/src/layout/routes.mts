@@ -11,7 +11,7 @@ export interface EventBinding {
   label: string;
 }
 
-/** Shared capability list for the editor, validation and Agents. Every route must have a matching implementation in operit_lvgl.c. */
+/** Shared capability list for the editor, validation and Agents. Every route must have a matching implementation in operit_mini_ui.c. */
 export const routes: Route[] = [
   {id: '', label: '无动作', kind: 'none'},
   {id: 'home', label: '跳转 · 首页', kind: 'navigate', target: 'Home'},
@@ -25,6 +25,9 @@ export const routes: Route[] = [
   {id: 'shape_toggle', label: '主题 · 切换图标形状', kind: 'command'},
   {id: 'face_online', label: '设备动作 · 在线表情', kind: 'command'},
   {id: 'run_node', label: '设备动作 · 运行节点', kind: 'command'},
+  {id: 'edge_search', label: 'Edge · 搜索附近 Space', kind: 'command'},
+  {id: 'edge_pair', label: 'Edge · 发起配对', kind: 'command'},
+  {id: 'edge_chat', label: 'Edge · 打开 Space 聊天', kind: 'command'},
 ];
 
 export const actions: string[] = routes.map((route) => route.id);

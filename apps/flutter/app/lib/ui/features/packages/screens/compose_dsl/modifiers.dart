@@ -82,11 +82,18 @@ Widget _withModifier(
   required _ComposeDslModifierScope modifierScope,
 }) {
   final ops = _modifierOps(props['modifier']);
+  final dragOp = _modifierOpByToken(props['modifier'], 'draggestures');
+  final transformOp = _modifierOpByToken(
+    props['modifier'],
+    'transformgestures',
+  );
+  final combinedMotion = dragOp != null && transformOp != null;
   Widget current = child;
   current = _withDirectModifierProps(
     context,
     current,
     props,
+    onAction,
     nodeType: nodeType,
     modifierScope: modifierScope,
   );
@@ -235,6 +242,20 @@ Widget _withModifier(
       case 'tapgestures':
       case 'draggestures':
       case 'transformgestures':
+        if (combinedMotion && name == 'transformgestures') break;
+        if (combinedMotion && name == 'draggestures') {
+          final transformArgs = transformOp['args'] as List<Object?>;
+          current = _ComposeGestureRegion(
+            kind: 'motiongestures',
+            options: <String, Object?>{
+              ..._stringMap(args.firstOrNull),
+              ..._stringMap(transformArgs.firstOrNull),
+            },
+            onAction: onAction,
+            child: current,
+          );
+          break;
+        }
         current = _ComposeGestureRegion(
           kind: name,
           options: _stringMap(args.firstOrNull),
@@ -244,21 +265,18 @@ Widget _withModifier(
         break;
       case 'fillMaxWidth':
       case 'fillmaxwidth':
-        if (modifierScope != _ComposeDslModifierScope.row) {
-          current = SizedBox(width: double.infinity, child: current);
-        }
-        break;
       case 'fillMaxHeight':
       case 'fillmaxheight':
-        current = SizedBox(height: double.infinity, child: current);
-        break;
       case 'fillMaxSize':
       case 'fillmaxsize':
-        if (modifierScope == _ComposeDslModifierScope.row) {
-          current = SizedBox(height: double.infinity, child: current);
-        } else {
-          current = SizedBox.expand(child: current);
-        }
+        current = ComposeDslFill(
+          fillWidth:
+              name != 'fillmaxheight' &&
+              modifierScope != _ComposeDslModifierScope.row,
+          fillHeight: name != 'fillmaxwidth',
+          fraction: math.max(0, _number(args.firstOrNull) ?? 1),
+          child: current,
+        );
         break;
       case 'width':
       case 'requiredWidth':
@@ -424,36 +442,99 @@ Widget _withModifier(
 Widget _withDirectModifierProps(
   BuildContext context,
   Widget child,
-  Map<String, Object?> props, {
+  Map<String, Object?> props,
+  Future<Object?> Function(String, [Object?]) onAction, {
   required String nodeType,
   required _ComposeDslModifierScope modifierScope,
 }) {
   Widget current = child;
-  final width = _number(props['width']);
-  final height = _number(props['height']);
-  if (width != null || height != null) {
+  // Box owns its visual transition so intermediate sizes are not clamped by
+  // an outer SizedBox. All geometry, colors and timing come from the plugin.
+  final boxVisuals =
+      nodeType == 'Box' &&
+      (props['animation'] is Map || props['hoverStyle'] is Map);
+  final visualProps = boxVisuals && _ComposeHoverScope.of(context)
+      ? <String, Object?>{...props, ..._stringMap(props['hoverStyle'])}
+      : props;
+  final width = _number(visualProps['width']);
+  final height = _number(visualProps['height']);
+  if (boxVisuals) {
+    final animation = _stringMap(props['animation']);
+    final durationMillis = _int(animation['durationMillis']) ?? 0;
+    final decoration = BoxDecoration(
+      color: _color(
+        context,
+        visualProps['backgroundColor'] ?? visualProps['background'],
+      ),
+      gradient: visualProps['backgroundBrush'] == null
+          ? null
+          : _backgroundGradient(
+              context,
+              _stringMap(visualProps['backgroundBrush']),
+            ),
+      borderRadius: _borderRadius(
+        visualProps['backgroundShape'] ?? visualProps['shape'],
+      ),
+    );
+    current = AnimatedContainer(
+      duration: Duration(milliseconds: durationMillis < 0 ? 0 : durationMillis),
+      curve: switch (_normalizeToken(_string(animation['curve']))) {
+        'easeoutcubic' => Curves.easeOutCubic,
+        'easeinout' => Curves.easeInOut,
+        'easeout' => Curves.easeOut,
+        _ => Curves.linear,
+      },
+      width: width,
+      height: height,
+      decoration: decoration,
+      child: current,
+    );
+  } else if (width != null || height != null) {
     current = SizedBox(width: width, height: height, child: current);
   }
   if (_bool(props['fillMaxSize'])) {
-    if (modifierScope == _ComposeDslModifierScope.row) {
-      current = SizedBox(height: double.infinity, child: current);
-    } else {
-      current = SizedBox.expand(child: current);
-    }
-  } else if (_bool(props['fillMaxWidth'])) {
-    if (modifierScope != _ComposeDslModifierScope.row) {
-      current = SizedBox(width: double.infinity, child: current);
-    }
+    current = ComposeDslFill(
+      fillWidth: modifierScope != _ComposeDslModifierScope.row,
+      fillHeight: true,
+      child: current,
+    );
   } else if (_bool(props['fillMaxHeight'])) {
-    current = SizedBox(height: double.infinity, child: current);
+    current = ComposeDslFill(
+      fillWidth: false,
+      fillHeight: true,
+      child: current,
+    );
+  } else if (_bool(props['fillMaxWidth'])) {
+    current = ComposeDslFill(
+      fillWidth: modifierScope != _ComposeDslModifierScope.row,
+      fillHeight: false,
+      child: current,
+    );
   }
   final padding = _commonPaddingFromProps(props);
   if (padding != null) {
     current = Padding(padding: padding, child: current);
   }
+  // Put row ink above its decoration and inside its full padded hit region.
+  // Wrapping a decorated row afterwards hides the splash behind the background.
+  if (nodeType == 'Row' && _actionId(props['onClick']) != null) {
+    final clipArgs =
+        _modifierOpByToken(props['modifier'], 'clip')?['args']
+            as List<Object?>?;
+    current = _ComposeGestureRegion(
+      kind: 'combinedclickable',
+      options: <String, Object?>{'onClick': props['onClick']},
+      borderRadius:
+          _borderRadius(props['backgroundShape'] ?? props['shape']) ??
+          _borderRadius(clipArgs?.firstOrNull) ??
+          BorderRadius.zero,
+      onAction: onAction,
+      child: current,
+    );
+  }
   final background = props['backgroundColor'] ?? props['background'];
   final brush = props['backgroundBrush'];
-  if (background != null || brush != null) {
+  if (!boxVisuals && (background != null || brush != null)) {
     current = DecoratedBox(
       decoration: BoxDecoration(
         color: brush == null ? _color(context, background) : null,

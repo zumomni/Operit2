@@ -176,6 +176,7 @@ class _MarkdownTextState extends State<_MarkdownText>
     final lines = widget.text.split('\n');
     var index = 0;
     var textBlockIndex = 0;
+    var paragraphBreakIndex = 0;
     var typewriterOffset = 0;
     var pendingParagraphBreak = false;
     final enableTypewriter = _enableTypewriter;
@@ -242,6 +243,7 @@ class _MarkdownTextState extends State<_MarkdownText>
           MarkdownImageRenderer(
             imageMarkdown: widget.text.trim(),
             textColor: widget.textColor,
+            onOpenLink: widget.onLinkClick,
           ),
         );
       case MarkdownNodeType.blockLatex:
@@ -304,7 +306,7 @@ class _MarkdownTextState extends State<_MarkdownText>
           textKey: '${widget.nodeKey}-text-0',
           text: widget.text,
           color: widget.textColor,
-          reveal: revealSegmentFor(widget.text.length),
+          reveal: revealSegmentFor(widget.text.characters.length),
           children: widget.children,
           isLastNode: widget.isLastNode,
           onLinkClick: widget.onLinkClick,
@@ -331,7 +333,7 @@ class _MarkdownTextState extends State<_MarkdownText>
           textKey: '${widget.nodeKey}-text-${textBlockIndex++}',
           text: paragraphLines.join('\n'),
           color: widget.textColor,
-          reveal: revealSegmentFor(paragraphLines.join('\n').length),
+          reveal: revealSegmentFor(paragraphLines.join('\n').characters.length),
           onLinkClick: widget.onLinkClick,
         ),
       );
@@ -344,8 +346,10 @@ class _MarkdownTextState extends State<_MarkdownText>
         return;
       }
       widgets.add(
-        const SizedBox(
-          key: ValueKey<String>('markdown-paragraph-break'),
+        SizedBox(
+          key: ValueKey<String>(
+            'markdown-paragraph-break-${paragraphBreakIndex++}',
+          ),
           height: _markdownParagraphBreakHeight,
         ),
       );
@@ -428,6 +432,7 @@ class _MarkdownTextState extends State<_MarkdownText>
           MarkdownImageRenderer(
             imageMarkdown: trimmed.trim(),
             textColor: widget.textColor,
+            onOpenLink: widget.onLinkClick,
           ),
         );
       } else if (_isHorizontalRule(trimmed)) {
@@ -770,7 +775,7 @@ class _MarkdownParagraph extends StatelessWidget {
   }
 }
 
-class _TypewriterMarkdownRichText extends StatelessWidget {
+class _TypewriterMarkdownRichText extends StatefulWidget {
   const _TypewriterMarkdownRichText({
     super.key,
     required this.text,
@@ -791,28 +796,50 @@ class _TypewriterMarkdownRichText extends StatelessWidget {
   final void Function(String url)? onLinkClick;
 
   @override
+  State<_TypewriterMarkdownRichText> createState() =>
+      _TypewriterMarkdownRichTextState();
+}
+
+class _TypewriterMarkdownRichTextState
+    extends State<_TypewriterMarkdownRichText> {
+  final MarkdownLinkGestureOwner _gestures = MarkdownLinkGestureOwner();
+
+  @override
+  void dispose() {
+    _gestures.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final span = buildMarkdownInlineSpannableFromText(
-      context: context,
-      text: text,
-      textColor: color,
-      baseStyle: style,
-      onLinkClick: onLinkClick,
-    );
-    final richSpan = children.isNotEmpty
-        ? buildMarkdownInlineSpannableFromMarkdownNodes(
-            context: context,
-            children: children,
-            textColor: color,
-            baseStyle: style,
-            onLinkClick: onLinkClick,
-          )
-        : span;
+    _gestures.beginFrame();
+    late final InlineSpan richSpan;
+    try {
+      richSpan = widget.children.isNotEmpty
+          ? buildMarkdownInlineSpannableFromMarkdownNodes(
+              context: context,
+              children: widget.children,
+              textColor: widget.color,
+              baseStyle: widget.style,
+              onLinkClick: widget.onLinkClick,
+              gestures: _gestures,
+            )
+          : buildMarkdownInlineSpannableFromText(
+              context: context,
+              text: widget.text,
+              textColor: widget.color,
+              baseStyle: widget.style,
+              onLinkClick: widget.onLinkClick,
+              gestures: _gestures,
+            );
+    } finally {
+      _gestures.endFrame();
+    }
     final revealSpan = _revealedTypewriterSpan(
       source: richSpan,
-      revealLength: revealLength,
-      showCursor: showCursor,
-      baseStyle: style,
+      revealLength: widget.revealLength,
+      showCursor: widget.showCursor,
+      baseStyle: widget.style,
     );
     final pressShield = MessagePressShield.maybeOf(context);
 
@@ -829,12 +856,16 @@ class _TypewriterMarkdownRichText extends StatelessWidget {
             textDirection: Directionality.of(context),
             textScaler: MediaQuery.textScalerOf(context),
           )..layout(maxWidth: maxWidth);
-          if (_isInteractiveSpanHit(
-            span: revealSpan,
-            painter: painter,
-            position: event.localPosition,
-          )) {
-            pressShield.shieldPointer(event.pointer);
+          try {
+            if (_isInteractiveSpanHit(
+              span: revealSpan,
+              painter: painter,
+              position: event.localPosition,
+            )) {
+              pressShield.shieldPointer(event.pointer);
+            }
+          } finally {
+            painter.dispose();
           }
         },
         onPointerUp: (event) => pressShield.unshieldPointer(event.pointer),
@@ -845,7 +876,7 @@ class _TypewriterMarkdownRichText extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) => wrapWithInteractiveShield(
-        Text.rich(revealSpan, style: style),
+        Text.rich(revealSpan, style: widget.style),
         constraints.maxWidth,
       ),
     );
@@ -876,7 +907,7 @@ TextSpan _revealedTypewriterSpan({
   required bool showCursor,
   required TextStyle? baseStyle,
 }) {
-  final plainTextLength = source.toPlainText().length;
+  final plainTextLength = source.toPlainText().characters.length;
   final state = _InlineRevealState(
     revealLength: revealLength.clamp(0, plainTextLength).toDouble(),
     showCursor: showCursor,
@@ -943,7 +974,9 @@ void _appendRevealedText({
   required _InlineRevealState state,
 }) {
   final segmentStart = state.consumedLength;
-  final segmentEnd = segmentStart + text.length;
+  final textCharacters = text.characters;
+  final textLength = textCharacters.length;
+  final segmentEnd = segmentStart + textLength;
   final revealLength = state.revealLength;
   if (revealLength >= segmentEnd) {
     spans.add(TextSpan(text: text, style: style, recognizer: recognizer));
@@ -959,7 +992,7 @@ void _appendRevealedText({
   }
 
   final visibleLength = (revealLength.floor() - segmentStart)
-      .clamp(0, text.length)
+      .clamp(0, textLength)
       .toInt();
   final partialAmount = (revealLength - revealLength.floor())
       .clamp(0, 1)
@@ -967,17 +1000,17 @@ void _appendRevealedText({
   if (visibleLength > 0) {
     spans.add(
       TextSpan(
-        text: text.substring(0, visibleLength),
+        text: textCharacters.take(visibleLength).toString(),
         style: style,
         recognizer: recognizer,
       ),
     );
   }
   var hiddenStart = visibleLength;
-  if (partialAmount > 0 && visibleLength < text.length) {
+  if (partialAmount > 0 && visibleLength < textLength) {
     spans.add(
       TextSpan(
-        text: text.substring(visibleLength, visibleLength + 1),
+        text: textCharacters.skip(visibleLength).take(1).toString(),
         style: _partialTextStyle(style, partialAmount),
       ),
     );
@@ -985,10 +1018,10 @@ void _appendRevealedText({
   }
   state.consumedLength = segmentStart + hiddenStart;
   _appendRevealCursor(spans, state);
-  if (hiddenStart < text.length) {
+  if (hiddenStart < textLength) {
     spans.add(
       TextSpan(
-        text: text.substring(hiddenStart),
+        text: textCharacters.skip(hiddenStart).toString(),
         style: _hiddenTextStyle(style),
       ),
     );

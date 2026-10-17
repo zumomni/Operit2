@@ -2,12 +2,13 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    parse_macro_input, Error, FnArg, GenericArgument, Ident, ImplItemFn, Pat, PathArguments,
-    ReturnType, Token, Type,
+    parse_macro_input, Error, FnArg, GenericArgument, Ident, ImplItemFn, LitStr, Pat,
+    PathArguments, ReturnType, Token, Type,
 };
 
 struct CoreRouteArguments {
     binding: Ident,
+    permission: LitStr,
     sdk: bool,
 }
 
@@ -15,24 +16,69 @@ impl Parse for CoreRouteArguments {
     /// Parses the binding identifier owned by one routed method annotation.
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut binding = None;
+        let mut permission = None;
         let mut sdk = false;
+        let mut create_binding = None;
         while !input.is_empty() {
             let name: Ident = input.parse()?;
             if name == "binding" {
                 input.parse::<Token![=]>()?;
                 binding = Some(input.parse::<Ident>()?);
+            } else if name == "permission" {
+                input.parse::<Token![=]>()?;
+                permission = Some(input.parse::<LitStr>()?);
+            } else if name == "create_binding" {
+                input.parse::<Token![=]>()?;
+                create_binding = Some(input.parse::<LitStr>()?);
             } else if name == "sdk" {
                 sdk = true;
             } else {
-                return Err(Error::new(name.span(), "expected `binding = argument` or `sdk`"));
+                return Err(Error::new(
+                    name.span(),
+                    "expected `binding = argument`, `permission = \"scope:capability\"`, or `sdk`",
+                ));
             }
             if input.peek(Token![,]) {
                 input.parse::<Token![,]>()?;
             }
         }
         let binding = binding.ok_or_else(|| input.error("missing `binding = argument`"))?;
-        Ok(Self { binding, sdk })
+        if let Some(permission) = &permission {
+            validate_permission(permission)?;
+        }
+        if let Some(capability) = create_binding {
+            if capability.value().trim().is_empty() {
+                return Err(Error::new(capability.span(), "binding creation requires a target capability"));
+            }
+        }
+        let permission = permission.unwrap_or_else(|| LitStr::new("", binding.span()));
+        Ok(Self {
+            binding,
+            permission,
+            sdk,
+        })
     }
+}
+
+/// Validates one explicit route permission scope and capability identifier.
+fn validate_permission(permission: &LitStr) -> syn::Result<()> {
+    let value = permission.value();
+    let Some((scope, capability)) = value.split_once(':') else {
+        return Err(Error::new(
+            permission.span(),
+            "route permission must use `caller:capability` or `target:capability`",
+        ));
+    };
+    if scope != "caller" && scope != "target"
+        || capability.trim().is_empty()
+        || capability.contains(':')
+    {
+        return Err(Error::new(
+            permission.span(),
+            "route permission must use `caller:capability` or `target:capability`",
+        ));
+    }
+    Ok(())
 }
 
 /// Wraps one routed method and preserves its local implementation under a generated name.
@@ -60,7 +106,23 @@ fn expand_core_route(
     let original_name = function.sig.ident.clone();
     let local_name = format_ident!("__operit_core_local_{}", original_name);
     let binding_argument = arguments.binding;
+    let permission = arguments.permission;
+    let permission_value = permission.value();
     let argument_names = function_argument_names(&function)?;
+    let reverse_arguments = function.sig.inputs.iter().filter_map(|argument| {
+        let FnArg::Typed(argument) = argument else { return None };
+        let Type::Path(path) = argument.ty.as_ref() else { return None };
+        if path.path.segments.last()?.ident != "ReverseStream" { return None }
+        let Pat::Ident(pattern) = argument.pat.as_ref() else { return None };
+        Some(pattern.ident.clone())
+    }).collect::<Vec<_>>();
+    if reverse_arguments.len() > 1 {
+        return Err(Error::new_spanned(&function.sig, "routed methods accept one ReverseStream input"));
+    }
+    let reverse_argument = reverse_arguments.first();
+    if reverse_argument.is_some() && function.sig.asyncness.is_none() {
+        return Err(Error::new_spanned(&function.sig, "ReverseStream routes require an async method"));
+    }
     if !argument_names.iter().any(|name| name == &binding_argument) {
         return Err(Error::new(
             binding_argument.span(),
@@ -99,12 +161,14 @@ fn expand_core_route(
     let wrapper_attrs = preserved_attrs.clone();
     let binding_name = binding_argument.to_string();
     let route_metadata_name = format_ident!("__operit_core_binding_{}", original_name);
+    let route_permission_name = format_ident!("__operit_core_permission_{}", original_name);
     let call_helper_name = format_ident!("__operit_core_route_call_{}", original_name);
     let watch_snapshot_helper_name =
         format_ident!("__operit_core_route_watch_snapshot_{}", original_name);
     let watch_helper_name = format_ident!("__operit_core_route_watch_{}", original_name);
     let route_arg_entries = argument_names
         .iter()
+        .filter(|name| reverse_argument != Some(*name))
         .map(|name| {
             quote! {
                 operit_rslink_runtime::core_arg_entry(stringify!(#name), &#name)
@@ -116,7 +180,21 @@ fn expand_core_route(
         operit_rslink_runtime::core_route_args(vec![#(#route_arg_entries),*])
     };
     let route_call_decode = route_call_decode(&function.sig.output);
-    let route_wrapper_body = if return_type_is_state_flow(&function.sig.output) {
+    let route_wrapper_body = if let Some(input) = reverse_argument {
+        quote! {
+            if let Some(__core_route_runtime) = operit_link::coreRouteRuntime() {
+                let __core_route_args_value = #route_args_value;
+                if __core_route_runtime.shouldRoute(stringify!(#original_name), &__core_route_args_value)
+                    .expect("annotated route resolution failed") {
+                    return operit_rslink_runtime::core_route_reverse_stream(
+                        __core_route_runtime.as_ref(), stringify!(#original_name),
+                        __core_route_args_value, #input,
+                    ).await.map_err(|error| error.message);
+                }
+            }
+            #call_expression
+        }
+    } else if return_type_is_state_flow(&function.sig.output) {
         let remote_flow = quote! {
             match operit_rslink_runtime::core_route_state_flow(
                 __core_route_runtime.clone(),
@@ -194,13 +272,23 @@ fn expand_core_route(
         }
     };
 
-    let route_helpers = render_route_helpers(
+    let route_helpers = if reverse_argument.is_some() {
+        quote! {
+            /// Rejects value calls to a service whose input is a ReverseStream.
+            #[doc(hidden)]
+            #visibility async fn #call_helper_name(
+                &mut self, _request: &operit_link::CoreCallRequest,
+            ) -> Result<operit_link::CoreValue, operit_link::CoreLinkError> {
+                Err(operit_link::CoreLinkError::new("REVERSE_STREAM_REQUIRES_PUSH", "ReverseStream requires the Push transport"))
+            }
+        }
+    } else { render_route_helpers(
         &function,
         &local_name,
         &call_helper_name,
         &watch_snapshot_helper_name,
         &watch_helper_name,
-    );
+    ) };
 
     function.sig = local_signature.clone();
     function.block = local_body;
@@ -220,6 +308,11 @@ fn expand_core_route(
         #[doc(hidden)]
         #visibility fn #route_metadata_name() -> &'static str {
             #binding_name
+        }
+
+        #[doc(hidden)]
+        #visibility fn #route_permission_name() -> &'static str {
+            #permission_value
         }
 
         #route_helpers

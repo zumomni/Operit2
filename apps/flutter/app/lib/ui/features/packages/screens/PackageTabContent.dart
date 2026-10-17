@@ -7,6 +7,7 @@ import '../../../common/components/M3LoadingIndicator.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../components/EmptyState.dart';
 import '../components/PackageGrid.dart';
+import '../components/ExtensionScopeControls.dart';
 import '../components/PackageListItem.dart';
 import '../utils/PackageDisplayUtils.dart';
 
@@ -16,6 +17,9 @@ class PackageTabContent extends StatelessWidget {
     super.key,
     required this.packages,
     required this.morePackages,
+    required this.loadIssues,
+    required this.scopes,
+    required this.onMoveScope,
     required this.enabledPackageNames,
     required this.isLoading,
     required this.isSearchActive,
@@ -23,10 +27,15 @@ class PackageTabContent extends StatelessWidget {
     required this.onPackageTap,
     required this.onLoadMorePackage,
     required this.onPackageEnabledChanged,
+    required this.onLoadIssueTap,
   });
 
   final List<core_proxy.ToolPackage> packages;
   final List<core_proxy.BundledExternalPackageCandidate> morePackages;
+  final List<core_proxy.ToolPkgLoadIssue> loadIssues;
+  final Map<String, String> scopes;
+  final ValueChanged<String> onMoveScope;
+
   final Set<String> enabledPackageNames;
   final bool isLoading;
   final bool isSearchActive;
@@ -36,11 +45,15 @@ class PackageTabContent extends StatelessWidget {
   onLoadMorePackage;
   final void Function(core_proxy.ToolPackage package, bool enabled)
   onPackageEnabledChanged;
+  final ValueChanged<core_proxy.ToolPkgLoadIssue> onLoadIssueTap;
 
   /// Builds the package tab with a lazily rendered expandable list.
   @override
   Widget build(BuildContext context) {
-    if (packages.isEmpty && morePackages.isEmpty && isLoading) {
+    if (packages.isEmpty &&
+        morePackages.isEmpty &&
+        loadIssues.isEmpty &&
+        isLoading) {
       return const M3LoadingPane();
     }
     final grouped = <String, List<core_proxy.ToolPackage>>{};
@@ -73,7 +86,7 @@ class PackageTabContent extends StatelessWidget {
               ),
             if (!isSearchActive)
               const SliverToBoxAdapter(child: SizedBox(height: 12)),
-            if (packages.isEmpty && morePackages.isEmpty)
+            if (packages.isEmpty && morePackages.isEmpty && loadIssues.isEmpty)
               SliverPadding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
                 sliver: SliverToBoxAdapter(
@@ -85,7 +98,7 @@ class PackageTabContent extends StatelessWidget {
                   ),
                 ),
               ),
-            if (packages.isEmpty)
+            if (packages.isEmpty && loadIssues.isEmpty)
               const SliverPadding(
                 padding: EdgeInsets.fromLTRB(16, 0, 16, 0),
                 sliver: SliverToBoxAdapter(
@@ -95,10 +108,11 @@ class PackageTabContent extends StatelessWidget {
             else
               SliverPadding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                sliver: PackageSliverList(
-                  itemCount: orderedPackages.length,
-                  itemBuilder: (context, index) {
-                    final package = orderedPackages[index];
+                sliver: ScopedExtensionSliver<core_proxy.ToolPackage>(
+                  items: orderedPackages,
+                  scopes: scopes,
+                  identity: (package) => package.name,
+                  itemBuilder: (context, package) {
                     return PackageListItem(
                       key: ValueKey<String>('package:${package.name}'),
                       icon: packageCategoryIcon(package.category),
@@ -112,12 +126,59 @@ class PackageTabContent extends StatelessWidget {
                       ],
                       enabled: enabledPackageNames.contains(package.name),
                       onDetails: () => onPackageTap(package),
+                      trailingActions: <Widget>[
+                        ExtensionScopeAction(
+                          scope: scopes[package.name]!,
+                          onMove: () => onMoveScope(package.name),
+                        ),
+                      ],
                       onEnabledChanged: (enabled) =>
                           onPackageEnabledChanged(package, enabled),
                     );
                   },
                 ),
               ),
+            if (loadIssues.isNotEmpty) ...<Widget>[
+              const SliverToBoxAdapter(child: SizedBox(height: 16)),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+                sliver: const SliverToBoxAdapter(
+                  child: _PackageSectionHeader(
+                    title: '加载失败',
+                    subtitle: '这些包未能完成解析或导入，点击卡片查看完整错误。',
+                  ),
+                ),
+              ),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+                sliver: PackageSliverList(
+                  itemCount: loadIssues.length,
+                  itemBuilder: (context, index) {
+                    final issue = loadIssues[index];
+                    return PackageListItem(
+                      key: ValueKey<String>(
+                        'package-load-issue:${issue.sourcePath}:${issue.code}:$index',
+                      ),
+                      icon: Icons.error_outline,
+                      title: issue.displayName,
+                      subtitle: issue.message,
+                      metadata: <String>[
+                        issue.packageName ?? '',
+                        issue.packageKind,
+                        issue.code,
+                        issue.sourcePath,
+                      ],
+                      enabled: false,
+                      showEnabledSwitch: false,
+                      hasError: true,
+                      errorMessage: issue.message,
+                      onEnabledChanged: (_) {},
+                      onDetails: () => onLoadIssueTap(issue),
+                    );
+                  },
+                ),
+              ),
+            ],
             if (morePackages.isNotEmpty) ...<Widget>[
               const SliverToBoxAdapter(child: SizedBox(height: 16)),
               SliverPadding(
@@ -174,7 +235,10 @@ class PackageTabContent extends StatelessWidget {
               const SliverToBoxAdapter(child: SizedBox(height: 120)),
           ],
         ),
-        if ((packages.isNotEmpty || morePackages.isNotEmpty) && isLoading)
+        if ((packages.isNotEmpty ||
+                morePackages.isNotEmpty ||
+                loadIssues.isNotEmpty) &&
+            isLoading)
           const Positioned.fill(child: M3LoadingOverlay()),
       ],
     );

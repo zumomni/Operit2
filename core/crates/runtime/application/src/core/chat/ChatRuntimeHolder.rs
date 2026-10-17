@@ -57,6 +57,11 @@ impl ChatRuntimeCoreFactory {
                     ChatSelectionMode::LOCAL_ONLY
                 }
             },
+            match slot {
+                ChatRuntimeSlot::MAIN => Some(operit_plugin_sdk::js_sdk::chat::ChatRuntime::Main),
+                ChatRuntimeSlot::FLOATING => Some(operit_plugin_sdk::js_sdk::chat::ChatRuntime::Floating),
+                ChatRuntimeSlot::DETACHED(_) => None,
+            },
             self.fileSystemHost.clone(),
             self.pendingQueueStore.clone(),
         );
@@ -81,8 +86,17 @@ pub struct ChatRuntimeHolder {
 impl ChatRuntimeHolder {
     /// Resolves one generated proxy object id to the main chat service core.
     #[allow(non_snake_case)]
-    pub fn coreForObjectId(&mut self, _objectId: u32) -> Option<&mut ChatServiceCore> {
+    pub fn coreForTarget(&mut self, _target: &str) -> Option<&mut ChatServiceCore> {
         Some(self.getCore(ChatRuntimeSlot::MAIN))
+    }
+
+    /// Resolves a detached window's stable slot identity to its local chat core.
+    ///
+    /// The generated proxy uses the slot id as an instance argument because all
+    /// detached windows share the same generated object schema.
+    #[allow(non_snake_case)]
+    pub fn coreForInstanceId(&mut self, instanceId: String) -> Option<&mut ChatServiceCore> {
+        Some(self.getCore(ChatRuntimeSlot::DETACHED(instanceId)))
     }
 
     /// Creates a holder using bootstrap cores without host-backed enhanced AI services.
@@ -118,6 +132,17 @@ impl ChatRuntimeHolder {
         }
         holder.observeStats();
         holder
+    }
+
+    /// Borrows the actual main delegate's canonical manager for initialization-time record and execution-lease sharing.
+    #[allow(non_snake_case)]
+    pub(crate) fn chatHistoryManager(
+        &self,
+    ) -> Result<&operit_store::repository::ChatHistoryManager::ChatHistoryManager, String> {
+        self.cores
+            .get(&ChatRuntimeSlot::MAIN)
+            .map(|core| &core.chatHistoryDelegate.chatHistoryManager)
+            .ok_or_else(|| "Chat runtime has no initialized main record manager".to_string())
     }
 
     /// Returns the core for a slot, creating it from the factory when first used.

@@ -1,19 +1,14 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
 /**
+ * Contains a JSON object with complete values preserved by the native JSON parser.
+ */
+export type JsonObject = Record<string, unknown>;
+
+/**
  * Stores a scalar or JSON value assigned to an arbitrary tool parameter.
  */
 export type ToolParamsAdditionalValue = string | number | boolean | unknown;
-
-/**
- * Selects the native algorithm used to decompress plugin data.
- */
-export type NativeInterfaceHostDecompressAlgorithm = "deflate";
-
-/**
- * Selects the native cryptographic operation family requested by a plugin.
- */
-export type NativeInterfaceHostCryptoAlgorithm = "md5" | "aes";
 
 /**
  * Stores the named arguments passed to a tool invocation.
@@ -42,6 +37,50 @@ export interface ToolConfig {
    * Receives intermediate values produced by a streaming tool.
    */
   onIntermediateResult?: (arg0: any) => void;
+}
+
+/**
+ * Describes one parameter accepted by a public tool.
+ */
+export interface ToolCatalogParameter {
+  name: string;
+  type: string;
+  description: string;
+  required: boolean;
+  default: any;
+}
+
+/**
+ * Describes a public builtin or plugin tool available on a device.
+ */
+export interface ToolCatalogEntry {
+  name: string;
+  description: string;
+  parameters: ToolCatalogParameter[];
+  category: string;
+  source: string;
+  packageName?: string;
+}
+
+/**
+ * Contains public tool names and schemas returned by device discovery.
+ */
+export interface ToolCatalog {
+  tools: ToolCatalogEntry[];
+}
+
+/**
+ * Configures the lifetime of calls issued through Tools.device(nodeId).
+ */
+export interface DeviceToolOptions {
+  /**
+   * Maximum duration including connection and permission checks; defaults to 120000 ms.
+   */
+  timeoutMs?: number;
+  /**
+   * Optional AbortSignal. Aborting closes the remote execution stream.
+   */
+  signal?: object;
 }
 
 /**
@@ -233,129 +272,55 @@ export declare const dataUtils: DataUtilsApi;
  */
 export declare var exports: Record<string, any>;
 
-/**
- * Provides synchronous Android runtime services used by plugin scripts.
- */
-export namespace NativeInterface {
+declare global {
   /**
-   * Call a tool synchronously (legacy method)
-   * @param toolType - Tool type
-   * @param toolName - Tool name
-   * @param paramsJson - Parameters as JSON string
-   * @returns A JSON string representing a ToolResult object
+   * Represents the standard cancellation signal available in every plugin runtime.
    */
-  function callTool(toolType: string, toolName: string, paramsJson: string): string;
+  export interface AbortSignal {
+    /**
+     * Indicates whether cancellation has already been requested.
+     */
+    readonly aborted: boolean;
+    /**
+     * Carries the reason passed to AbortController.abort.
+     */
+    readonly reason: any;
+    /**
+     * Registers an abort event listener.
+     */
+    addEventListener(event: string, listener: () => void): void;
+    /**
+     * Removes a registered abort event listener.
+     */
+    removeEventListener(event: string, listener: () => void): void;
+    /**
+     * Throws the cancellation reason when this signal is aborted.
+     */
+    throwIfAborted(): void;
+  }
+
   /**
-   * Call a tool asynchronously
-   * @param callbackId - Unique callback ID
-   * @param toolType - Tool type
-   * @param toolName - Tool name
-   * @param paramsJson - Parameters as JSON string
-   * The callback will receive a ToolResult object
+   * Owns one standard cancellation signal.
    */
-  function callToolAsync(callbackId: string, toolType: string, toolName: string, paramsJson: string): void;
-  /**
-   * Starts an asynchronous tool call and routes both intermediate and final results to callbacks.
-   */
-  function callToolAsyncStreaming(callbackId: string, intermediateCallbackId: string, toolType: string, toolName: string, paramsJson: string): void;
-  /**
-   * Execute native crypto operations used by the CryptoJS bridge.
-   */
-  function crypto(algorithm: NativeInterfaceHostCryptoAlgorithm, operation: string, argsJson: string): string;
-  /**
-   * Decompress native deflate data from a base64 string or binary handle.
-   */
-  function decompress(data: string, algorithm: NativeInterfaceHostDecompressAlgorithm): string;
-  /**
-   * Resolve the persistent config directory for a package or toolpkg.
-   * Returns an absolute path under `/sdcard/Download/Operit/plugins/<id>`.
-   */
-  function getPluginConfigDir(pluginId: string): string;
-  /**
-   * Execute native image operations used by the Jimp bridge.
-   */
-  function image_processing(callbackId: string, operation: string, argsJson: string): void;
-  /**
-   * Log debug message with data
-   * @param message - Debug message
-   * @param data - Debug data
-   */
-  function logDebug(message: string, data: string): void;
-  /**
-   * Log error message
-   * @param message - Error message to log
-   */
-  function logError(message: string): void;
-  /**
-   * Log informational message
-   * @param message - Message to log
-   */
-  function logInfo(message: string): void;
-  /**
-   * Register an image from base64-encoded data into the global image pool
-   * and return a `<link type="image" id="...">` tag string that can be
-   * embedded into tool results or messages.
-   */
-  function registerImageFromBase64(base64: string, mimeType: string): string;
-  /**
-   * Register an image from a file path on the device into the global image
-   * pool and return a `<link type="image" id="...">` tag string that can
-   * be embedded into tool results or messages.
-   */
-  function registerImageFromPath(path: string): string;
-  /**
-   * Register an app lifecycle hook for current toolpkg main registration session.
-   * @param specJson - JSON object string describing an app lifecycle hook
-   */
-  function registerToolPkgAppLifecycleHook(specJson: string): void;
-  /**
-   * Register a chat input hook for current toolpkg main registration session.
-   * @param specJson - JSON object string describing a chat input hook
-   */
-  function registerToolPkgChatInputHook(specJson: string): void;
-  /**
-   * Register a chat message hook for current toolpkg main registration session.
-   * @param specJson - JSON object string describing a chat message hook
-   */
-  function registerToolPkgChatMessageHook(specJson: string): void;
-  /**
-   * Register an input menu toggle plugin for current toolpkg main registration session.
-   * @param specJson - JSON object string describing an input menu toggle plugin
-   */
-  function registerToolPkgInputMenuTogglePlugin(specJson: string): void;
-  /**
-   * Register a message processing plugin for current toolpkg main registration session.
-   * @param specJson - JSON object string describing a message processing plugin
-   */
-  function registerToolPkgMessageProcessingPlugin(specJson: string): void;
-  /**
-   * Register a toolbox UI module for current toolpkg main registration session.
-   * @param specJson - JSON object string describing a toolbox UI module
-   */
-  function registerToolPkgToolboxUiModule(specJson: string): void;
-  /**
-   * Register an XML render plugin for current toolpkg main registration session.
-   * @param specJson - JSON object string describing an XML render plugin
-   */
-  function registerToolPkgXmlRenderPlugin(specJson: string): void;
-  /**
-   * Report a script error with its source line and stack details.
-   * @param errorType - Error type
-   * @param errorMessage - Error message
-   * @param errorLine - Line number where error occurred
-   * @param errorStack - Error stack trace
-   */
-  function reportError(errorType: string, errorMessage: string, errorLine: number, errorStack: string): void;
-  /**
-   * Set an error for script execution
-   * @param error - Error message
-   */
-  function setError(error: string): void;
-  /**
-   * Set the result of script execution
-   * @param result - Result string
-   */
-  function setResult(result: string): void;
+  export interface AbortController {
+    /**
+     * Exposes the signal passed to cancellable SDK operations.
+     */
+    readonly signal: AbortSignal;
+    /**
+     * Cancels the owned signal exactly once with an optional reason.
+     */
+    abort(reason?: any): void;
+  }
+
+  export var AbortController: {
+    prototype: AbortController;
+    /**
+     * Creates an initially active abort controller.
+     */
+    new(): AbortController;
+  };
+
 }
 
 /**

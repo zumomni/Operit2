@@ -1,102 +1,82 @@
-# Agent UI editing contract
+# ESP32 界面开发与调试接口
 
-All clients edit the same `apps/esp32/ui/layout.json`; there is no Agent-specific copy.
-The GUI, HTTP clients and MCP adapter share validation and optimistic revision checks.
+系统页面由 `apps/esp32/ui_port/operit_mini_ui.c` 绘制，
+Rust 的 `apps/esp32/src/ui.rs` 和 `main.rs` 负责状态与动作适配。
+浏览器预览和真机使用同一份 C 实现。修改系统页面时直接编辑这些源码，
+重新构建 C/Wasm 预览与固件，再分别验证模拟器和物理设备。
 
-## HTTP (any language / host)
+Core 上的 JS/TS 插件使用 `Tools.device(nodeId).Edge` 调用设备能力；
+可选 `display.scene` 服务支持像素素材、本地动画和事件。
+插件流程见 [Edge 插件指南](../../plugins/docs/edge-plugin-guide.md)，
+网页宿主与源码边界见 [FRONTEND.md](FRONTEND.md)。
 
-Base URL: `http://127.0.0.1:8766`.
+## HTTP 调试
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/components` | Entire catalog with editable/resource requirements, limits and actions |
-| GET | `/api/component-source?id=ID&revision=REV` | Actual layout lines, excerpt, event/router implementation entrypoints; 409 on stale revision |
-| GET | `/api/layout` | `{document, revision}` |
-| PUT | `/api/layout` | Replace with `{revision, document}` |
-| PATCH | `/api/layout` | `{revision, operations}` |
-| POST | `/api/layout/validate` | `{document}` → `{errors}`; no write |
-| GET | `/api/build` | Build progress, failure, source/firmware manifest |
-| POST | `/api/build` | Build preview and firmware; never flash |
+本地服务默认地址为 `http://127.0.0.1:8766`。
 
-PATCH operations:
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/board` | 查询预览板型、尺寸与系统 UI 能力 |
+| GET | `/api/build` | 查询构建状态、清单与源码是否变化 |
+| POST | `/api/build` | 构建浏览器预览和固件，不烧录 |
+| GET | `/api/simulator/state` | 查询 Rust 模拟设备状态、TCP 地址与日志 |
+| POST | `/api/simulator/start` | 启动 Rust 模拟设备 |
+| POST | `/api/simulator/stop` | 停止 Rust 模拟设备 |
+| GET | `/api/simulator/memory` | 查询模拟设备的资源限制 |
+| GET | `/api/simulator/debug/tree` | 读取浏览器中当前 C/Wasm UI 的节点树 |
+| GET | `/api/simulator/debug/snapshot` | 读取浏览器中当前 C/Wasm UI 的结构化屏幕状态 |
+| POST | `/api/simulator/debug/tap` | 使用 `{id}` 点击当前可用控件 |
+| POST | `/api/simulator/debug/swipe` | 使用 `{direction}` 向当前 UI 提交滑动 |
+| POST | `/api/simulator/send` | 使用 `{text}` 向模拟设备的当前 Core 对话发送文字 |
+| GET | `/api/deploy/ports` | 查询真机串口 |
+| GET | `/api/deploy/flash` | 查询固件安装状态 |
+| POST | `/api/deploy/flash` | 使用 `{port}` 安装已构建固件 |
 
-```json
-{"revision":"COPY_FROM_GET","operations":[
-  {"op":"update","id":"home_brand","changes":{"text":"MY DEVICE","x":20}},
-  {"op":"document","changes":{"enabled":true}}
-]}
-```
+`/api/simulator/debug/*` 需要浏览器预览页面保持打开，命令由实际 C/Wasm 实例执行。
+它们不读取物理设备，也不由 Rust 模拟器构造另一套 UI 树。
+点击前先读取当前节点 ID；隐藏、禁用或不存在的节点会返回错误。
 
-Other operations: `{op:"add",node:{...}}` and `{op:"remove",id:"..."}`. Removing a panel removes descendants.
-A stale revision returns HTTP 409. Read again, compare the new document, and deliberately merge changes; never retry by blindly replacing another editor's work.
+## 构建与验证
 
-## CLI
+在仓库根目录执行：
 
 ```powershell
-node tools/esp32-editor/src/agent.mjs ui_components
-node tools/esp32-editor/src/agent.mjs ui_read
-node tools/esp32-editor/src/agent.mjs ui_patch @patch.json
-node tools/esp32-editor/src/agent.mjs ui_build_status
+npm run build --prefix tools/esp32-editor
+npm run build:firmware --prefix tools/esp32-editor
+npm run check --prefix tools/esp32-editor
+npm test --prefix tools/esp32-editor
 ```
 
-Use a JSON file for arguments to avoid shell quoting. `OPERIT_UI_URL` overrides the service URL.
+仅网页或预览修改可使用预览构建；系统页面和设备原生能力变更需要固件构建。
+配对、空间审批和远程聊天变更另运行
+`npm run test:space --prefix tools/esp32-editor`。
+模拟器测试使用独立配置和数据目录；真机性能与内存需要实际设备验证。
 
-## MCP stdio
+## 真机 USB 读屏与点击
 
-Register this command in an Agent's MCP configuration:
-
-```json
-{
-  "command":"node",
-  "args":["./tools/esp32-editor/src/agent.mjs","--mcp"],
-  "env":{"OPERIT_UI_URL":"http://127.0.0.1:8766"}
-}
+```powershell
+# 在仓库根目录运行；不需要常驻 HTTP server
+npm run device:screen --prefix tools/esp32-editor -- --port COM24
+npm run device:tree --prefix tools/esp32-editor -- --port COM24
+npm run device:tap --prefix tools/esp32-editor -- --port COM24 --id <从读屏结果取得的节点ID>
+python -X utf8 tools/esp32-editor/device-debug.py screen --port COM24
 ```
 
-Tools: `ui_component_source`, `ui_read`, `ui_components`, `ui_patch`, `ui_validate`, `ui_build_status`, `ui_build`.
-The adapter implements JSON-RPC initialization, tools/list, tools/call and ping; no dependencies or model-provider coupling.
+按实际设备选择串口。设备需要安装包含串口调试入口的固件；更新命令为
+`npm run dev --prefix tools/esp32-editor -- --port COM24 --no-monitor`。
+普通更新保留 NVS 中的 Wi-Fi、配对身份和空间状态。
 
-Windows/macOS/Linux Agents can use HTTP or MCP. Android/iOS/Web/OHOS Agents use their host's HTTP capability or existing MCP/remote-tool bridge to this development service. Their `localhost` is not the development PC: use the software's existing forwarding/bridge, not the device's loopback address. This change provides a shared protocol and adapter; it does not install MCP configuration or network forwarding into every host automatically. The service remains bound to the PC's loopback and is not a public unauthenticated editor.
+返回的 `source: "device-uart"` 表示内容来自物理设备当前 C 渲染器。
+`result` 包含页面、节点 ID、文本、坐标、可点击与可用状态，以及配对码和 UI 静态内存。
+这是结构化屏幕内容，不是像素截图或整板 RAM 测量。
 
-## Data and firmware
+点击通过真实触摸/事件入口执行。滑动命令按当前页面的支持情况返回结果。
+调试命令与 Link 复用 UART0，在 UI 主线程执行；队列单飞，帧有长度限制和 CRC。
+USB 调试不代替配对或空间审批。
 
-Version 1 supports the current board's 320×240 layout, up to 24 nodes and a conservative complexity budget of 40. Nested children reference a preceding `panel`; coordinates are relative to their parent. Bounds, unique IDs, supported widget types, actions, and strings are validated before writes. The current embedded font supports ASCII; arbitrary C code and file paths cannot be submitted through layout operations.
+串口一次只能由一个程序占用：先结束 monitor 或 CLI 常驻串口 session 再读屏。
+串口配对可依次执行 pair-start、读屏取码、pair-finish，每一步结束后释放端口。
+读屏和点击不主动复位设备；点击超时后先读屏确认状态，避免重复执行动作。
 
-`enabled:true` uses this layout as firmware home. With `false`, the editor previews the draft while firmware retains its built-in home. `compile-layout.mjs` generates a small C descriptor header; the same LVGL factory creates widgets for Wasm and firmware. Dragging changes the live LVGL object without compiling; Save persists the document and triggers a dual build. Build failures remain visible, and the previous successful preview is retained.
-
-Read `/api/build` after editing. An accepted JSON write is not proof of successful compilation or adequate real-device memory/performance. Board flashing remains a separate operation.
-
-## Component conversations and interaction routes
-
-Right-click / touch-hold an editor component to compose a function request. The context includes `kind: "operit.hardware.component"`, `componentId`, component, complete document, revision, dirty flag, request and route capabilities. Never treat an unsaved draft as the persisted document. When dirty, preserve the attached draft and coordinate it before changing persisted layout; do not silently overwrite it with `ui_patch`.
-
-Both GUI and API expose click (`action`) and optional long-press (`longAction`). `GET /api/components` / `ui_components` provides route IDs, labels, targets and event fields. Known routes include `home`, `apps`, `page:theme`, `page:settings`, `page:network`, `page:face`, `page:terminal`, `face_online`, `run_node`, and the empty string to unbind. Unknown routes are rejected. Navigation runs in the shared LVGL C implementation; device commands use the existing firmware callback. Registering a name alone does not implement a new feature.
-
-Example reply to a component conversation (paste into the editor's AI reply field):
-
-```json
-{"componentId":"openApps","operations":[
-  {"op":"update","id":"openApps","changes":{"action":"page:theme","longAction":"home"}}
-]}
-```
-
-Only the referenced component's action fields are accepted in this reply flow; no automatic execution or saving. For direct MCP/API updates, wrap operations with a freshly read `revision`. In run mode, short tap navigates to Theme; long press returns Home and does not also trigger the click. In edit mode, long press opens component context instead. To add new pages or capabilities, update the shared C/Rust implementation, route catalog and tests, then build both targets.
-
-
-## Source-reference workflow (v2, primary)
-
-The component attachment now includes `codeReference.location` (path, 1-based start/end lines, JSON pointer, excerpt, per-field lines, revision) and `codeReference.implementation` (C event/router functions, Rust command handling and route catalog locations). Use `ui_component_source` with `{id,revision?}` to refresh these references. Use IDs as stable identity; re-read before editing because line numbers move.
-
-The user's request is to implement behavior in the project, not merely generate route JSON. Read the referenced files, modify the selected component's binding and implement any needed page/command code and registered routes, then validate and build both targets. The JSON proposal example above is an optional compatibility path for small binding-only edits. New unsaved components have no file line number (`location:null`); their ID, draft pointer and full draft document identify them without inventing a saved position.
-
-## v2 项目与直接部署
-
-当前默认项目为 v2：根 nodes/background 是 home，pages 是附加页面（总数最多12），entryPage 是启动页；每页24组件、复杂度40。组件 ID 全项目唯一，parent 同页且指向前面的 panel。节点可设 binding clock/connection/expression，fontSize14/48。路由 `go:页面ID` 无需重新编译；swipeLeft/swipeRight 是目标页面 ID。
-
-补丁新增 `addPage {page}`、`updatePage {id,changes}`、`removePage {id}`；`add` 可带 pageId。删除页面清除所有入向路由，首页/当前启动页不能直接删除。矩阵推荐 panel+独立 child button；不要把用户交互做成不可选中的内部控件。
-
-保存是修改真实 `apps/esp32/ui/layout.json` 源文件，不自动改写 C，也不启动编译。`src/layout/package-layout.mts` 生成设备 OUI2 数据包，普通用户通过网页下发，或 POST `/api/deploy/layout`。只有新硬件能力才修改 C/Rust 并显式构建基础运行时。部署协议详见 FRONTEND.md。共享运行时支持的数据约束不可在网页单独放宽。
-
-AI 开发任务 kind `operit.hardware.task` 带 task/context；context 包含当前完整草稿、页面/组件ID、JSON pointer、实际源码行号与 revision。默认发到软件当前对话；独立API通过 `/api/ai/develop` 返回审阅提案。密钥不得写入项目。
-
-USB 离线部署：在“部署到设备”刷新串口，选择 COM 口，点击“USB 下发布局，无需编译”。后端先读取设备分区表和两个布局槽位，核对地址/尺寸/CRC/版本，只覆盖非当前槽位并递增版本；不改程序分区或 NVS。临时读取文件和布局文件结束后删除。接口为 `POST /api/deploy/usb-layout {port,document}`，状态仍用 `GET /api/deploy/flash`。与 Wi-Fi 热更新不同，USB 使用 ROM 引导器，会重启设备。
+USB 调试检查：`npm run test:device-debug --prefix tools/esp32-editor`。
+Rust UART/帧边界测试：`cargo test --manifest-path hosts/boards/esp32/Cargo.toml serial`。

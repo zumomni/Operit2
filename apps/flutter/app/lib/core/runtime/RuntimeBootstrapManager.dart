@@ -141,6 +141,23 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     }
   }
 
+  /// Loads persisted bootstrap state for a secondary Flutter engine.
+  ///
+  /// Detached windows share the native Rust runtime with the main engine, so
+  /// they must not apply storage roots or start the process-owned runtime a
+  /// second time. They still need the persisted configuration in order to
+  /// render the normal themed UI instead of the unconfigured bootstrap view.
+  Future<void> initializeForDetachedWindow() async {
+    final encoded = await platformCoreProxy.runtimeBootstrapRead();
+    if (encoded == null) {
+      await _apply(LocalRuntimeStorageConfig.platformDefault(), persist: false);
+      return;
+    }
+    final decoded = jsonDecode(encoded) as Map<String, Object?>;
+    _startupThemeMode = _decodeStartupThemeMode(decoded[_startupThemeModeKey]);
+    await _apply(LocalRuntimeStorageConfig.fromJson(decoded), persist: false);
+  }
+
   /// Returns native storage paths for the stored local runtime config.
   Future<RuntimeStoragePaths> localRuntimeStoragePaths() {
     if (!_config.confirmed) {
@@ -262,6 +279,10 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     );
     await LocalRuntimeStorageBridge.apply(localStorage);
     await _apply(localStorage, persist: true);
+    // Startup logs were kept in memory while onboarding was unconfigured.
+    // Attach only after the native bridge has accepted the confirmed roots so
+    // the queued entries can be flushed safely.
+    ClientLogger.attachPersistentStorage();
     ClientLogger.i(
       'confirm local runtime storage done elapsedMs=${stopwatch.elapsedMilliseconds}',
       tag: _logTag,
@@ -287,6 +308,7 @@ class RuntimeBootstrapManager extends ChangeNotifier {
       updatedAt: DateTime.now().millisecondsSinceEpoch,
     );
     await _apply(localStorage, persist: true);
+    ClientLogger.attachPersistentStorage();
     ClientLogger.i(
       'persist migrated local runtime storage done elapsedMs=${stopwatch.elapsedMilliseconds}',
       tag: _logTag,
@@ -312,6 +334,9 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     _config = config;
     if (persist) {
       await _writeBootstrapConfig(config);
+    }
+    if (config.confirmed) {
+      ClientLogger.attachPersistentStorage();
     }
     notifyListeners();
     ClientLogger.i(

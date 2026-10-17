@@ -154,6 +154,7 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
                 normalized.push({
                     since: since,
                     until: until,
+                    implicitUntil: variant.implicitUntil === true,
                     invoke: variant.invoke
                 });
             }
@@ -176,7 +177,8 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
             for (var rangeIndex = 0; rangeIndex + 1 < normalized.length; rangeIndex += 1) {
                 var current = normalized[rangeIndex];
                 var next = normalized[rangeIndex + 1];
-                if (!current.until) {
+                // Successive since declarations split only their own major API family.
+                if (current.implicitUntil && current.since.parts[0] === next.since.parts[0]) {
                     current.until = next.since;
                 }
                 if (compareVersions(current.until, next.since) > 0) {
@@ -217,14 +219,32 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
             };
         }
 
+        // Builds explicitly bounded API-family implementations at the declaration site.
         function method() {
             var variants = [];
             var builder = {
                 __operitToolPkgApiMethod: true,
+                // Selects versions from this release up to the next major API family.
                 since: function(apiVersion, invoke) {
-                    return builder.range(apiVersion, null, invoke);
+                    var version = requireVersion(apiVersion, 'API version since');
+                    if (invoke !== undefined && typeof invoke !== 'function') {
+                        throw new Error('ToolPkg API implementation must be a function.');
+                    }
+                    variants.push({
+                        since: apiVersion,
+                        until: (version.parts[0] + 1) + '.0.0',
+                        implicitUntil: true,
+                        invoke: invoke
+                    });
+                    return builder;
                 },
-                range: function(apiVersion, untilApiVersion, invoke) {
+                // Adds a left-inclusive, right-exclusive implementation range.
+                between: function(apiVersion, untilApiVersion, invoke) {
+                    requireVersion(apiVersion, 'API version since');
+                    requireVersion(untilApiVersion, 'API version until');
+                    if (invoke !== undefined && typeof invoke !== 'function') {
+                        throw new Error('ToolPkg API implementation must be a function.');
+                    }
                     variants.push({
                         since: apiVersion,
                         until: untilApiVersion,
@@ -232,6 +252,28 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
                     });
                     return builder;
                 },
+                // Retains the existing explicit range spelling for callers.
+                range: function(apiVersion, untilApiVersion, invoke) {
+                    return builder.between(apiVersion, untilApiVersion, invoke);
+                },
+                // Binds one implementation to the preceding unbound range declarations.
+                implement: function(invoke) {
+                    if (typeof invoke !== 'function') {
+                        throw new Error('ToolPkg API implementation must be a function.');
+                    }
+                    var bound = 0;
+                    for (var index = 0; index < variants.length; index += 1) {
+                        if (variants[index].invoke === undefined) {
+                            variants[index].invoke = invoke;
+                            bound += 1;
+                        }
+                    }
+                    if (bound === 0) {
+                        throw new Error('ToolPkg API implementation requires an unbound range.');
+                    }
+                    return builder;
+                },
+                // Validates ranges and snapshots implementations before exposing the method.
                 build: function(apiName) {
                     return versionedMethod(apiName, variants);
                 }
@@ -257,7 +299,58 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
             return output;
         }
 
+        /** Calls a published dependency method using host-owned structured Promise handles. */
+        async function callDependency(packageName, methodName, payload) {
+            if (typeof packageName !== 'string' || !packageName.trim() ||
+                typeof methodName !== 'string' || !methodName.trim()) {
+                throw new Error('Dependency package and method names are required.');
+            }
+            var callId = currentCallId();
+            var state = currentCallState();
+            if (state.params.__operit_registration_mode === true) {
+                throw new Error('Dependency calls are not allowed during registration.');
+            }
+            return new Promise(function(resolve, reject) {
+                root.__operitRetainCallReference(callId);
+                /** Releases the owner after the public completion's microtask. */
+                function cleanup() {
+                    Promise.resolve().then(function() { root.__operitReleaseCallReference(callId); });
+                }
+                try {
+                    root.__operitNativeCallDependency(
+                        callId, packageName.trim(), methodName.trim(), payload === undefined ? null : payload
+                    ).then(function(response) {
+                        try {
+                            root.__operitActivateCall(callId);
+                            if (!response || typeof response !== 'object' || typeof response.success !== 'boolean') {
+                                throw new TypeError('Dependency host returned an invalid result envelope');
+                            }
+                            if (!response.success) throw new Error(response.message);
+                            resolve(response.value);
+                        } catch (error) {
+                            reject(error);
+                        } finally {
+                            cleanup();
+                        }
+                    }, function(error) {
+                        try {
+                            root.__operitActivateCall(callId);
+                            reject(error);
+                        } catch (activationError) {
+                            reject(activationError);
+                        } finally {
+                            cleanup();
+                        }
+                    });
+                } catch (error) {
+                    cleanup();
+                    reject(error);
+                }
+            });
+        }
+
         expose('__operitToolPkgApi', {
+            callDependency: callDependency,
             currentCallId: currentCallId,
             currentVersion: currentApiVersion,
             namespace: namespace,

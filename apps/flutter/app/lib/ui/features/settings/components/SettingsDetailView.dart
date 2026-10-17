@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import '../appearance/AppearanceSettingsPanel.dart';
 import '../access_links/AccessLinksSettingsPanel.dart';
 import '../about/AboutOperitScreen.dart';
-import '../characters/CharacterSettingsPanel.dart';
 import '../data/DataSettingsPanel.dart';
 import '../global_behavior/GlobalBehaviorSettingsPanel.dart';
 import '../model/ModelSettingsPanel.dart';
@@ -13,7 +12,6 @@ import '../local_models/LocalModelSettingsPanel.dart';
 import '../models/SettingsModels.dart';
 import '../profile/UserProfileSettingsPanel.dart';
 import '../tools/ToolSettingsPanel.dart';
-import '../tts/TtsSettingsPanel.dart';
 import '../workspace/WorkspaceSettingsPanel.dart';
 
 class SettingsDetailView extends StatelessWidget {
@@ -39,8 +37,7 @@ class SettingsDetailView extends StatelessWidget {
       ),
       SettingsCategory.model => const ModelSettingsPanel(),
       SettingsCategory.localModels => const LocalModelSettingsPanel(),
-      SettingsCategory.tts => const TtsSettingsPanel(),
-      SettingsCategory.characters => const CharacterSettingsPanel(),
+      SettingsCategory.tts => const ModelSettingsPanel(),
       SettingsCategory.tools => const ToolSettingsPanel(),
       SettingsCategory.workspace => const WorkspaceSettingsPanel(),
       SettingsCategory.globalBehavior => const GlobalBehaviorSettingsPanel(),

@@ -3,12 +3,14 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+
 import 'CoreLinkProtocol.dart';
 
 typedef CoreEmbeddedStreamFactory =
     Stream<T> Function<T>(
       String streamId,
-      int targetObjectId,
+      String target,
       String propertyName,
       Object? args,
       T Function(CoreLinkValueReader reader) decode,
@@ -21,21 +23,66 @@ Uint8List encodeCoreLink(Object? value) {
   return writer.takeBytes();
 }
 
+/// Prepares one value for a host carrier without flattening its binary contents.
+CoreLinkMessage encodeCoreLinkMessage(Object? value) {
+  final writer = _CoreLinkMessagePackWriter();
+  writer.writeValue(value);
+  return writer.takeMessage();
+}
+
 /// Decodes one complete MessagePack Link value.
 T decodeCoreLink<T>(
   Uint8List bytes, {
   T Function(CoreLinkValueReader reader)? decode,
-  int? targetObjectId,
+  String? target,
   CoreEmbeddedStreamFactory? embeddedStreamFactory,
 }) {
   final reader = _CoreLinkMessagePackReader(
     bytes,
-    targetObjectId: targetObjectId,
+    target: target,
     embeddedStreamFactory: embeddedStreamFactory,
   );
   final value = decode == null ? reader.readValue() as T : decode(reader);
   reader.expectDone();
   return value;
+}
+
+/// Decodes independent full values emitted by a Core Stream protocol.
+///
+/// Flow and State protocols use the incremental decoders below instead.
+class CoreLinkStreamEventValueDecoder {
+  /// Passes the original payload directly to the typed decoder without a base.
+  T decode<T>(CoreEvent event, {required T Function(Uint8List bytes) decode}) {
+    if (event.kind != 'Snapshot' && event.kind != 'Changed') {
+      throw FormatException(
+        'Unsupported Core stream event kind: ${event.kind}',
+      );
+    }
+    final bytes = event.valueBytes;
+    if (bytes == null) {
+      throw StateError('Core stream event has no payload bytes');
+    }
+    return _decodeCoreLinkEventBytes(
+      bytes,
+      decode,
+      stage: 'dart-stream-messagepack',
+    );
+  }
+}
+
+/// Measures typed watch decoding independently of the value or stream protocol.
+T _decodeCoreLinkEventBytes<T>(
+  Uint8List bytes,
+  T Function(Uint8List bytes) decode, {
+  String stage = 'dart-messagepack',
+}) {
+  const profile = bool.fromEnvironment('OPERIT_PROFILE_COMPOSE_STAGES');
+  final watch = profile ? (Stopwatch()..start()) : null;
+  final result = decode(bytes);
+  if (watch != null) {
+    _profileCoreLinkDecode(stage, watch, bytes.length);
+  }
+  return result;
 }
 
 /// Reconstructs complete typed watch payloads from ordered Core events.
@@ -45,12 +92,39 @@ class CoreLinkEventValueDecoder {
 
   /// Decodes one watch event after applying protocol-level incremental payloads.
   T decode<T>(CoreEvent event, {required T Function(Uint8List bytes) decode}) {
-    return decode(completeValueBytes(event));
+    const profile = bool.fromEnvironment('OPERIT_PROFILE_COMPOSE_STAGES');
+    final bytes = completeValueBytes(event, profileStages: profile);
+    return _decodeCoreLinkEventBytes(bytes, decode);
+  }
+
+  /// Decodes one complete event with the typed Link reader API.
+  ///
+  /// Kept for callers that predate the byte-oriented [decode] callback.
+  T decodeValue<T>(
+    CoreEvent event, {
+    required T Function(CoreLinkValueReader reader) decode,
+    CoreEmbeddedStreamFactory? embeddedStreamFactory,
+  }) {
+    return decodeCoreLink<T>(
+      completeValueBytes(event),
+      decode: decode,
+      target: event.target,
+      embeddedStreamFactory: embeddedStreamFactory,
+    );
   }
 
   /// Returns complete MessagePack bytes for one ordered Core watch event.
-  Uint8List completeValueBytes(CoreEvent event) {
+  Uint8List completeValueBytes(CoreEvent event, {bool profileStages = false}) {
+    final watch = profileStages ? (Stopwatch()..start()) : null;
     final currentValue = _readEventValue(event);
+    if (watch != null) {
+      _profileCoreLinkDecode(
+        'dart-watch-read',
+        watch,
+        event.valueBytes!.length,
+      );
+      watch.reset();
+    }
     final completeValue = switch (event.kind) {
       'Snapshot' || 'Changed' => _replacePreviousValue(currentValue),
       'Delta' => _applyDeltaEvent(currentValue),
@@ -58,7 +132,21 @@ class CoreLinkEventValueDecoder {
         'Unsupported Core watch event kind: ${event.kind}',
       ),
     };
-    return encodeCoreLink(completeValue);
+    if (watch != null) {
+      _profileCoreLinkDecode(
+        'dart-watch-retain',
+        watch,
+        event.valueBytes!.length,
+      );
+      watch.reset();
+    }
+    final bytes = event.kind == 'Delta'
+        ? _encodeRetainedCoreLink(completeValue)
+        : event.valueBytes!;
+    if (watch != null && event.kind == 'Delta') {
+      _profileCoreLinkDecode('dart-watch-reencode', watch, bytes.length);
+    }
+    return bytes;
   }
 
   /// Reads one event payload as an untyped Link value.
@@ -87,11 +175,204 @@ class CoreLinkEventValueDecoder {
   }
 }
 
+/// Retains individual wire values so unchanged list elements need no re-encoding.
+class _CoreLinkListEntry<T> {
+  /// Retains a decoded item and its original MessagePack bytes.
+  _CoreLinkListEntry.decoded(this.bytes, this.value);
+
+  /// Holds a freshly decoded item until the current delta has been fully applied.
+  _CoreLinkListEntry.pending(this.pendingValue);
+
+  Uint8List? bytes;
+  late T value;
+  Object? pendingValue;
+  bool dirty = false;
+}
+
+/// Decodes list watch deltas without re-encoding or decoding unchanged elements.
+class CoreLinkListEventDecoder<T> {
+  List<_CoreLinkListEntry<T>>? _entries;
+
+  /// Applies one ordered watch event and returns a complete typed list.
+  List<T> decode(
+    CoreEvent event, {
+    required T Function(CoreLinkValueReader reader) decodeItem,
+    CoreEmbeddedStreamFactory? embeddedStreamFactory,
+  }) {
+    final valueBytes = event.valueBytes;
+    if (valueBytes == null) {
+      throw StateError('Core watch event has no payload bytes');
+    }
+    final entries = switch (event.kind) {
+      'Snapshot' || 'Changed' => _readList(
+        valueBytes,
+        event.target,
+        decodeItem,
+        embeddedStreamFactory,
+      ),
+      'Delta' => _applyListDelta(valueBytes),
+      _ => throw FormatException(
+        'Unsupported Core watch event kind: ${event.kind}',
+      ),
+    };
+    for (final entry in entries) {
+      if (entry.dirty || entry.bytes == null) {
+        final bytes = _encodeRetainedCoreLink(entry.pendingValue);
+        entry.value = decodeCoreLink<T>(
+          bytes,
+          decode: decodeItem,
+          target: event.target,
+          embeddedStreamFactory: embeddedStreamFactory,
+        );
+        entry.bytes = bytes;
+        entry.pendingValue = null;
+        entry.dirty = false;
+      }
+    }
+    _entries = entries;
+    return entries.map((entry) => entry.value).toList(growable: false);
+  }
+
+  /// Reads a complete MessagePack array while retaining each element's wire slice.
+  List<_CoreLinkListEntry<T>> _readList(
+    Uint8List bytes,
+    String target,
+    T Function(CoreLinkValueReader reader) decodeItem,
+    CoreEmbeddedStreamFactory? embeddedStreamFactory,
+  ) {
+    return decodeCoreLink<List<_CoreLinkListEntry<T>>>(
+      bytes,
+      target: target,
+      decode: (reader) {
+        final length = reader.readArrayLength();
+        return List<_CoreLinkListEntry<T>>.generate(length, (_) {
+          final itemBytes = reader.readValueBytes();
+          return _CoreLinkListEntry<T>.decoded(
+            itemBytes,
+            decodeCoreLink<T>(
+              itemBytes,
+              decode: decodeItem,
+              target: target,
+              embeddedStreamFactory: embeddedStreamFactory,
+            ),
+          );
+        }, growable: false);
+      },
+    );
+  }
+
+  /// Applies list-indexed operations to a shallow copy of the retained entries.
+  List<_CoreLinkListEntry<T>> _applyListDelta(Uint8List bytes) {
+    final previous = _entries;
+    if (previous == null) {
+      throw StateError('Core watch delta arrived before a full value');
+    }
+    final delta = _coreLinkMap(
+      decodeCoreLink<Object?>(bytes),
+      'incremental delta',
+    );
+    final operations = delta[_coreDeltaMarker];
+    if (operations is! List) {
+      throw const FormatException('Core incremental delta marker is missing');
+    }
+    var entries = List<_CoreLinkListEntry<T>>.of(previous);
+    for (final operation in operations) {
+      final fields = _coreLinkMap(operation, 'incremental operation');
+      final name = fields['op'];
+      final path = fields['path'];
+      if (name is! String) {
+        throw const FormatException(
+          'Core incremental operation name is missing',
+        );
+      }
+      if (path is! List) {
+        throw const FormatException(
+          'Core incremental operation path is missing',
+        );
+      }
+      if (name == 'set' && !fields.containsKey('value')) {
+        throw const FormatException(
+          'Core incremental set operation value is missing',
+        );
+      }
+      if (path.isEmpty) {
+        if (name != 'set') {
+          throw const FormatException(
+            'Core incremental root remove is invalid',
+          );
+        }
+        final root = fields['value'];
+        if (root is! List) {
+          throw const FormatException(
+            'Core incremental list root must be an array',
+          );
+        }
+        entries = root
+            .map((item) => _CoreLinkListEntry<T>.pending(item))
+            .toList();
+        continue;
+      }
+      final index = path.first;
+      if (index is! int) {
+        throw const FormatException(
+          'Core incremental list path segment must be an integer',
+        );
+      }
+      if (path.length == 1) {
+        if (name == 'set') {
+          final entry = _CoreLinkListEntry<T>.pending(fields['value']);
+          if (index == entries.length) {
+            entries.add(entry);
+          } else if (index >= 0 && index < entries.length) {
+            entries[index] = entry;
+          } else {
+            throw FormatException(
+              'Core incremental list append index is invalid: $index',
+            );
+          }
+        } else if (name == 'remove') {
+          if (index < 0 || index >= entries.length) {
+            throw FormatException(
+              'Core incremental list removal index is invalid: $index',
+            );
+          }
+          entries.removeAt(index);
+        } else {
+          throw FormatException(
+            'Unsupported Core incremental operation: $name',
+          );
+        }
+        continue;
+      }
+      if (index < 0 || index >= entries.length) {
+        throw FormatException(
+          'Core incremental list path does not exist: $index',
+        );
+      }
+      var entry = entries[index];
+      if (!entry.dirty && entry.bytes != null) {
+        entry = _CoreLinkListEntry<T>.pending(
+          decodeCoreLink<Object?>(entry.bytes!),
+        );
+        entry.dirty = true;
+        entries[index] = entry;
+      }
+      entry.pendingValue = _applyCoreDeltaOperation(entry.pendingValue, {
+        'op': name,
+        'path': path.sublist(1),
+        if (name == 'set') 'value': fields['value'],
+      });
+    }
+    return entries;
+  }
+}
+
 const _coreDeltaMarker = r'$coreDelta';
 
 /// Creates a mutable copy of a decoded Link value tree.
 Object? _copyCoreLinkValue(Object? value) {
   if (value is Uint8List) {
+    if (coreLinkSharedSpan(value) != null) return value;
     return Uint8List.fromList(value);
   }
   if (value is List) {
@@ -301,50 +582,54 @@ Map<String, Object?> _coreLinkMap(Object? value, String label) {
 }
 
 /// Encodes a CoreProxy call using the compact native bridge tuple format.
-Uint8List encodeNativeCoreCallRequest(CoreCallRequest request) {
+CoreLinkMessage encodeNativeCoreCallRequest(CoreCallRequest request) {
   final writer = _CoreLinkMessagePackWriter();
   writer.writeArrayHeader(4);
   writer.writeValue(request.requestId);
-  _writeNativeCorePath(writer, request.targetObjectId);
+  _writeNativeCorePath(writer, request.target);
   writer.writeValue(request.methodName);
   writer.writeValue(request.args);
-  return writer.takeBytes();
+  return writer.takeMessage();
 }
 
 /// Encodes a CoreProxy push-open request using the compact native tuple format.
-Uint8List encodeNativeCorePushOpenRequest(CorePushRequest request) {
+CoreLinkMessage encodeNativeCorePushOpenRequest(CorePushRequest request) {
   final writer = _CoreLinkMessagePackWriter();
   writer.writeArrayHeader(4);
   writer.writeValue(request.requestId);
-  _writeNativeCorePath(writer, request.targetObjectId);
+  _writeNativeCorePath(writer, request.target);
   writer.writeValue(request.methodName);
   writer.writeValue(request.args);
-  return writer.takeBytes();
+  return writer.takeMessage();
 }
 
 /// Encodes one ordered CoreProxy push item using the compact native tuple format.
-Uint8List encodeNativeCorePushItem(String pushId, int sequence, Object? args) {
+CoreLinkMessage encodeNativeCorePushItem(
+  String pushId,
+  int sequence,
+  Object? args,
+) {
   final writer = _CoreLinkMessagePackWriter();
   writer.writeArrayHeader(3);
   writer.writeValue(pushId);
   writer.writeValue(sequence);
   writer.writeValue(args);
-  return writer.takeBytes();
+  return writer.takeMessage();
 }
 
 /// Encodes a CoreProxy watch snapshot request using the compact native tuple format.
-Uint8List encodeNativeCoreWatchSnapshotRequest(CoreWatchRequest request) {
+CoreLinkMessage encodeNativeCoreWatchSnapshotRequest(CoreWatchRequest request) {
   final writer = _CoreLinkMessagePackWriter();
   writer.writeArrayHeader(4);
   writer.writeValue(request.requestId);
-  _writeNativeCorePath(writer, request.targetObjectId);
+  _writeNativeCorePath(writer, request.target);
   writer.writeValue(request.propertyName);
   writer.writeValue(request.args);
-  return writer.takeBytes();
+  return writer.takeMessage();
 }
 
 /// Encodes a CoreProxy watch stream open request using the compact native tuple format.
-Uint8List encodeNativeCoreWatchStreamRequest(
+CoreLinkMessage encodeNativeCoreWatchStreamRequest(
   String subscriptionId,
   CoreWatchRequest request,
 ) {
@@ -352,14 +637,14 @@ Uint8List encodeNativeCoreWatchStreamRequest(
   writer.writeArrayHeader(5);
   writer.writeValue(subscriptionId);
   writer.writeValue(request.requestId);
-  _writeNativeCorePath(writer, request.targetObjectId);
+  _writeNativeCorePath(writer, request.target);
   writer.writeValue(request.propertyName);
   writer.writeValue(request.args);
-  return writer.takeBytes();
+  return writer.takeMessage();
 }
 
 /// Writes one Core object identity as its compact native path field.
-void _writeNativeCorePath(_CoreLinkMessagePackWriter writer, int objectId) {
+void _writeNativeCorePath(_CoreLinkMessagePackWriter writer, String objectId) {
   writer.writeValue(objectId);
 }
 
@@ -367,12 +652,12 @@ void _writeNativeCorePath(_CoreLinkMessagePackWriter writer, int objectId) {
 T decodeNativeCoreResult<T>(
   Uint8List bytes, {
   T Function(CoreLinkValueReader reader)? decode,
-  int? targetObjectId,
+  String? target,
   CoreEmbeddedStreamFactory? embeddedStreamFactory,
 }) {
   final reader = _CoreLinkMessagePackReader(
     bytes,
-    targetObjectId: targetObjectId,
+    target: target,
     embeddedStreamFactory: embeddedStreamFactory,
   );
   final value = _readNativeCoreResult(
@@ -516,7 +801,7 @@ CoreEvent _readNativeCoreEvent(_CoreLinkMessagePackReader reader) {
   final valueBytes = reader.readValueBytes();
   return CoreEvent.raw(
     requestId: requestId,
-    targetObjectId: target,
+    target: target,
     propertyName: propertyName,
     kind: kind,
     valueBytes: valueBytes,
@@ -525,19 +810,19 @@ CoreEvent _readNativeCoreEvent(_CoreLinkMessagePackReader reader) {
 }
 
 /// Reads one compact native Core object identity.
-int _readNativeCorePath(_CoreLinkMessagePackReader reader) {
+String _readNativeCorePath(_CoreLinkMessagePackReader reader) {
   final objectId = reader.readValue();
-  if (objectId is! int) {
-    throw FormatException('Native core object id must be an integer');
+  if (objectId is! String) {
+    throw FormatException('Native core target must be a string');
   }
   return objectId;
 }
 
 /// Decodes one fixed embedded-stream pool object address.
-int _readCoreObjectIdValue(Object? value) {
-  if (value is! int) {
+String _readCoreTargetValue(Object? value) {
+  if (value is! String) {
     throw FormatException(
-      'Embedded Core stream target path must be an integer address',
+      'Embedded Core stream target must be a string address',
     );
   }
   return value;
@@ -576,9 +861,232 @@ class NativeCoreWatchFrame {
   final CoreEvent event;
 }
 
-/// Writes the Link protocol's MessagePack value set without dart2js uint64 accessors.
+/// Retains a host-owned immutable binary allocation and its opaque ownership token.
+class CoreLinkSharedBuffer {
+  /// Binds a host allocation without exposing host-specific APIs to the codec.
+  CoreLinkSharedBuffer(this.bytes, this.token, this.domain) {
+    _sharedByteSpans[bytes] = CoreLinkBufferSpan(this, 0, bytes.length);
+  }
+  final Uint8List bytes;
+  final Object token;
+  final Object domain;
+}
+
+/// Identifies an immutable range while retaining its complete backing allocation.
+class CoreLinkBufferSpan {
+  /// Describes one validated range of a shared allocation.
+  CoreLinkBufferSpan(this.buffer, this.offset, this.length);
+  final CoreLinkSharedBuffer buffer;
+  final int offset;
+  final int length;
+
+  /// Creates a byte view whose ownership and range survive a subsequent send.
+  Uint8List view() {
+    final bytes = Uint8List.sublistView(buffer.bytes, offset, offset + length);
+    _sharedByteSpans[bytes] = this;
+    return bytes;
+  }
+}
+
+final _sharedByteSpans = Expando<CoreLinkBufferSpan>('Core shared bytes');
+final _sharedDecodeBuffers = Expando<List<CoreLinkSharedBuffer>>(
+  'Core frame buffers',
+);
+
+/// Finds the explicit ownership retained by an external byte view.
+CoreLinkBufferSpan? coreLinkSharedSpan(Uint8List bytes) =>
+    _sharedByteSpans[bytes];
+
+/// Retains a frame's shared allocations for every later typed decode.
+void attachCoreLinkBuffers(
+  Uint8List bytes,
+  List<CoreLinkSharedBuffer> buffers,
+) {
+  _sharedDecodeBuffers[bytes] = buffers;
+}
+
+/// Slices bytes while preserving both payload ownership and decode context.
+Uint8List sliceCoreLinkBytes(Uint8List bytes, int start, [int? end]) {
+  final stop = end ?? bytes.length;
+  final span = _sharedByteSpans[bytes];
+  final view = Uint8List.sublistView(bytes, start, stop);
+  if (span != null) {
+    _sharedByteSpans[view] = CoreLinkBufferSpan(
+      span.buffer,
+      span.offset + start,
+      stop - start,
+    );
+  }
+  final buffers = _sharedDecodeBuffers[bytes];
+  if (buffers != null) _sharedDecodeBuffers[view] = buffers;
+  return view;
+}
+
+/// Separates one control message from its retained binary allocations.
+class CoreLinkSharedMessage {
+  /// Retains every buffer until the transport has taken its native references.
+  CoreLinkSharedMessage(this.bytes, this.buffers);
+  final Uint8List bytes;
+  final List<CoreLinkBufferSpan> buffers;
+}
+
+/// Marks a binary value that has not been copied into an intermediate wire buffer.
+class _CoreLinkBinary {
+  /// Retains the source until its carrier materializes or shares it.
+  _CoreLinkBinary(this.bytes);
+  final Uint8List bytes;
+}
+
+/// Holds one message's metadata and binary values until its carrier consumes it.
+class CoreLinkMessage {
+  /// Wraps control bytes without introducing an additional payload allocation.
+  CoreLinkMessage.bytes(Uint8List bytes) : _parts = [bytes];
+
+  /// Retains metadata and binary spans belonging to exactly one wire message.
+  CoreLinkMessage._(this._parts);
+  final List<Object> _parts;
+
+  /// Reports the size of the portable inline representation.
+  int get length => _parts.fold(
+    0,
+    (total, part) =>
+        total +
+        switch (part) {
+          Uint8List bytes => bytes.length,
+          _CoreLinkBinary(:final bytes) =>
+            bytes.length + _binaryHeader(bytes.length).length,
+          _ => throw StateError('Invalid message part'),
+        },
+  );
+
+  /// Writes the portable representation into an exact destination.
+  void writeTo(Uint8List destination) {
+    if (destination.length != length) {
+      throw ArgumentError('Core Link destination length mismatch');
+    }
+    var offset = 0;
+    for (final part in _parts) {
+      final Uint8List bytes;
+      if (part is _CoreLinkBinary) {
+        final header = _binaryHeader(part.bytes.length);
+        destination.setRange(offset, offset + header.length, header);
+        offset += header.length;
+        bytes = part.bytes;
+      } else {
+        bytes = part as Uint8List;
+      }
+      destination.setRange(offset, offset + bytes.length, bytes);
+      offset += bytes.length;
+    }
+  }
+
+  /// Materializes portable bytes for a carrier that requires inline binary values.
+  Uint8List toBytes() {
+    if (_parts.length == 1 && _parts.single is Uint8List) {
+      return _parts.single as Uint8List;
+    }
+    final bytes = Uint8List(length);
+    writeTo(bytes);
+    return bytes;
+  }
+
+  /// Encodes only metadata while the host provides shared ownership for binary values.
+  CoreLinkSharedMessage share(CoreLinkBufferSpan Function(Uint8List) retain) {
+    final output = BytesBuilder(copy: false);
+    final buffers = <CoreLinkBufferSpan>[];
+    for (final part in _parts) {
+      if (part is _CoreLinkBinary) {
+        final span = retain(part.bytes);
+        output.add(_sharedReference(buffers.length, span.offset, span.length));
+        buffers.add(span);
+      } else {
+        output.add(part as Uint8List);
+      }
+    }
+    return CoreLinkSharedMessage(output.takeBytes(), buffers);
+  }
+
+  /// Preserves shared values when a Dart Flow reconstructs local decode metadata.
+  Uint8List retainedBytes() {
+    final output = BytesBuilder(copy: false);
+    final buffers = <CoreLinkSharedBuffer>[];
+    for (final part in _parts) {
+      if (part is _CoreLinkBinary) {
+        final span = coreLinkSharedSpan(part.bytes);
+        if (span != null) {
+          output.add(
+            _sharedReference(buffers.length, span.offset, span.length),
+          );
+          buffers.add(span.buffer);
+        } else {
+          output.add(_binaryHeader(part.bytes.length));
+          output.add(part.bytes);
+        }
+      } else {
+        output.add(part as Uint8List);
+      }
+    }
+    final bytes = output.takeBytes();
+    attachCoreLinkBuffers(bytes, buffers);
+    return bytes;
+  }
+}
+
+/// Encodes the portable MessagePack binary prefix without visiting its contents.
+Uint8List _binaryHeader(int length) {
+  if (length <= 0xff) return Uint8List.fromList([0xc4, length]);
+  if (length <= 0xffff) {
+    return Uint8List.fromList([0xc5, length >> 8, length & 255]);
+  }
+  final bytes = Uint8List(5)..[0] = 0xc6;
+  ByteData.sublistView(bytes).setUint32(1, length);
+  return bytes;
+}
+
+/// Encodes one fixed-size shared-buffer reference for the native carrier.
+Uint8List _sharedReference(int index, int offset, int length) {
+  final bytes = Uint8List(27)
+    ..[0] = 0xc7
+    ..[1] = 24
+    ..[2] = 0x42;
+  final data = ByteData.sublistView(bytes);
+  for (final entry in [(3, index), (11, offset), (19, length)]) {
+    data.setUint32(entry.$1, entry.$2 ~/ 0x100000000);
+    data.setUint32(entry.$1 + 4, entry.$2 & 0xffffffff);
+  }
+  return bytes;
+}
+
+/// Re-encodes reconstructed Flow metadata while retaining existing shared values.
+Uint8List _encodeRetainedCoreLink(Object? value) {
+  final writer = _CoreLinkMessagePackWriter();
+  writer.writeValue(value);
+  return writer.takeMessage().retainedBytes();
+}
+
+/// Writes metadata contiguously and retains binary spans for final destination writes.
 class _CoreLinkMessagePackWriter {
-  final BytesBuilder _bytes = BytesBuilder(copy: false);
+  Uint8List _bytes = Uint8List(128);
+  int _length = 0;
+  final List<Object> _parts = [];
+
+  /// Grows one contiguous output allocation to fit the next encoded segment.
+  void _ensureCapacity(int additional) {
+    final required = _length + additional;
+    if (required <= _bytes.length) return;
+    final doubled = _bytes.length * 2;
+    final grown = Uint8List(required > doubled ? required : doubled);
+    grown.setRange(0, _length, _bytes);
+    _bytes = grown;
+  }
+
+  /// Seals encoded metadata before a binary span or the end of the message.
+  void _flush() {
+    if (_length == 0) return;
+    _parts.add(Uint8List.sublistView(_bytes, 0, _length));
+    _bytes = Uint8List(128);
+    _length = 0;
+  }
 
   /// Writes any supported Link value.
   void writeValue(Object? value) {
@@ -617,9 +1125,15 @@ class _CoreLinkMessagePackWriter {
     throw FormatException('Unsupported Link value type: ${value.runtimeType}');
   }
 
-  /// Returns the encoded bytes accumulated by this writer.
+  /// Returns the exact encoded byte range without copying the output allocation.
   Uint8List takeBytes() {
-    return _bytes.takeBytes();
+    return takeMessage().toBytes();
+  }
+
+  /// Finishes one message without flattening its retained binary spans.
+  CoreLinkMessage takeMessage() {
+    _flush();
+    return CoreLinkMessage._(_parts);
   }
 
   /// Writes an array header with the requested item count.
@@ -637,7 +1151,8 @@ class _CoreLinkMessagePackWriter {
 
   /// Writes one byte after validating its range.
   void _writeByte(int value) {
-    _bytes.addByte(value & 0xff);
+    _ensureCapacity(1);
+    _bytes[_length++] = value & 0xff;
   }
 
   /// Writes a signed or unsigned integer using the smallest MessagePack form.
@@ -712,15 +1227,50 @@ class _CoreLinkMessagePackWriter {
 
   /// Writes a double using the MessagePack float64 form.
   void _writeFloat64(double value) {
-    final data = ByteData(8)..setFloat64(0, value);
     _writeByte(0xcb);
-    _bytes.add(data.buffer.asUint8List());
+    _ensureCapacity(8);
+    ByteData.sublistView(_bytes).setFloat64(_length, value);
+    _length += 8;
   }
 
-  /// Writes a UTF-8 string with the matching MessagePack string prefix.
+  /// Writes UTF-8 directly into the output, preserving surrogate replacement semantics.
   void _writeString(String value) {
-    final bytes = utf8.encode(value);
-    final length = bytes.length;
+    // Five reserved bytes hold the largest string prefix. Each UTF-16 code unit
+    // needs at most three UTF-8 bytes, including an unpaired surrogate.
+    _ensureCapacity(5 + value.length * 3);
+    final bytes = _bytes;
+    final start = _length + 5;
+    var offset = start;
+    for (var index = 0; index < value.length; index++) {
+      var codePoint = value.codeUnitAt(index);
+      if (codePoint <= 0x7f) {
+        bytes[offset++] = codePoint;
+        continue;
+      }
+      if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+        final next = index + 1 < value.length ? value.codeUnitAt(index + 1) : 0;
+        if (codePoint <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+          codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + next - 0xdc00;
+          index++;
+        } else {
+          codePoint = 0xfffd;
+        }
+      }
+      if (codePoint <= 0x7ff) {
+        bytes[offset++] = 0xc0 | (codePoint >> 6);
+        bytes[offset++] = 0x80 | (codePoint & 0x3f);
+      } else if (codePoint <= 0xffff) {
+        bytes[offset++] = 0xe0 | (codePoint >> 12);
+        bytes[offset++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        bytes[offset++] = 0x80 | (codePoint & 0x3f);
+      } else {
+        bytes[offset++] = 0xf0 | (codePoint >> 18);
+        bytes[offset++] = 0x80 | ((codePoint >> 12) & 0x3f);
+        bytes[offset++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        bytes[offset++] = 0x80 | (codePoint & 0x3f);
+      }
+    }
+    final length = offset - start;
     if (length <= 31) {
       _writeByte(0xa0 | length);
     } else if (length <= 0xff) {
@@ -733,23 +1283,17 @@ class _CoreLinkMessagePackWriter {
       _writeByte(0xdb);
       _writeUnsigned(4, length);
     }
-    _bytes.add(bytes);
+    // Compact the prefix gap using an overlapping typed-data copy.
+    if (_length != start) {
+      bytes.setRange(_length, _length + length, bytes, start);
+    }
+    _length += length;
   }
 
   /// Writes native bytes using the MessagePack binary family.
   void _writeBinary(Uint8List value) {
-    final length = value.length;
-    if (length <= 0xff) {
-      _writeByte(0xc4);
-      _writeByte(length);
-    } else if (length <= 0xffff) {
-      _writeByte(0xc5);
-      _writeUnsigned(2, length);
-    } else {
-      _writeByte(0xc6);
-      _writeUnsigned(4, length);
-    }
-    _bytes.add(value);
+    _flush();
+    _parts.add(_CoreLinkBinary(value));
   }
 
   /// Writes a Link array.
@@ -846,7 +1390,7 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
   /// Creates a reader over one complete MessagePack payload.
   _CoreLinkMessagePackReader(
     this._bytes, {
-    int? targetObjectId,
+    String? target,
     CoreEmbeddedStreamFactory? embeddedStreamFactory,
   }) : _embeddedStreamFactory = embeddedStreamFactory;
 
@@ -866,7 +1410,7 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
   ) {
     final fieldCount = readMapLength();
     String? streamId;
-    int? targetObjectId;
+    String? target;
     String? propertyName;
     Object? args;
     for (var index = 0; index < fieldCount; index += 1) {
@@ -884,8 +1428,8 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
         final descriptorKey = readString();
         if (descriptorKey == 'streamId') {
           streamId = readString();
-        } else if (descriptorKey == 'targetObjectId') {
-          targetObjectId = _readCoreObjectIdValue(readValue());
+        } else if (descriptorKey == 'target') {
+          target = _readCoreTargetValue(readValue());
         } else if (descriptorKey == 'propertyName') {
           propertyName = readString();
         } else if (descriptorKey == 'args') {
@@ -896,18 +1440,18 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
       }
     }
     final resolvedStreamId = streamId;
-    final resolvedTargetObjectId = targetObjectId;
+    final resolvedTarget = target;
     final resolvedPropertyName = propertyName;
     final factory = _embeddedStreamFactory;
     if (resolvedStreamId == null ||
-        resolvedTargetObjectId == null ||
+        resolvedTarget == null ||
         resolvedPropertyName == null ||
         factory == null) {
       throw StateError('Embedded Core stream requires a stream factory');
     }
     return factory<T>(
       resolvedStreamId,
-      resolvedTargetObjectId,
+      resolvedTarget,
       resolvedPropertyName,
       args,
       decode,
@@ -947,6 +1491,8 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
         return _readBinary(_readUnsigned(2));
       case 0xc6:
         return _readBinary(_readUnsigned(4));
+      case 0xc7:
+        return _readSharedBinary(_readUnsigned(1));
       case 0xca:
         return _readFloat32();
       case 0xcb:
@@ -993,7 +1539,7 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
   Uint8List readValueBytes() {
     final start = _offset;
     skipValue();
-    return Uint8List.sublistView(_bytes, start, _offset);
+    return sliceCoreLinkBytes(_bytes, start, _offset);
   }
 
   /// Reads one MessagePack map header and returns its item count.
@@ -1135,6 +1681,7 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
       0xc4 => _readBinary(_readUnsigned(1)),
       0xc5 => _readBinary(_readUnsigned(2)),
       0xc6 => _readBinary(_readUnsigned(4)),
+      0xc7 => _readSharedBinary(_readUnsigned(1)),
       _ => throw FormatException(
         'Expected MessagePack binary, got marker 0x${marker.toRadixString(16)}',
       ),
@@ -1183,6 +1730,9 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
         return;
       case 0xc6:
         _skipBytes(_readUnsigned(4));
+        return;
+      case 0xc7:
+        _readSharedBinary(_readUnsigned(1));
         return;
       case 0xca:
         _skipBytes(4);
@@ -1297,6 +1847,28 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
     return data.getFloat64(0);
   }
 
+  /// Validates and resolves a shared slice without reading its binary contents.
+  Uint8List _readSharedBinary(int length) {
+    if (length != 24 || _readByte() != 0x42) {
+      throw const FormatException('Invalid shared buffer extension');
+    }
+    final index = _readUnsigned(8);
+    final offset = _readUnsigned(8);
+    final size = _readUnsigned(8);
+    final buffers = _sharedDecodeBuffers[_bytes];
+    if (buffers == null || index < 0 || index >= buffers.length) {
+      throw const FormatException('Invalid shared buffer index');
+    }
+    final buffer = buffers[index];
+    if (offset < 0 ||
+        size < 0 ||
+        offset > buffer.bytes.length ||
+        size > buffer.bytes.length - offset) {
+      throw const FormatException('Invalid shared buffer range');
+    }
+    return CoreLinkBufferSpan(buffer, offset, size).view();
+  }
+
   /// Reads native bytes.
   Uint8List _readBinary(int length) {
     _require(length);
@@ -1308,14 +1880,18 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
   /// Reads a UTF-8 string.
   String _readString(int length) {
     _require(length);
-    final value = utf8.decode(_bytes.sublist(_offset, _offset + length));
+    final value = const Utf8Decoder().convert(
+      _bytes,
+      _offset,
+      _offset + length,
+    );
     _offset += length;
     return value;
   }
 
-  /// Reads a Link array.
+  /// Decodes an owned, growable array so deltas can resize it without cloning.
   List<Object?> _readArray(int length) {
-    return List<Object?>.generate(length, (_) => readValue(), growable: false);
+    return List<Object?>.generate(length, (_) => readValue(), growable: true);
   }
 
   /// Reads a Link map with string keys.
@@ -1360,4 +1936,13 @@ class _CoreLinkMessagePackReader implements CoreLinkValueReader {
       throw FormatException('Unexpected end of Link payload');
     }
   }
+}
+
+/// Measures generic watch decoding when the diagnostic flag is enabled.
+void _profileCoreLinkDecode(String stage, Stopwatch watch, int bytes) {
+  final duration = watch.elapsedMicroseconds / 1000;
+  debugPrintSynchronously(
+    'event=compose_pipeline_stage stage=$stage durationMs=${duration.toStringAsFixed(3)} '
+    'wallMicros=${DateTime.now().microsecondsSinceEpoch} bytes=$bytes',
+  );
 }

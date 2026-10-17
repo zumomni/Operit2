@@ -8,11 +8,81 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::app::{OperitTui, QueuedAttachmentToken, QueuedAttachmentTokenKind};
-use super::commands::{complete_command_input, matching_command_specs, TuiCommandSpec};
+use super::commands::{complete_command_input, matching_command_specs, TuiCommandSuggestion};
 use super::helpers::{char_to_byte_index, display_width, wrap_approx_lines};
 
 const PASTE_ATTACHMENT_CHAR_THRESHOLD: usize = 2_048;
 const PASTE_ATTACHMENT_LINE_THRESHOLD: usize = 8;
+/// How many submitted inputs stay recallable with the arrow keys.
+const INPUT_HISTORY_LIMIT: usize = 200;
+
+/// Readline-style input history for the input box.
+///
+/// Browsing holds the in-progress text as a draft, so stepping past the newest
+/// entry hands the reader back exactly what they were typing.
+#[derive(Clone, Debug, Default)]
+pub(super) struct InputHistory {
+    entries: Vec<String>,
+    /// Entry currently recalled; `None` while the draft itself is being edited.
+    index: Option<usize>,
+    draft: String,
+}
+
+impl InputHistory {
+    /// Records one submitted input, skipping blanks and consecutive repeats.
+    pub(super) fn record(&mut self, input: &str) {
+        let entry = input.trim_end();
+        if entry.is_empty() || self.entries.last().map(String::as_str) == Some(entry) {
+            self.reset();
+            return;
+        }
+        self.entries.push(entry.to_string());
+        if self.entries.len() > INPUT_HISTORY_LIMIT {
+            self.entries.remove(0);
+        }
+        self.reset();
+    }
+
+    /// Leaves history browsing, dropping any saved draft.
+    pub(super) fn reset(&mut self) {
+        self.index = None;
+        self.draft.clear();
+    }
+
+    /// Returns whether a recall is in progress, which keeps the arrow keys on
+    /// history instead of the command suggestion list.
+    pub(super) fn is_browsing(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// Recalls the previous submitted input, saving `draft` on the first step.
+    pub(super) fn previous(&mut self, draft: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let index = match self.index {
+            None => {
+                self.draft = draft.to_string();
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(index) => index - 1,
+        };
+        self.index = Some(index);
+        Some(self.entries[index].clone())
+    }
+
+    /// Recalls the next submitted input, or the saved draft past the newest.
+    pub(super) fn next(&mut self) -> Option<String> {
+        let index = self.index?;
+        if index + 1 < self.entries.len() {
+            self.index = Some(index + 1);
+            return Some(self.entries[index + 1].clone());
+        }
+        self.index = None;
+        Some(std::mem::take(&mut self.draft))
+    }
+}
 
 impl OperitTui {
     /// Handles one bracketed paste payload for the input area.
@@ -46,12 +116,21 @@ impl OperitTui {
             (KeyCode::Tab, _) if self.has_command_suggestions() => {
                 self.complete_selected_command();
             }
-            (KeyCode::Up, _) if self.has_command_suggestions() => {
+            // A recall in progress keeps the arrow keys on history: a recalled
+            // slash command opens the suggestion list, and stepping through
+            // history must not be swallowed by it.
+            (KeyCode::Up, _)
+                if self.has_command_suggestions() && !self.input_history.is_browsing() =>
+            {
                 self.move_command_selection_up();
             }
-            (KeyCode::Down, _) if self.has_command_suggestions() => {
+            (KeyCode::Down, _)
+                if self.has_command_suggestions() && !self.input_history.is_browsing() =>
+            {
                 self.move_command_selection_down();
             }
+            (KeyCode::Up, _) => self.recall_previous_input(),
+            (KeyCode::Down, _) => self.recall_next_input(),
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.should_complete_selected_command_on_enter() {
                     self.complete_selected_command();
@@ -84,8 +163,8 @@ impl OperitTui {
     }
 
     /// Returns command suggestions matching the current input buffer.
-    pub(super) fn command_suggestions(&self) -> Vec<TuiCommandSpec> {
-        matching_command_specs(&self.input)
+    pub(super) fn command_suggestions(&self) -> Vec<TuiCommandSuggestion> {
+        matching_command_specs(&self.input, &self.plugin_commands)
     }
 
     /// Returns the selected command suggestion index within the available range.
@@ -159,6 +238,27 @@ impl OperitTui {
         !self.command_suggestions().is_empty()
     }
 
+    /// Replaces the input box with the previous submitted input.
+    fn recall_previous_input(&mut self) {
+        if let Some(recalled) = self.input_history.previous(&self.input) {
+            self.set_input_from_recall(recalled);
+        }
+    }
+
+    /// Replaces the input box with the next submitted input or the saved draft.
+    fn recall_next_input(&mut self) {
+        if let Some(recalled) = self.input_history.next() {
+            self.set_input_from_recall(recalled);
+        }
+    }
+
+    /// Shows one history entry in the input box with the cursor at its end.
+    fn set_input_from_recall(&mut self, recalled: String) {
+        self.input_cursor = recalled.chars().count();
+        self.input = recalled;
+        self.autocomplete_index = 0;
+    }
+
     /// Applies the selected command suggestion to the input buffer.
     fn complete_selected_command(&mut self) {
         let suggestions = self.command_suggestions();
@@ -166,7 +266,7 @@ impl OperitTui {
             return;
         }
         let index = self.selected_command_index(suggestions.len());
-        let (input, cursor) = complete_command_input(&self.input, suggestions[index]);
+        let (input, cursor) = complete_command_input(&self.input, &suggestions[index]);
         self.input = input;
         self.input_cursor = cursor;
         self.autocomplete_index = 0;
@@ -186,7 +286,11 @@ impl OperitTui {
             .unwrap_or("")
             .trim_end()
             .to_ascii_lowercase();
-        !current.is_empty() && current != suggestions[index].name
+        let name = suggestions[index].name();
+        // Enter only completes while the buffer is still a prefix of the
+        // suggestion; once values follow (e.g. `/new source parent `),
+        // remaining option suggestions must not swallow the submission.
+        !current.is_empty() && current != name && name.starts_with(&current)
     }
 
     /// Moves the command suggestion selection up by one row.
@@ -313,6 +417,7 @@ impl OperitTui {
         self.paste_attachment_counter += 1;
         let file_name = format!("pasted-text-{}.txt", self.paste_attachment_counter);
         AttachmentInfo {
+            nodeId: None,
             filePath: format!("tui-paste:{file_name}"),
             fileName: file_name,
             mimeType: "text/plain".to_string(),
@@ -339,12 +444,14 @@ impl OperitTui {
             .to_str()
             .ok_or_else(|| format!("clipboard image path is not UTF-8: {}", file_path.display()))?
             .to_string();
-        Ok(AttachmentInfo::new(
+        let mut attachment = AttachmentInfo::new(
             file_path_text,
             file_name,
             "image/png".to_string(),
             png.len() as i64,
-        ))
+        );
+        attachment.nodeId = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId();
+        Ok(attachment)
     }
 
     /// Reads a clipboard image and queues it as a direct file attachment.
@@ -568,4 +675,69 @@ fn push_pasted_path_part(parts: &mut Vec<String>, current: &mut String) {
         parts.push(value.to_string());
     }
     current.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Recalling walks backwards through submissions and keeps the in-progress
+    /// draft, so stepping past the newest entry hands the draft back.
+    #[test]
+    fn history_recalls_submissions_and_restores_the_draft() {
+        let mut history = InputHistory::default();
+        history.record("第一条");
+        history.record("第二条");
+
+        assert_eq!(history.previous("正在输入"), Some("第二条".to_string()));
+        assert_eq!(history.previous("ignored while browsing"), Some("第一条".to_string()));
+        assert_eq!(history.previous("ignored"), None, "the oldest entry is the end");
+        assert!(history.is_browsing());
+
+        assert_eq!(history.next(), Some("第二条".to_string()));
+        assert_eq!(history.next(), Some("正在输入".to_string()));
+        assert!(!history.is_browsing());
+        assert_eq!(history.next(), None, "browsing ended at the draft");
+    }
+
+    /// Blank submissions and consecutive repeats stay out of history.
+    #[test]
+    fn history_skips_blanks_and_consecutive_repeats() {
+        let mut history = InputHistory::default();
+        history.record("  ");
+        assert_eq!(history.previous("draft"), None);
+
+        history.record("go");
+        history.record("go");
+        assert_eq!(history.previous("draft"), Some("go".to_string()));
+        assert_eq!(history.previous("draft"), None);
+    }
+
+    /// Older entries leave history first once the cap is reached.
+    #[test]
+    fn history_drops_the_oldest_entry_at_its_limit() {
+        let mut history = InputHistory::default();
+        for index in 0..INPUT_HISTORY_LIMIT + 2 {
+            history.record(&format!("entry-{index}"));
+        }
+        let oldest = history.previous("draft").expect("the newest entry");
+        assert_eq!(oldest, format!("entry-{}", INPUT_HISTORY_LIMIT + 1));
+        let mut last = oldest;
+        while let Some(entry) = history.previous("draft") {
+            last = entry;
+        }
+        assert_eq!(last, "entry-2");
+    }
+
+    /// Submitting ends a browse, so the next arrow press starts from the newest
+    /// entry again instead of resuming the old position.
+    #[test]
+    fn recording_resets_browsing_state() {
+        let mut history = InputHistory::default();
+        history.record("one");
+        history.record("two");
+        assert_eq!(history.previous("draft"), Some("two".to_string()));
+        history.record("two");
+        assert!(!history.is_browsing());
+    }
 }

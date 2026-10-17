@@ -3,6 +3,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:operit2/core/web_visit/WebVisitModels.dart';
+import 'package:operit_folder_access/operit_folder_access.dart';
 import '../../../../common/markdown/StreamMarkdownRenderer.dart';
 
 import '../../../../../l10n/generated/app_localizations.dart';
@@ -16,6 +17,7 @@ import 'WorkspaceHomeContent.dart';
 import 'WorkspaceOverviewModels.dart';
 import 'WorkspaceTabModels.dart';
 import 'terminal/WorkspaceTerminalContent.dart';
+import '../../../../main/screens/OperitScreens.dart';
 
 class WorkspaceTabContent extends StatelessWidget {
   const WorkspaceTabContent({
@@ -45,6 +47,7 @@ class WorkspaceTabContent extends StatelessWidget {
     required this.onOpenWorkspaceCreator,
     required this.onBindWorkspace,
     required this.onChooseExistingWorkspace,
+    required this.onUnbindWorkspace,
     required this.splitMarkdownContent,
   });
 
@@ -82,8 +85,10 @@ class WorkspaceTabContent extends StatelessWidget {
   final VoidCallback onOpenWorkspaceCreator;
   final Future<void> Function(String workspace) onBindWorkspace;
   final VoidCallback onChooseExistingWorkspace;
+  final VoidCallback onUnbindWorkspace;
   final MarkdownContentSplitter splitMarkdownContent;
 
+  /// Builds the selected tab with shared workspace capability callbacks.
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
@@ -98,6 +103,7 @@ class WorkspaceTabContent extends StatelessWidget {
           onAddFolder: onAddFolder,
           onCreateWorkspace: onOpenWorkspaceCreator,
           onChooseExistingWorkspace: onChooseExistingWorkspace,
+          onUnbindWorkspace: onUnbindWorkspace,
           onOpenTerminal: onOpenTerminal,
           onOpenTerminalSessions: onOpenTerminalSessions,
           onOpenBrowserSessions: onOpenBrowserSessions,
@@ -110,6 +116,12 @@ class WorkspaceTabContent extends StatelessWidget {
           onListWorkspaceFiles: onListWorkspaceBindingDirectories,
           onOpenFile: onOpenFile,
           onSelectCurrentDirectory: onBindWorkspace,
+          onPickLocalDirectory: () async {
+            final source = await OperitFolderAccess.pickWorkspaceDirectory();
+            if (source != null) {
+              await onBindWorkspace(source.encode());
+            }
+          },
         );
       case WorkspaceTabKind.files:
         final rootPath = workspacePath?.trim();
@@ -176,10 +188,22 @@ class WorkspaceTabContent extends StatelessWidget {
         return WorkspaceFilePreviewContent(
           tab: tab,
           onReadWorkspaceFileBytes: onReadWorkspaceFileBytes,
+          onWriteWorkspaceFileBytes: onWriteWorkspaceFileBytes,
           onOpenWorkspaceFile: onOpenWorkspaceFile,
           onOpenBrowser: onOpenBrowser,
           splitMarkdownContent: splitMarkdownContent,
         );
+      case WorkspaceTabKind.plugin:
+        final packageName = tab.pluginPackageName;
+        final moduleId = tab.pluginUiModuleId;
+        if (packageName == null || moduleId == null) {
+          return const SizedBox.shrink();
+        }
+        return ToolPkgComposeDslScreenRoute(
+          containerPackageName: packageName,
+          uiModuleId: moduleId,
+          title: tab.title,
+        ).build(context);
     }
   }
 }

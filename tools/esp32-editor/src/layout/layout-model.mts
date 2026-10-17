@@ -99,8 +99,8 @@ const projectKeys = [
 const pageKeys = ['id', 'name', 'background', 'nodes', 'swipeLeft', 'swipeRight'];
 const integerFields = ['x', 'y', 'w', 'h', 'radius', 'value'] as const;
 const heavyTypes = ['calendar', 'keyboard', 'menu', 'msgbox', 'win', 'tabview', 'tileview'];
-const iconNames = ['face', 'wifi', 'settings', 'home', 'play', 'folder'];
-const bindings = ['', 'clock', 'connection', 'expression'];
+const iconNames = ['face', 'wifi', 'settings', 'home', 'play', 'folder', 'plugins', 'theme', 'terminal'];
+const bindings = ['', 'clock', 'connection', 'expression', 'theme', 'pairing', 'space', 'chat'];
 const fontSizes = [14, 48];
 const documentFields = ['background', 'enabled', 'entryPage', 'swipeLeft', 'swipeRight'];
 const pageChangeFields = ['name', 'background', 'swipeLeft', 'swipeRight'];
@@ -215,7 +215,7 @@ function validatePage(doc: unknown, allowedActions: readonly string[] = actions)
     }
     if (typeof raw.id === 'string') seen.set(raw.id, raw);
   }
-  if (cost > 40) add('组件复杂度超出 64 KiB LVGL 池的编辑器预算 (40)');
+  if (cost > 40) add('组件复杂度超出布局文档的编辑器预算 (40)');
   return errors;
 }
 

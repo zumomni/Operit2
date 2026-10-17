@@ -48,8 +48,7 @@ void main() {
                   inputState: InputProcessingState.idle(),
                   viewModel: ChatViewModel(bridge: _PendingModelBridge()),
                   currentChatId: 'empty-chat',
-                  currentCharacterCardName: null,
-                  currentCharacterCardAvatarUri: null,
+
                   onSendMessage: () {},
                   onQueueMessage: () {},
                   onCancelMessage: () {},
@@ -174,5 +173,5 @@ class _PendingModelBridge extends OperitRuntimeBridge {
   /// Rejects watches until model metadata has completed.
   @override
   Stream<CoreEvent> watchStream(CoreWatchRequest request) =>
-      throw UnimplementedError();
+      const Stream<CoreEvent>.empty();
 }

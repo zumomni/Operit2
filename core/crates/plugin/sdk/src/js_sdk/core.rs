@@ -1,9 +1,13 @@
 //! Core tool invocation, runtime utilities, and native bridge contracts for plugins.
 use super::{JsAny, JsDate, JsFuture, JsObject, JsUndefined};
 use serde::{Deserialize, Serialize};
+use operit_plugin_sdk_macros::js_declaration;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// Contains a JSON object with complete values preserved by the native JSON parser.
+pub type JsonObject = BTreeMap<String, serde_json::Value>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 /// Stores a scalar or JSON value assigned to an arbitrary tool parameter.
@@ -12,20 +16,6 @@ pub enum ToolParamsAdditionalValue {
     Variant2(f64),
     Variant3(bool),
     Variant4(serde_json::Value),
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Selects the native algorithm used to decompress plugin data.
-pub enum NativeInterfaceHostDecompressAlgorithm {
-    #[serde(rename = "deflate")]
-    Deflate,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Selects the native cryptographic operation family requested by a plugin.
-pub enum NativeInterfaceHostCryptoAlgorithm {
-    #[serde(rename = "md5")]
-    Md5,
-    #[serde(rename = "aes")]
-    Aes,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stores the named arguments passed to a tool invocation.
@@ -44,6 +34,37 @@ pub struct ToolConfig {
     pub params: Option<ToolParams>,
     /// Receives intermediate values produced by a streaming tool.
     pub onIntermediateResult: Option<Arc<dyn Fn(JsAny) + Send + Sync>>,
+}
+/// Describes one parameter accepted by a public tool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCatalogParameter {
+    pub name: String,
+    pub r#type: String,
+    pub description: String,
+    pub required: bool,
+    pub default: JsAny,
+}
+/// Describes a public builtin or plugin tool available on a device.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub parameters: Vec<ToolCatalogParameter>,
+    pub category: String,
+    pub source: String,
+    pub packageName: Option<String>,
+}
+/// Contains public tool names and schemas returned by device discovery.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCatalog {
+    pub tools: Vec<ToolCatalogEntry>,
+}
+/// Configures the lifetime of calls issued through Tools.device(nodeId).
+pub struct DeviceToolOptions {
+    /// Maximum duration including connection and permission checks; defaults to 120000 ms.
+    pub timeoutMs: Option<u64>,
+    /// Optional AbortSignal. Aborting closes the remote execution stream.
+    pub signal: Option<JsObject>,
 }
 /// Configures callbacks for a global tool call.
 pub struct ToolCallOptions<TIntermediate = JsAny> {
@@ -245,148 +266,36 @@ pub trait DataUtilsApi: Send + Sync {
 pub struct DataUtilsGlobal(pub Arc<dyn DataUtilsApi>);
 /// Stores the named values assigned to CommonJS module exports.
 pub struct CommonJsExports(pub BTreeMap<String, JsAny>);
-/// Provides synchronous Android runtime services used by plugin scripts.
-pub trait NativeInterfaceHost: Send + Sync {
-    ///
-    ///Call a tool synchronously (legacy method)
-    ///@param toolType - Tool type
-    ///@param toolName - Tool name
-    ///@param paramsJson - Parameters as JSON string
-    ///@returns A JSON string representing a ToolResult object
-    ///
-    fn callTool(&self, toolType: String, toolName: String, paramsJson: String) -> String;
-    ///
-    ///Call a tool asynchronously
-    ///@param callbackId - Unique callback ID
-    ///@param toolType - Tool type
-    ///@param toolName - Tool name
-    ///@param paramsJson - Parameters as JSON string
-    ///The callback will receive a ToolResult object
-    ///
-    fn callToolAsync(
-        &self,
-        callbackId: String,
-        toolType: String,
-        toolName: String,
-        paramsJson: String,
-    ) -> ();
-    /// Starts an asynchronous tool call and routes both intermediate and final results to callbacks.
-    fn callToolAsyncStreaming(
-        &self,
-        callbackId: String,
-        intermediateCallbackId: String,
-        toolType: String,
-        toolName: String,
-        paramsJson: String,
-    ) -> ();
-    ///
-    ///Set the result of script execution
-    ///@param result - Result string
-    ///
-    fn setResult(&self, result: String) -> ();
-    ///
-    ///Set an error for script execution
-    ///@param error - Error message
-    ///
-    fn setError(&self, error: String) -> ();
-    ///
-    ///Log informational message
-    ///@param message - Message to log
-    ///
-    fn logInfo(&self, message: String) -> ();
-    ///
-    ///Log error message
-    ///@param message - Error message to log
-    ///
-    fn logError(&self, message: String) -> ();
-    ///
-    ///Log debug message with data
-    ///@param message - Debug message
-    ///@param data - Debug data
-    ///
-    fn logDebug(&self, message: String, data: String) -> ();
-    ///
-    ///Register a toolbox UI module for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing a toolbox UI module
-    ///
-    fn registerToolPkgToolboxUiModule(&self, specJson: String) -> ();
-    ///
-    ///Register an app lifecycle hook for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing an app lifecycle hook
-    ///
-    fn registerToolPkgAppLifecycleHook(&self, specJson: String) -> ();
-    ///
-    ///Register a message processing plugin for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing a message processing plugin
-    ///
-    fn registerToolPkgMessageProcessingPlugin(&self, specJson: String) -> ();
-    ///
-    ///Register an XML render plugin for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing an XML render plugin
-    ///
-    fn registerToolPkgXmlRenderPlugin(&self, specJson: String) -> ();
-    ///
-    ///Resolve the persistent config directory for a package or toolpkg.
-    ///Returns an absolute path under `/sdcard/Download/Operit/plugins/<id>`.
-    ///
-    fn getPluginConfigDir(&self, pluginId: String) -> String;
-    ///
-    ///Decompress native deflate data from a base64 string or binary handle.
-    ///
-    fn decompress(&self, data: String, algorithm: NativeInterfaceHostDecompressAlgorithm)
-        -> String;
-    ///
-    ///Execute native crypto operations used by the CryptoJS bridge.
-    ///
-    fn crypto(
-        &self,
-        algorithm: NativeInterfaceHostCryptoAlgorithm,
-        operation: String,
-        argsJson: String,
-    ) -> String;
-    ///
-    ///Execute native image operations used by the Jimp bridge.
-    ///
-    fn image_processing(&self, callbackId: String, operation: String, argsJson: String) -> ();
-    ///
-    ///Register an input menu toggle plugin for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing an input menu toggle plugin
-    ///
-    fn registerToolPkgInputMenuTogglePlugin(&self, specJson: String) -> ();
-    ///
-    ///Register a chat input hook for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing a chat input hook
-    ///
-    fn registerToolPkgChatInputHook(&self, specJson: String) -> ();
-    ///
-    ///Register a chat message hook for current toolpkg main registration session.
-    ///@param specJson - JSON object string describing a chat message hook
-    ///
-    fn registerToolPkgChatMessageHook(&self, specJson: String) -> ();
-    ///
-    ///Register an image from base64-encoded data into the global image pool
-    ///and return a `<link type="image" id="...">` tag string that can be
-    ///embedded into tool results or messages.
-    ///
-    fn registerImageFromBase64(&self, base64: String, mimeType: String) -> String;
-    ///
-    ///Register an image from a file path on the device into the global image
-    ///pool and return a `<link type="image" id="...">` tag string that can
-    ///be embedded into tool results or messages.
-    ///
-    fn registerImageFromPath(&self, path: String) -> String;
-    ///
-    ///Report a script error with its source line and stack details.
-    ///@param errorType - Error type
-    ///@param errorMessage - Error message
-    ///@param errorLine - Line number where error occurred
-    ///@param errorStack - Error stack trace
-    ///
-    fn reportError(
-        &self,
-        errorType: String,
-        errorMessage: String,
-        errorLine: f64,
-        errorStack: String,
-    ) -> ();
+
+/// Represents the standard cancellation signal available in every plugin runtime.
+#[js_declaration(scope = "global", readonly)]
+pub struct AbortSignal {
+    /// Indicates whether cancellation has already been requested.
+    pub aborted: bool,
+    /// Carries the reason passed to AbortController.abort.
+    pub reason: JsAny,
+}
+/// Observes standard abort events without depending on a browser host.
+#[js_declaration(scope = "global")]
+pub trait AbortSignalMethods: Send + Sync {
+    /// Registers an abort event listener.
+    fn addEventListener(&self, event: String, listener: Arc<dyn Fn() + Send + Sync>);
+    /// Removes a registered abort event listener.
+    fn removeEventListener(&self, event: String, listener: Arc<dyn Fn() + Send + Sync>);
+    /// Throws the cancellation reason when this signal is aborted.
+    fn throwIfAborted(&self);
+}
+/// Owns one standard cancellation signal.
+#[js_declaration(scope = "global", readonly)]
+pub struct AbortController {
+    /// Exposes the signal passed to cancellable SDK operations.
+    pub signal: AbortSignal,
+}
+/// Creates and cancels a standard abort controller.
+#[js_declaration(scope = "global")]
+pub trait AbortControllerMethods: Send + Sync {
+    /// Creates an initially active abort controller.
+    fn new() -> AbortController;
+    /// Cancels the owned signal exactly once with an optional reason.
+    fn abort(&self, reason: Option<JsAny>);
 }

@@ -1,4 +1,4 @@
-/* Editor chrome only; the device pixels are rendered by shared LVGL. */
+/* Editor chrome only; the device pixels are rendered by the shared self-drawn UI. */
 :root {
   color-scheme:dark;
   --bg:#101319;
@@ -549,6 +549,94 @@ footer {
   color:#728297;
   padding:14px 24px;
 }
+.simulator-panel {
+  margin:16px 20px 0;
+  border-top:1px solid var(--line);
+  color:var(--muted);
+}
+.simulator-panel > details > summary {
+  min-height:44px;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  cursor:pointer;
+  list-style:none;
+  color:var(--text);
+  font-size:12px;
+}
+.simulator-panel > details > summary::-webkit-details-marker {
+  display:none;
+}
+.simulator-panel > details > summary::before {
+  content:'›';
+  color:var(--muted);
+  font-size:18px;
+  line-height:1;
+  transition:transform .15s ease;
+}
+.simulator-panel > details[open] > summary::before {
+  transform:rotate(90deg);
+}
+.simulator-panel summary small {
+  color:var(--muted);
+  font-size:11px;
+  font-weight:400;
+}
+.simulator-content {
+  max-width:720px;
+  padding:0 0 16px 26px;
+}
+.simulator-content .note {
+  margin:0 0 10px;
+}
+.simulator-details {
+  margin:12px 0;
+  border:1px solid var(--line);
+  border-radius:7px;
+  overflow:hidden;
+}
+.simulator-details > div {
+  display:grid;
+  grid-template-columns:104px minmax(0,1fr);
+  border-top:1px solid var(--line);
+}
+.simulator-details > div:first-child {
+  border-top:0;
+}
+.simulator-details dt,.simulator-details dd {
+  margin:0;
+  padding:9px 12px;
+}
+.simulator-details dt {
+  background:#171c24;
+  color:var(--muted);
+  font-size:11px;
+}
+.simulator-details dd {
+  min-width:0;
+  color:var(--text);
+  font-family:ui-monospace,Consolas,monospace;
+  font-size:11px;
+  overflow-wrap:anywhere;
+}
+
+.simulator-log {
+  font-size:11px;
+}
+.simulator-log summary {
+  cursor:pointer;
+}
+.simulator-log pre {
+  max-height:180px;
+  overflow:auto;
+  margin:8px 0 0;
+  padding:10px;
+  border:1px solid var(--line);
+  border-radius:7px;
+  background:var(--field);
+  color:var(--muted);
+  white-space:pre-wrap;
+}
 #source {
   overflow:hidden;
   text-overflow:ellipsis;
@@ -901,3 +989,10 @@ footer {
 @media(max-width:760px){.header-actions{gap:5px}.header-actions button{padding:6px 8px}.page-toolbar{padding:8px;gap:6px}.page-toolbar label{gap:5px}.page-toolbar select{width:130px;font-size:12px}.page-toolbar button{font-size:11px}.handle-nw{left:-16px;top:-16px}.handle-ne{right:-16px;top:-16px}.handle-sw{left:-16px;bottom:-16px}.handle-se{right:-16px;bottom:-16px}.page-settings{grid-template-columns:1fr}#ai-api-config input{font-size:16px}}
 
 #deploy-dialog{width:min(650px,calc(100vw - 24px));max-height:calc(100dvh - 24px);padding:0;color:var(--text);background:var(--panel);border:1px solid #45566a;border-radius:14px;overflow:auto}#deploy-dialog::backdrop{background:#040912b8}#flash-output{white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto}#deploy-feedback{color:var(--accent)}
+
+.host-composer { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin: 12px 0; }
+.host-composer label { flex: 1; min-width: 160px; font-size: 12px; }
+.host-composer input { display: block; width: 100%; margin-top: 6px; }
+.host-composer output { flex-basis: 100%; font-size: 12px; }
+.host-composer .image-picker { flex-basis: 100%; font-size: 12px; }
+.host-composer .image-picker input { max-width: 100%; }

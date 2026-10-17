@@ -1,3 +1,6 @@
+import { WebViewUserScripts } from './WebViewUserScripts';
+import { WebViewZoom } from './WebViewZoom';
+import { WebViewLocalResources } from './WebViewLocalResources';
 import common from '@ohos.app.ability.common';
 import { FlutterPlugin, FlutterPluginBinding } from '@ohos/flutter_ohos/src/main/ets/embedding/engine/plugins/FlutterPlugin';
 import { BinaryMessenger } from '@ohos/flutter_ohos/src/main/ets/plugin/common/BinaryMessenger';
@@ -31,6 +34,9 @@ import { WebViewHostApiImpl, WebViewProxy } from './WebViewHostApiImpl';
 const PLUGIN_NAME = 'WebviewAllOhosPlugin';
 
 export class WebviewAllOhosPlugin implements FlutterPlugin {
+  private localResources: WebViewLocalResources | null = null;
+  private userScripts: WebViewUserScripts | null = null;
+  private zoom: WebViewZoom | null = null;
   private instanceManager: InstanceManager | null = null;
   private hostApiChannel: OhosWebViewHostApiChannel | null = null;
 
@@ -53,6 +59,12 @@ export class WebviewAllOhosPlugin implements FlutterPlugin {
   }
 
   onDetachedFromEngine(_binding: FlutterPluginBinding): void {
+    this.zoom?.dispose();
+    this.zoom = null;
+    this.userScripts?.dispose();
+    this.userScripts = null;
+    this.localResources?.dispose();
+    this.localResources = null;
     if (this.hostApiChannel != null) {
       this.hostApiChannel.dispose();
       this.hostApiChannel = null;
@@ -91,6 +103,9 @@ export class WebviewAllOhosPlugin implements FlutterPlugin {
     const downloadListenerFlutterApi = new DownloadListenerFlutterApiImpl(messenger, instanceManager);
 
     this.instanceManager = instanceManager;
+    this.localResources = new WebViewLocalResources(messenger, instanceManager);
+    this.userScripts = new WebViewUserScripts(messenger, instanceManager);
+    this.zoom = new WebViewZoom(messenger, instanceManager);
     this.hostApiChannel = new OhosWebViewHostApiChannel(
       messenger,
       instanceManager,

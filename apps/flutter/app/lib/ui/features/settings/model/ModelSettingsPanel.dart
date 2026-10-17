@@ -1,9 +1,11 @@
 // ignore_for_file: file_names
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../../core/link/CoreLinkProtocol.dart';
@@ -15,7 +17,10 @@ import '../../../common/components/M3LoadingIndicator.dart';
 import '../../../theme/OperitFormStyles.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../components/SettingsControlStyles.dart';
+import 'CodexLoginDialog.dart';
+import 'ModelConnectionTestCapabilities.dart';
 import 'ProviderLogo.dart';
+import '../tts/TtsSettingsPanel.dart';
 
 class ModelSettingsPanel extends StatefulWidget {
   const ModelSettingsPanel({super.key, GeneratedCoreProxyClients? clients})
@@ -47,14 +52,35 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
     final chatBinding = await functionManager.getModelBindingForFunction(
       functionType: core_proxy.FunctionType.chat,
     );
+    final providers = await modelManager.getProviderProfiles();
+    final summaries = await modelManager.getAllModelSummaries();
+    core_proxy.ResolvedModelConfig? currentConfig;
+    if (summaries.any(
+      (model) =>
+          model.providerId == chatBinding.providerId &&
+          model.modelId == chatBinding.modelId,
+    )) {
+      try {
+        currentConfig = await modelManager.getResolvedModelConfig(
+          providerId: chatBinding.providerId,
+          modelId: chatBinding.modelId,
+        );
+      } on CoreLinkError catch (error) {
+        // A sync batch may change provider profiles after the summaries call.
+        // Keep the configuration page accessible so a dangling binding can
+        // be repaired. Unrelated runtime errors must still be reported.
+        if (error.code != 'COMMAND_ERROR' ||
+            !(error.message.startsWith('model not found: ') ||
+                error.message.startsWith('provider not found: '))) {
+          rethrow;
+        }
+      }
+    }
     final data = ModelSettingsData(
-      providers: await modelManager.getProviderProfiles(),
-      summaries: await modelManager.getAllModelSummaries(),
+      providers: providers,
+      summaries: summaries,
       chatBinding: chatBinding,
-      currentConfig: await modelManager.getResolvedModelConfig(
-        providerId: chatBinding.providerId,
-        modelId: chatBinding.modelId,
-      ),
+      currentConfig: currentConfig,
       functionBindings: await functionManager.functionModelBindingFlow().first,
       maxImageHistoryUserTurns: await apiPreferences
           .maxImageHistoryUserTurnsFlow()
@@ -70,6 +96,9 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
   Future<ModelSettingsData> get loadFuture => _future!;
 
   void _reload() {
+    if (!mounted) {
+      return;
+    }
     setState(() {
       _future = load();
     });
@@ -152,6 +181,7 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
       context: context,
       catalogEntries: catalogEntries,
       occupiedProviderNames: _occupiedProviderNames(providers, null),
+      clients: widget.clients,
     );
     if (result == null || result is! _ProviderEditSaveResult) {
       return;
@@ -199,6 +229,7 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
   }
 
   /// Updates a provider after rejecting names already used by other profiles.
+  /// Saves provider edits while preserving its identity and configured models.
   Future<void> _editProvider(
     core_proxy.ProviderProfile provider,
     List<core_proxy.ProviderProfile> providers,
@@ -212,6 +243,7 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
       context: context,
       catalogEntries: catalogEntries,
       occupiedProviderNames: _occupiedProviderNames(providers, provider.id),
+      clients: widget.clients,
       provider: provider,
     );
     if (result == null) {
@@ -227,8 +259,10 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
         provider: core_proxy.ProviderProfile(
           id: provider.id,
           name: saveResult.name,
-          providerTypeId: provider.providerTypeId,
-          providerType: provider.providerType,
+          providerTypeId: saveResult.providerTypeId,
+          providerType: core_proxy.ApiProviderType.fromJson(
+            saveResult.providerTypeId,
+          ),
           endpoint: saveResult.endpoint,
           apiKey: saveResult.apiKey,
           useMultipleApiKeys: provider.useMultipleApiKeys,
@@ -328,11 +362,18 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
       context: context,
       providerId: provider.id,
       initialData: data,
-      reload: load,
+      reload: () {
+        // Keep function mappings in sync with edits saved inside the detail dialog.
+        _reload();
+        return loadFuture;
+      },
       onSelectModel: _selectChatModel,
       onAddModel: _addProviderModel,
       onEditProvider: _editOpenedProvider,
-      onEditModelSettings: _editModelSettings,
+      onDeleteProvider: _deleteProvider,
+      clients: widget.clients,
+      onDeleteModel: _deleteModel,
+      onTestModelConnection: _testModelConnection,
     );
   }
 
@@ -477,82 +518,26 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
     _reload();
   }
 
-  Future<void> _editModelSettings(
-    core_proxy.ProviderProfile provider,
-    core_proxy.ModelProfile model,
-  ) async {
-    final config = await widget.clients.preferencesModelConfigManager
-        .getResolvedModelConfig(providerId: provider.id, modelId: model.id);
-    if (!mounted) {
-      return;
-    }
-    final result = await _ModelSettingsEditorDialog.show(
-      context: context,
-      providerName: provider.name,
-      modelId: model.id,
-      initialCapabilities: config.capabilities,
-      initialBuiltinTools: config.builtinTools,
-      initialContext: config.context,
-      initialSummary: config.summary,
-      onTest: () => _testModelConnection(provider, model),
-    );
-    if (result == null || !mounted) {
-      return;
-    }
-    final _ModelSettingsChange changed;
-    switch (result) {
-      case _ModelSettingsDeleteRequested():
-        await _deleteModel(provider, model);
-        return;
-      case _ModelSettingsSaved(:final change):
-        changed = change;
-    }
-    if (changed.capabilities != config.capabilities) {
-      await widget.clients.preferencesModelConfigManager
-          .updateCapabilitiesForModel(
-            providerId: provider.id,
-            modelId: model.id,
-            capabilities: changed.capabilities,
-          );
-    }
-    if (changed.builtinTools != config.builtinTools) {
-      await widget.clients.preferencesModelConfigManager
-          .updateBuiltinToolsForModel(
-            providerId: provider.id,
-            modelId: model.id,
-            builtinTools: changed.builtinTools,
-          );
-    }
-    if (changed.context != config.context) {
-      await widget.clients.preferencesModelConfigManager.updateContextForModel(
-        providerId: provider.id,
-        modelId: model.id,
-        context: changed.context,
-      );
-    }
-    if (changed.summary != config.summary) {
-      await widget.clients.preferencesModelConfigManager.updateSummaryForModel(
-        providerId: provider.id,
-        modelId: model.id,
-        summary: changed.summary,
-      );
-    }
-    if (!mounted) {
-      return;
-    }
-    _reload();
-  }
-
   Future<core_proxy.ModelConnectionTestReport?> _testModelConnection(
     core_proxy.ProviderProfile provider,
     core_proxy.ModelProfile model,
+    core_proxy.ModelCapabilities capabilities,
   ) async {
+    if (!mounted) {
+      return null;
+    }
     final l10n = AppLocalizations.of(context)!;
     final testKey = _modelTestKey(provider.id, model.id);
     setState(() {
       _testingModelKey = testKey;
     });
     try {
+      await widget.clients.preferencesModelConfigManager
+          .updateCapabilitiesForModel(
+            providerId: provider.id,
+            modelId: model.id,
+            capabilities: capabilities,
+          );
       final report = await widget.clients.application.testModelConnection(
         providerId: provider.id,
         modelId: model.id,
@@ -564,6 +549,7 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
         providerId: provider.id,
         modelId: model.id,
         report: report,
+        current: capabilities,
       );
       if (!mounted) {
         return report;
@@ -592,8 +578,9 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
     required String providerId,
     required String modelId,
     required core_proxy.ModelConnectionTestReport report,
+    required core_proxy.ModelCapabilities current,
   }) async {
-    final chatPassed = _connectionTestSucceeded(
+    final chatPassed = connectionTestSucceeded(
       report,
       core_proxy.ModelConnectionTestType.chat,
     );
@@ -604,24 +591,7 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
         .updateCapabilitiesForModel(
           providerId: providerId,
           modelId: modelId,
-          capabilities: core_proxy.ModelCapabilities(
-            directImage: _connectionTestSucceeded(
-              report,
-              core_proxy.ModelConnectionTestType.image,
-            ),
-            directAudio: _connectionTestSucceeded(
-              report,
-              core_proxy.ModelConnectionTestType.audio,
-            ),
-            directVideo: _connectionTestSucceeded(
-              report,
-              core_proxy.ModelConnectionTestType.video,
-            ),
-            toolCall: _connectionTestSucceeded(
-              report,
-              core_proxy.ModelConnectionTestType.toolCall,
-            ),
-          ),
+          capabilities: capabilitiesFromConnectionTest(report, current),
         );
     if (!mounted) {
       return;
@@ -645,8 +615,23 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
         return ListView(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
           children: <Widget>[
-            _ProviderSectionCard(
-              onCreateProvider: _createProvider,
+            if (data.currentConfig == null) ...<Widget>[
+              CommonNetworkErrorView(
+                errorText: l10n.settingsModelFunctionMappingsMissing(
+                  data.chatBinding.providerId,
+                  data.chatBinding.modelId,
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            _SectionCard(
+              title: l10n.settingsModelProvidersSection,
+              icon: Icons.dns_outlined,
+              initiallyExpanded: true,
+              action: SettingsSectionAddButton(
+                tooltip: '添加模型供应商',
+                onPressed: _createProvider,
+              ),
               children: <Widget>[
                 _ProviderCardList(
                   providers: data.providers,
@@ -656,8 +641,17 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
                 ),
               ],
             ),
+            TtsProviderSection(
+              clients: widget.clients,
+              initiallyExpanded: false,
+            ),
+            SttProviderSection(
+              clients: widget.clients,
+              initiallyExpanded: false,
+            ),
             _SectionCard(
               title: l10n.settingsModelFunctionMappingsSection,
+              icon: Icons.tune_outlined,
               initiallyExpanded: false,
               children: <Widget>[
                 _FunctionMappingGroups(
@@ -689,7 +683,7 @@ class ModelSettingsData {
   final List<core_proxy.ProviderProfile> providers;
   final List<core_proxy.ProviderModelSummary> summaries;
   final core_proxy.FunctionModelBinding chatBinding;
-  final core_proxy.ResolvedModelConfig currentConfig;
+  final core_proxy.ResolvedModelConfig? currentConfig;
   final Map<core_proxy.FunctionType, core_proxy.FunctionModelBinding>
   functionBindings;
   final int maxImageHistoryUserTurns;
@@ -743,17 +737,20 @@ class _ProviderEditorDialog extends StatefulWidget {
   const _ProviderEditorDialog({
     required this.catalogEntries,
     required this.occupiedProviderNames,
+    required this.clients,
     this.provider,
   });
 
   final List<core_proxy.ProviderCatalogEntry> catalogEntries;
   final Set<String> occupiedProviderNames;
+  final GeneratedCoreProxyClients clients;
   final core_proxy.ProviderProfile? provider;
 
   static Future<_ProviderEditResult?> show({
     required BuildContext context,
     required List<core_proxy.ProviderCatalogEntry> catalogEntries,
     required Set<String> occupiedProviderNames,
+    required GeneratedCoreProxyClients clients,
     core_proxy.ProviderProfile? provider,
   }) {
     return showDialog<_ProviderEditResult>(
@@ -761,6 +758,7 @@ class _ProviderEditorDialog extends StatefulWidget {
       builder: (context) => _ProviderEditorDialog(
         catalogEntries: catalogEntries,
         occupiedProviderNames: occupiedProviderNames,
+        clients: clients,
         provider: provider,
       ),
     );
@@ -782,6 +780,7 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
   String? _thinkingConfigError;
   bool _thinkingRulesChanged = false;
   String? _selectedProviderTypeId;
+  core_proxy.CodexSessionStatus? _codexStatus;
 
   @override
   void initState() {
@@ -801,6 +800,11 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
     );
     if (provider != null) {
       _selectedProviderTypeId = provider.providerTypeId;
+      if (provider.providerTypeId == 'OPENAI_CODEX') {
+        _endpointController.text =
+            'https://chatgpt.com/backend-api/codex/responses';
+        unawaited(_refreshCodexStatus());
+      }
       try {
         _thinkingRules = _parseThinkingRuleEditors(
           provider.thinkingConfigurations,
@@ -877,6 +881,41 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
         _endpointController.text = catalog.defaultEndpoint;
       }
     });
+    if (providerTypeId == 'OPENAI_CODEX') {
+      unawaited(_refreshCodexStatus());
+    }
+  }
+
+  bool get _isCodexProvider => _selectedProviderTypeId == 'OPENAI_CODEX';
+
+  bool get _isLocalProvider => _selectedProviderTypeId == 'LOCAL_MODEL';
+
+  Future<void> _refreshCodexStatus() async {
+    try {
+      final status = await widget.clients.servicesCodexOAuthService
+          .sessionStatus();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _codexStatus = status;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _codexStatus = null;
+      });
+    }
+  }
+
+  Future<void> _openCodexLogin() async {
+    await showCodexLoginDialog(context: context, clients: widget.clients);
+    if (!mounted) {
+      return;
+    }
+    await _refreshCodexStatus();
   }
 
   /// Opens the endpoint selector for providers with declared options.
@@ -975,7 +1014,9 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
       _ProviderEditSaveResult(
         name: _nameController.text.trim(),
         providerTypeId: _selectedProviderTypeId!,
-        endpoint: _endpointController.text.trim(),
+        endpoint: _isCodexProvider
+            ? 'https://chatgpt.com/backend-api/codex/responses'
+            : _endpointController.text.trim(),
         apiKey: _apiKeyController.text,
         customHeaders: _customHeadersController.text,
         requestLimitPerMinute: int.parse(_requestLimitController.text),
@@ -985,6 +1026,7 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
     );
   }
 
+  /// Builds editable provider settings for both new and existing profiles.
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
@@ -1036,7 +1078,7 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                           ),
                         )
                         .toList(growable: false),
-                    onChanged: editing ? null : _onProviderTypeChanged,
+                    onChanged: _onProviderTypeChanged,
                     validator: (value) {
                       if (value == null || value.isEmpty) {
                         return l10n.settingsModelProviderType;
@@ -1048,24 +1090,33 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                 _DialogTextField(
                   controller: _endpointController,
                   label: l10n.settingsModelApiEndpoint,
-                  requiredField: true,
+                  requiredField: !_isLocalProvider,
+                  readOnly: _isCodexProvider,
                   keyboardType: TextInputType.url,
                   inputFormatters: <TextInputFormatter>[
                     FilteringTextInputFormatter.deny(RegExp(r'\s')),
                   ],
-                  suffixIcon: endpointOptions.isEmpty
-                      ? null
-                      : IconButton(
-                          tooltip: l10n.settingsModelApiEndpoint,
-                          icon: const Icon(Icons.arrow_drop_down_rounded),
-                          onPressed: _showEndpointOptionsDialog,
-                        ),
+                  suffixIcon: _isCodexProvider
+                      ? const Icon(Icons.lock_outline, size: 20)
+                      : (endpointOptions.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: l10n.settingsModelApiEndpoint,
+                                icon: const Icon(Icons.arrow_drop_down_rounded),
+                                onPressed: _showEndpointOptionsDialog,
+                              )),
                 ),
-                _DialogTextField(
-                  controller: _apiKeyController,
-                  label: l10n.settingsModelApiKey,
-                  obscureText: true,
-                ),
+                if (_isCodexProvider)
+                  _CodexLoginField(
+                    status: _codexStatus,
+                    onLogin: _openCodexLogin,
+                  )
+                else
+                  _DialogTextField(
+                    controller: _apiKeyController,
+                    label: l10n.settingsModelApiKey,
+                    obscureText: true,
+                  ),
                 Theme(
                   data: Theme.of(context).copyWith(
                     dividerColor: Colors.transparent,
@@ -2694,10 +2745,256 @@ class _AvailableModelDialog extends StatefulWidget {
 
 enum _AvailableModelListScope { fetched, all }
 
+// Lucide SVG Icons (MIT License)
+const String _kSvgSearch =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>';
+const String _kSvgClose =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+const String _kSvgLayers =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 12.5-8.58 3.91a2 2 0 0 1-1.66 0L2 12.5"/><path d="m22 17.5-8.58 3.91a2 2 0 0 1-1.66 0L2 17.5"/></svg>';
+const String _kSvgSparkles =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/></svg>';
+const String _kSvgHistory =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>';
+const String _kSvgCheck =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const String _kSvgCpu =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>';
+const String _kSvgChevronRight =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+const String _kSvgChevronDown =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+const String _kSvgCheckSquare =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg>';
+const String _kSvgCloudOff =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 2 20 20"/><path d="M5.782 5.782A7 7 0 0 0 9 19h8.5a4.5 4.5 0 0 0 1.307-.193"/><path d="M21.532 16.5A4.5 4.5 0 0 0 17.5 10h-1.79A7.008 7.008 0 0 0 10 5.07"/></svg>';
+const String _kSvgSearchX =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13.5 8.5-5 5"/><path d="m8.5 8.5 5 5"/><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>';
+
+class _LucideIcon extends StatelessWidget {
+  const _LucideIcon(this.svg, {this.size = 18, this.color});
+
+  final String svg;
+  final double size;
+  final Color? color;
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveColor = color ?? Theme.of(context).colorScheme.onSurface;
+    return SvgPicture.string(
+      svg,
+      width: size,
+      height: size,
+      colorFilter: ColorFilter.mode(effectiveColor, BlendMode.srcIn),
+    );
+  }
+}
+
+class _ModernCheckbox extends StatelessWidget {
+  const _ModernCheckbox({required this.checked, required this.onTap});
+
+  final bool checked;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        width: 18,
+        height: 18,
+        decoration: BoxDecoration(
+          color: checked ? colorScheme.primary : Colors.transparent,
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(
+            color: checked
+                ? colorScheme.primary
+                : colorScheme.outlineVariant.withValues(alpha: 0.5),
+            width: 1.4,
+          ),
+        ),
+        child: checked
+            ? Center(
+                child: _LucideIcon(
+                  _kSvgCheck,
+                  size: 13,
+                  color: colorScheme.onPrimary,
+                ),
+              )
+            : null,
+      ),
+    );
+  }
+}
+
+class _TransformerScopeSlider extends StatelessWidget {
+  const _TransformerScopeSlider({
+    required this.scope,
+    required this.fetchedLabel,
+    required this.allLabel,
+    required this.onChanged,
+  });
+
+  final _AvailableModelListScope scope;
+  final String fetchedLabel;
+  final String allLabel;
+  final ValueChanged<_AvailableModelListScope> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isAll = scope == _AvailableModelListScope.all;
+
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: colorScheme.outlineVariant.withValues(alpha: 0.18),
+        ),
+      ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final itemWidth = (constraints.maxWidth - 2) / 2;
+          return Stack(
+            children: <Widget>[
+              // Fluid Transformer sliding thumb
+              AnimatedAlign(
+                duration: const Duration(milliseconds: 260),
+                curve: Curves.fastOutSlowIn,
+                alignment: isAll ? Alignment.centerRight : Alignment.centerLeft,
+                child: Container(
+                  width: itemWidth,
+                  height: double.infinity,
+                  decoration: BoxDecoration(
+                    color: colorScheme.primaryContainer.withValues(alpha: 0.65),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: colorScheme.primary.withValues(alpha: 0.35),
+                      width: 1,
+                    ),
+                    boxShadow: <BoxShadow>[
+                      BoxShadow(
+                        color: colorScheme.shadow.withValues(alpha: 0.12),
+                        blurRadius: 4,
+                        offset: const Offset(0, 1),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              // Option labels with smooth morph animation
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: _SliderOptionItem(
+                      icon: _kSvgSparkles,
+                      label: fetchedLabel,
+                      selected: !isAll,
+                      onTap: () => onChanged(_AvailableModelListScope.fetched),
+                    ),
+                  ),
+                  Expanded(
+                    child: _SliderOptionItem(
+                      icon: _kSvgHistory,
+                      label: allLabel,
+                      selected: isAll,
+                      onTap: () => onChanged(_AvailableModelListScope.all),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _SliderOptionItem extends StatelessWidget {
+  const _SliderOptionItem({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Center(
+          child: AnimatedDefaultTextStyle(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeInOut,
+            style: textTheme.labelMedium!.copyWith(
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+              color: selected
+                  ? colorScheme.onPrimaryContainer
+                  : colorScheme.onSurfaceVariant,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                AnimatedScale(
+                  scale: selected ? 1.06 : 0.94,
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutBack,
+                  child: _LucideIcon(
+                    icon,
+                    size: 14,
+                    color: selected
+                        ? colorScheme.primary
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AvailableModelDialogState extends State<_AvailableModelDialog> {
   final _searchController = TextEditingController();
   final Set<String> _selectedModelIds = <String>{};
-  _AvailableModelListScope _scope = _AvailableModelListScope.fetched;
+  late _AvailableModelListScope _scope;
+
+  @override
+  void initState() {
+    super.initState();
+    final hasFetched = widget.models.any(_availableProviderModelIsFetched);
+    _scope = hasFetched
+        ? _AvailableModelListScope.fetched
+        : _AvailableModelListScope.all;
+  }
 
   @override
   void dispose() {
@@ -2768,91 +3065,371 @@ class _AvailableModelDialogState extends State<_AvailableModelDialog> {
         .toList(growable: false);
   }
 
+  /// Returns whether all currently filtered models are selected.
+  bool _areAllFilteredSelected(
+    List<core_proxy.AvailableProviderModel> filtered,
+  ) {
+    if (filtered.isEmpty) {
+      return false;
+    }
+    return filtered.every((model) => _selectedModelIds.contains(model.modelId));
+  }
+
+  /// Selects or clears all currently filtered models.
+  void _toggleSelectAll(List<core_proxy.AvailableProviderModel> filtered) {
+    setState(() {
+      if (_areAllFilteredSelected(filtered)) {
+        for (final model in filtered) {
+          _selectedModelIds.remove(model.modelId);
+        }
+      } else {
+        for (final model in filtered) {
+          _selectedModelIds.add(model.modelId);
+        }
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
     final l10n = AppLocalizations.of(context)!;
     final query = _searchController.text.trim();
     final filteredModels = _filteredModels(l10n);
     final includeSource = _scope == _AvailableModelListScope.all;
-    return AlertDialog(
-      title: Text(l10n.settingsModelAddModel),
-      content: SizedBox(
-        width: 520,
-        height: 500,
+    final fetchedCount = widget.models
+        .where(_availableProviderModelIsFetched)
+        .length;
+    final allCount = widget.models.length;
+    final allFilteredSelected = _areAllFilteredSelected(filteredModels);
+
+    final viewport = MediaQuery.sizeOf(context);
+    final dialogWidth = (viewport.width - 32).clamp(320.0, 560.0).toDouble();
+    final dialogHeight = (viewport.height - 48).clamp(320.0, 600.0).toDouble();
+
+    return Dialog(
+      insetPadding: const EdgeInsets.all(16),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: SizedBox(
+        width: dialogWidth,
+        height: dialogHeight,
         child: Column(
           children: <Widget>[
-            TextField(
-              controller: _searchController,
-              decoration: InputDecoration(
-                prefixIcon: const Icon(Icons.search),
-                labelText: l10n.search,
-              ),
-              onChanged: (_) => setState(() {}),
-            ),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: SegmentedButton<_AvailableModelListScope>(
-                showSelectedIcon: false,
-                segments: <ButtonSegment<_AvailableModelListScope>>[
-                  ButtonSegment<_AvailableModelListScope>(
-                    value: _AvailableModelListScope.fetched,
-                    label: Text(l10n.settingsModelAvailableFetchedOnly),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
+              child: Row(
+                children: <Widget>[
+                  Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: colorScheme.primary.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Center(
+                      child: _LucideIcon(
+                        _kSvgLayers,
+                        size: 18,
+                        color: colorScheme.primary,
+                      ),
+                    ),
                   ),
-                  ButtonSegment<_AvailableModelListScope>(
-                    value: _AvailableModelListScope.all,
-                    label: Text(l10n.settingsModelAvailableIncludeHistory),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      l10n.settingsModelAddModel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: MaterialLocalizations.of(
+                      context,
+                    ).closeButtonTooltip,
+                    icon: _LucideIcon(
+                      _kSvgClose,
+                      size: 16,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => Navigator.of(context).pop(),
                   ),
                 ],
-                selected: <_AvailableModelListScope>{_scope},
-                onSelectionChanged: (selection) => _setScope(selection.single),
               ),
             ),
-            const SizedBox(height: 8),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Column(
+                children: <Widget>[
+                  Container(
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: colorScheme.surfaceContainerHighest.withValues(
+                        alpha: 0.35,
+                      ),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: colorScheme.outlineVariant.withValues(
+                          alpha: 0.25,
+                        ),
+                      ),
+                    ),
+                    child: TextField(
+                      controller: _searchController,
+                      style: textTheme.bodyMedium,
+                      textAlignVertical: TextAlignVertical.center,
+                      decoration: InputDecoration(
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                        ),
+                        border: InputBorder.none,
+                        prefixIcon: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: _LucideIcon(
+                            _kSvgSearch,
+                            size: 16,
+                            color: colorScheme.onSurfaceVariant.withValues(
+                              alpha: 0.7,
+                            ),
+                          ),
+                        ),
+                        prefixIconConstraints: const BoxConstraints(
+                          minWidth: 36,
+                          minHeight: 36,
+                        ),
+                        hintText: l10n.search,
+                        hintStyle: textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onSurfaceVariant.withValues(
+                            alpha: 0.6,
+                          ),
+                        ),
+                        suffixIcon: _searchController.text.isNotEmpty
+                            ? IconButton(
+                                icon: _LucideIcon(
+                                  _kSvgClose,
+                                  size: 14,
+                                  color: colorScheme.onSurfaceVariant,
+                                ),
+                                visualDensity: VisualDensity.compact,
+                                padding: EdgeInsets.zero,
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() {});
+                                },
+                              )
+                            : null,
+                        suffixIconConstraints: const BoxConstraints(
+                          minWidth: 32,
+                          minHeight: 32,
+                        ),
+                      ),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: _TransformerScopeSlider(
+                          scope: _scope,
+                          fetchedLabel:
+                              '${l10n.settingsModelAvailableFetchedOnly} ($fetchedCount)',
+                          allLabel:
+                              '${l10n.settingsModelAvailableIncludeHistory} ($allCount)',
+                          onChanged: _setScope,
+                        ),
+                      ),
+                      if (filteredModels.isNotEmpty) ...<Widget>[
+                        const SizedBox(width: 10),
+                        Material(
+                          color: colorScheme.surfaceContainerHighest.withValues(
+                            alpha: 0.35,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            side: BorderSide(
+                              color: colorScheme.outlineVariant.withValues(
+                                alpha: 0.15,
+                              ),
+                            ),
+                          ),
+                          child: InkWell(
+                            onTap: () => _toggleSelectAll(filteredModels),
+                            borderRadius: BorderRadius.circular(10),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 7,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: <Widget>[
+                                  _LucideIcon(
+                                    allFilteredSelected
+                                        ? _kSvgClose
+                                        : _kSvgCheckSquare,
+                                    size: 14,
+                                    color: allFilteredSelected
+                                        ? colorScheme.error
+                                        : colorScheme.primary,
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    allFilteredSelected
+                                        ? l10n.clear
+                                        : l10n.settingsWorkspaceSelectAllCurrentList,
+                                    style: textTheme.labelMedium?.copyWith(
+                                      color: allFilteredSelected
+                                          ? colorScheme.error
+                                          : colorScheme.primary,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
             Expanded(
               child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
                 children: <Widget>[
                   if (filteredModels.isEmpty &&
                       query.isEmpty &&
                       _scope == _AvailableModelListScope.fetched)
                     Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: Text(l10n.settingsModelAvailableEmptyFetched),
-                    ),
-                  for (final model in filteredModels)
-                    Material(
-                      type: MaterialType.transparency,
-                      child: ListTile(
-                        dense: true,
-                        visualDensity: VisualDensity.compact,
-                        contentPadding: EdgeInsets.zero,
-                        leading: Checkbox(
-                          value: _selectedModelIds.contains(model.modelId),
-                          onChanged: (_) => _toggleModel(model),
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 36,
+                        horizontal: 16,
+                      ),
+                      child: Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            _LucideIcon(
+                              _kSvgCloudOff,
+                              size: 36,
+                              color: colorScheme.onSurfaceVariant.withValues(
+                                alpha: 0.5,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              l10n.settingsModelAvailableEmptyFetched,
+                              textAlign: TextAlign.center,
+                              style: textTheme.bodySmall?.copyWith(
+                                color: colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
                         ),
-                        title: Text(model.modelId),
-                        subtitle: Text(
-                          _availableModelSubtitle(
-                            l10n,
-                            model,
-                            includeSource: includeSource,
-                          ),
+                      ),
+                    )
+                  else if (filteredModels.isEmpty && query.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 36),
+                      child: Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            _LucideIcon(
+                              _kSvgSearchX,
+                              size: 36,
+                              color: colorScheme.onSurfaceVariant.withValues(
+                                alpha: 0.5,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              l10n.noData,
+                              style: textTheme.bodyMedium?.copyWith(
+                                color: colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
                         ),
-                        onTap: () => _toggleModel(model),
                       ),
                     ),
-                  Material(
-                    type: MaterialType.transparency,
-                    child: ListTile(
-                      dense: true,
+                  for (final model in filteredModels)
+                    _AvailableModelItemCard(
+                      model: model,
+                      selected: _selectedModelIds.contains(model.modelId),
+                      includeSource: includeSource,
+                      onTap: () => _toggleModel(model),
+                    ),
+                  _CustomModelActionCard(
+                    onTap: () => Navigator.of(
+                      context,
+                    ).pop(const _AvailableModelCustom()),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 16, 12),
+              child: Row(
+                children: <Widget>[
+                  Text(
+                    _selectedModelIds.isEmpty
+                        ? ''
+                        : l10n.settingsWorkspaceSelectedCount(
+                            _selectedModelIds.length,
+                            filteredModels.length,
+                          ),
+                    style: textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: TextButton.styleFrom(
                       visualDensity: VisualDensity.compact,
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.add),
-                      title: Text(l10n.settingsModelCustomModel),
-                      subtitle: Text(l10n.settingsModelModelId),
-                      onTap: () => Navigator.of(
-                        context,
-                      ).pop(const _AvailableModelCustom()),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    child: Text(l10n.cancel),
+                  ),
+                  const SizedBox(width: 10),
+                  FilledButton(
+                    onPressed: _selectedModelIds.isEmpty
+                        ? null
+                        : () => Navigator.of(
+                            context,
+                          ).pop(_AvailableModelsPicked(_selectedModels())),
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 8,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    child: Text(
+                      '${l10n.settingsModelAddModelShort} (${_selectedModelIds.length})',
                     ),
                   ),
                 ],
@@ -2861,22 +3438,233 @@ class _AvailableModelDialogState extends State<_AvailableModelDialog> {
           ],
         ),
       ),
-      actions: <Widget>[
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: Text(l10n.cancel),
-        ),
-        FilledButton(
-          onPressed: _selectedModelIds.isEmpty
-              ? null
-              : () => Navigator.of(
-                  context,
-                ).pop(_AvailableModelsPicked(_selectedModels())),
-          child: Text(
-            '${l10n.settingsModelAddModelShort} (${_selectedModelIds.length})',
+    );
+  }
+}
+
+class _AvailableModelItemCard extends StatelessWidget {
+  const _AvailableModelItemCard({
+    required this.model,
+    required this.selected,
+    required this.includeSource,
+    required this.onTap,
+  });
+
+  final core_proxy.AvailableProviderModel model;
+  final bool selected;
+  final bool includeSource;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final l10n = AppLocalizations.of(context)!;
+    final contextLength = model.context?.maxContextLength;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Material(
+        color: selected
+            ? colorScheme.primaryContainer.withValues(alpha: 0.22)
+            : colorScheme.surfaceContainerHighest.withValues(alpha: 0.2),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: BorderSide(
+            color: selected
+                ? colorScheme.primary.withValues(alpha: 0.45)
+                : colorScheme.outlineVariant.withValues(alpha: 0.18),
           ),
         ),
-      ],
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            child: Row(
+              children: <Widget>[
+                _ModernCheckbox(checked: selected, onTap: onTap),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        model.modelId,
+                        style: textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          color: selected
+                              ? colorScheme.primary
+                              : colorScheme.onSurface,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 4),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: <Widget>[
+                          if (contextLength != null)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 1.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: colorScheme.primary.withValues(
+                                  alpha: 0.12,
+                                ),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                _formatContextLength(contextLength) ??
+                                    '${contextLength.round()}K',
+                                style: textTheme.labelSmall?.copyWith(
+                                  color: colorScheme.primary,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                          if (includeSource)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 1.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: colorScheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                _availableProviderModelIsFetched(model)
+                                    ? l10n.settingsModelAvailableSourceFetched
+                                    : l10n.settingsModelAvailableSourceHistory,
+                                style: textTheme.labelSmall?.copyWith(
+                                  color: colorScheme.onSurfaceVariant,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                          if (model.capabilities != null)
+                            _ModelCapabilityCapsules(
+                              capabilities: model.capabilities!,
+                            ),
+                          if (model.builtinTools.isNotEmpty)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1.5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: colorScheme.tertiaryContainer.withValues(
+                                  alpha: 0.35,
+                                ),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                l10n.settingsModelBuiltinTools,
+                                style: textTheme.labelSmall?.copyWith(
+                                  color: colorScheme.tertiary,
+                                  fontSize: 10,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CustomModelActionCard extends StatelessWidget {
+  const _CustomModelActionCard({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    final l10n = AppLocalizations.of(context)!;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 4),
+      child: Material(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.18),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: BorderSide(
+            color: colorScheme.outlineVariant.withValues(alpha: 0.22),
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: <Widget>[
+                Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: colorScheme.primary.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(7),
+                  ),
+                  child: Center(
+                    child: _LucideIcon(
+                      _kSvgCpu,
+                      size: 16,
+                      color: colorScheme.primary,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        l10n.settingsModelCustomModel,
+                        style: textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        l10n.settingsModelModelId,
+                        style: textTheme.bodySmall?.copyWith(
+                          color: colorScheme.onSurfaceVariant,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                _LucideIcon(
+                  _kSvgChevronRight,
+                  size: 16,
+                  color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -2954,108 +3742,6 @@ class _TextInputDialogState extends State<_TextInputDialog> {
   }
 }
 
-class _ProviderSectionCard extends StatelessWidget {
-  const _ProviderSectionCard({
-    required this.onCreateProvider,
-    required this.children,
-  });
-
-  final VoidCallback onCreateProvider;
-  final List<Widget> children;
-
-  @override
-  Widget build(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
-    final colorScheme = Theme.of(context).colorScheme;
-    final radius = BorderRadius.circular(12);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Material(
-        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.36),
-        shape: RoundedRectangleBorder(
-          borderRadius: radius,
-          side: BorderSide(
-            color: colorScheme.outlineVariant.withValues(alpha: 0.18),
-          ),
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: OperitGlassSurface(
-          color: Colors.transparent,
-          borderRadius: radius,
-          material: true,
-          clip: false,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: _CreateProviderPill(
-                    label: l10n.settingsModelProvidersSection,
-                    onTap: onCreateProvider,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ...children,
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _CreateProviderPill extends StatelessWidget {
-  const _CreateProviderPill({required this.label, required this.onTap});
-
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final borderColor = colorScheme.outlineVariant.withValues(alpha: 0.6);
-    return InkWell(
-      onTap: onTap,
-      customBorder: const StadiumBorder(),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 7, 8, 7),
-        decoration: ShapeDecoration(
-          color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
-          shape: StadiumBorder(side: BorderSide(color: borderColor)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Text(
-              label,
-              style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Container(
-              width: 24,
-              height: 24,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(color: borderColor),
-              ),
-              child: Icon(
-                Icons.add,
-                size: 15,
-                color: colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _ProviderCardList extends StatelessWidget {
   const _ProviderCardList({
     required this.providers,
@@ -3119,7 +3805,7 @@ class _ProviderCard extends StatelessWidget {
     final multimodal = _isMultimodalCapabilities(
       displayedSummary?.capabilities,
     );
-    final radius = BorderRadius.circular(16);
+    final radius = BorderRadius.circular(12);
     return Material(
       color: chatProvider
           ? colorScheme.primaryContainer.withValues(alpha: 0.16)
@@ -3129,50 +3815,37 @@ class _ProviderCard extends StatelessWidget {
         side: BorderSide(
           color: chatProvider
               ? colorScheme.primary.withValues(alpha: 0.45)
-              : colorScheme.outlineVariant.withValues(alpha: 0.38),
+              : colorScheme.outlineVariant.withValues(alpha: 0.28),
         ),
       ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
+        borderRadius: radius,
         onTap: onOpen,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           child: Row(
             children: <Widget>[
               ProviderLogo(
                 providerTypeId: provider.providerTypeId,
                 fallbackName: provider.name,
+                size: 30,
               ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: <Widget>[
-                    Row(
-                      children: <Widget>[
-                        Flexible(
-                          child: Text(
-                            provider.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall
-                                ?.copyWith(fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                        if (chatProvider) ...<Widget>[
-                          const SizedBox(width: 7),
-                          Container(
-                            width: 8,
-                            height: 8,
-                            decoration: BoxDecoration(
-                              color: Colors.green.shade400,
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                        ],
-                      ],
+                    Text(
+                      provider.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 2),
                     Row(
                       children: <Widget>[
                         Flexible(
@@ -3200,11 +3873,14 @@ class _ProviderCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 8),
-              Icon(
-                Icons.arrow_forward,
-                size: 18,
-                color: colorScheme.onSurfaceVariant,
-              ),
+              if (chatProvider)
+                const SettingsActivePill(label: '当前主模型')
+              else
+                Icon(
+                  Icons.chevron_right,
+                  size: 20,
+                  color: colorScheme.onSurfaceVariant,
+                ),
             ],
           ),
         ),
@@ -3238,6 +3914,123 @@ class _ProviderInfoBadge extends StatelessWidget {
   }
 }
 
+class _ProviderHeaderCapsule extends StatelessWidget {
+  const _ProviderHeaderCapsule({
+    required this.provider,
+    required this.modelCountLabel,
+  });
+
+  final core_proxy.ProviderProfile provider;
+  final String modelCountLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final label = '${provider.name} · $modelCountLabel';
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(4, 4, 11, 4),
+      decoration: ShapeDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        shape: StadiumBorder(
+          side: BorderSide(
+            color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+          ),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          ProviderLogo(
+            providerTypeId: provider.providerTypeId,
+            fallbackName: provider.name,
+            size: 22,
+            contentScale: 0.66,
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: colorScheme.onSurface,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CapsuleActionButton extends StatelessWidget {
+  const _CapsuleActionButton({
+    required this.label,
+    required this.onTap,
+    this.tooltip,
+    this.primary = false,
+  });
+
+  final String label;
+  final VoidCallback? onTap;
+  final String? tooltip;
+  final bool primary;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isEnabled = onTap != null;
+    final backgroundColor = primary
+        ? (isEnabled
+              ? colorScheme.primaryContainer.withValues(alpha: 0.7)
+              : colorScheme.surfaceContainerHighest.withValues(alpha: 0.2))
+        : (isEnabled
+              ? colorScheme.surfaceContainerHighest.withValues(alpha: 0.45)
+              : colorScheme.surfaceContainerHighest.withValues(alpha: 0.2));
+    final foregroundColor = primary
+        ? (isEnabled
+              ? colorScheme.onPrimaryContainer
+              : colorScheme.onSurface.withValues(alpha: 0.38))
+        : (isEnabled
+              ? colorScheme.onSurface
+              : colorScheme.onSurface.withValues(alpha: 0.38));
+    final borderColor = primary
+        ? (isEnabled
+              ? colorScheme.primary.withValues(alpha: 0.25)
+              : colorScheme.outlineVariant.withValues(alpha: 0.15))
+        : (isEnabled
+              ? colorScheme.outlineVariant.withValues(alpha: 0.35)
+              : colorScheme.outlineVariant.withValues(alpha: 0.15));
+
+    Widget button = Material(
+      color: backgroundColor,
+      shape: StadiumBorder(side: BorderSide(color: borderColor)),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const StadiumBorder(),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          child: Text(
+            label,
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: foregroundColor,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    if (tooltip != null) {
+      button = Tooltip(message: tooltip!, child: button);
+    }
+    return button;
+  }
+}
+
 class _ProviderDetailScreen extends StatefulWidget {
   const _ProviderDetailScreen({
     required this.providerId,
@@ -3246,7 +4039,10 @@ class _ProviderDetailScreen extends StatefulWidget {
     required this.onSelectModel,
     required this.onAddModel,
     required this.onEditProvider,
-    required this.onEditModelSettings,
+    required this.onDeleteProvider,
+    required this.clients,
+    required this.onDeleteModel,
+    required this.onTestModelConnection,
   });
 
   final String providerId;
@@ -3256,11 +4052,20 @@ class _ProviderDetailScreen extends StatefulWidget {
   final Future<void> Function(core_proxy.ProviderProfile provider) onAddModel;
   final Future<void> Function(core_proxy.ProviderProfile provider)
   onEditProvider;
+  final Future<void> Function(core_proxy.ProviderProfile provider)
+  onDeleteProvider;
+  final GeneratedCoreProxyClients clients;
   final Future<void> Function(
     core_proxy.ProviderProfile provider,
     core_proxy.ModelProfile model,
   )
-  onEditModelSettings;
+  onDeleteModel;
+  final Future<core_proxy.ModelConnectionTestReport?> Function(
+    core_proxy.ProviderProfile provider,
+    core_proxy.ModelProfile model,
+    core_proxy.ModelCapabilities capabilities,
+  )
+  onTestModelConnection;
 
   static Future<void> open({
     required BuildContext context,
@@ -3273,11 +4078,20 @@ class _ProviderDetailScreen extends StatefulWidget {
     onAddModel,
     required Future<void> Function(core_proxy.ProviderProfile provider)
     onEditProvider,
+    required Future<void> Function(core_proxy.ProviderProfile provider)
+    onDeleteProvider,
+    required GeneratedCoreProxyClients clients,
     required Future<void> Function(
       core_proxy.ProviderProfile provider,
       core_proxy.ModelProfile model,
     )
-    onEditModelSettings,
+    onDeleteModel,
+    required Future<core_proxy.ModelConnectionTestReport?> Function(
+      core_proxy.ProviderProfile provider,
+      core_proxy.ModelProfile model,
+      core_proxy.ModelCapabilities capabilities,
+    )
+    onTestModelConnection,
   }) {
     return showDialog<void>(
       context: context,
@@ -3288,7 +4102,10 @@ class _ProviderDetailScreen extends StatefulWidget {
         onSelectModel: onSelectModel,
         onAddModel: onAddModel,
         onEditProvider: onEditProvider,
-        onEditModelSettings: onEditModelSettings,
+        onDeleteProvider: onDeleteProvider,
+        clients: clients,
+        onDeleteModel: onDeleteModel,
+        onTestModelConnection: onTestModelConnection,
       ),
     );
   }
@@ -3299,6 +4116,13 @@ class _ProviderDetailScreen extends StatefulWidget {
 
 class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
   late ModelSettingsData _data = widget.initialData;
+  String? _expandedModelId;
+
+  void _toggleModelSettings(String modelId) {
+    setState(() {
+      _expandedModelId = _expandedModelId == modelId ? null : modelId;
+    });
+  }
 
   core_proxy.ProviderProfile? get _provider {
     for (final provider in _data.providers) {
@@ -3335,6 +4159,59 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
     }
   }
 
+  Future<core_proxy.ModelConnectionTestReport?> _testModelConnection(
+    core_proxy.ProviderProfile provider,
+    core_proxy.ModelProfile model,
+    core_proxy.ModelCapabilities capabilities,
+  ) async {
+    if (!mounted) {
+      return null;
+    }
+    final l10n = AppLocalizations.of(context)!;
+    try {
+      await widget.clients.preferencesModelConfigManager
+          .updateCapabilitiesForModel(
+            providerId: provider.id,
+            modelId: model.id,
+            capabilities: capabilities,
+          );
+      final report = await widget.clients.application.testModelConnection(
+        providerId: provider.id,
+        modelId: model.id,
+      );
+      if (!mounted) {
+        return report;
+      }
+      final chatPassed = connectionTestSucceeded(
+        report,
+        core_proxy.ModelConnectionTestType.chat,
+      );
+      if (chatPassed) {
+        await widget.clients.preferencesModelConfigManager
+            .updateCapabilitiesForModel(
+              providerId: provider.id,
+              modelId: model.id,
+              capabilities: capabilitiesFromConnectionTest(
+                report,
+                capabilities,
+              ),
+            );
+        if (mounted) {
+          await _refresh();
+        }
+      }
+      return report;
+    } catch (error) {
+      if (mounted) {
+        await _ConnectionTestErrorDialog.show(
+          context: context,
+          message: l10n.settingsModelConnectionTestError('$error'),
+        );
+      }
+      return null;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
@@ -3360,40 +4237,60 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
         child: Column(
           children: <Widget>[
             Padding(
-              padding: const EdgeInsets.fromLTRB(18, 10, 8, 10),
+              padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
               child: Row(
                 children: <Widget>[
-                  ProviderLogo(
-                    providerTypeId: provider.providerTypeId,
-                    fallbackName: provider.name,
-                    size: 30,
-                    contentScale: 0.66,
-                  ),
-                  const SizedBox(width: 10),
                   Expanded(
-                    child: Text(
-                      provider.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.titleMedium,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: _ProviderHeaderCapsule(
+                        provider: provider,
+                        modelCountLabel: l10n.settingsModelProviderModelCount(
+                          provider.models.length,
+                        ),
+                      ),
                     ),
                   ),
-                  IconButton(
+                  const SizedBox(width: 8),
+                  _CapsuleActionButton(
+                    label: l10n.settingsModelAddModel,
                     tooltip: l10n.settingsModelAddModel,
-                    icon: const Icon(Icons.playlist_add_outlined),
-                    onPressed: () => _run(() => widget.onAddModel(provider)),
+                    primary: true,
+                    onTap: () => _run(() => widget.onAddModel(provider)),
                   ),
-                  IconButton(
-                    tooltip: l10n.edit,
-                    icon: const Icon(Icons.edit_outlined),
-                    onPressed: () =>
-                        _run(() => widget.onEditProvider(provider)),
+                  const SizedBox(width: 8),
+                  _CapsuleActionButton(
+                    label: l10n.edit,
+                    tooltip: l10n.settingsModelEditProvider,
+                    onTap: () => _run(() => widget.onEditProvider(provider)),
                   ),
+                  const SizedBox(width: 8),
+                  _CapsuleActionButton(
+                    label: l10n.delete,
+                    tooltip: l10n.settingsModelDeleteProviderConfirmAction,
+                    onTap: () => _run(() => widget.onDeleteProvider(provider)),
+                  ),
+                  const SizedBox(width: 4),
                   IconButton(
                     tooltip: MaterialLocalizations.of(
                       context,
                     ).closeButtonTooltip,
-                    icon: const Icon(Icons.close_outlined),
+                    style: IconButton.styleFrom(
+                      hoverColor: colorScheme.surfaceContainerHighest
+                          .withValues(
+                            alpha:
+                                Theme.of(context).brightness == Brightness.dark
+                                ? 0.35
+                                : 0.5,
+                          ),
+                      shape: const CircleBorder(),
+                    ),
+                    icon: _LucideIcon(
+                      _kSvgClose,
+                      size: 16,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                    visualDensity: VisualDensity.compact,
                     onPressed: () => Navigator.of(context).pop(),
                   ),
                 ],
@@ -3404,14 +4301,6 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
                 children: <Widget>[
-                  Text(
-                    '${_providerTypeDisplayName(l10n, provider.providerTypeId)}'
-                    ' · ${l10n.settingsModelProviderModelCount(provider.models.length)}',
-                    style: Theme.of(context).textTheme.bodySmall!.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
                   if (provider.models.isEmpty)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 28),
@@ -3442,13 +4331,17 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
                       onSelectModel: (providerId, modelId) =>
                           _run(() => widget.onSelectModel(providerId, modelId)),
                       testingModelKey: null,
-                      onEditModelSettings: (currentProvider, currentModel) =>
-                          _run(
-                            () => widget.onEditModelSettings(
-                              currentProvider,
-                              currentModel,
-                            ),
-                          ),
+                      expandedModelId: _expandedModelId,
+                      onToggleSettings: _toggleModelSettings,
+                      clients: widget.clients,
+                      onDeleteModel: (p, m) async {
+                        setState(() {
+                          _expandedModelId = null;
+                        });
+                        await _run(() => widget.onDeleteModel(p, m));
+                      },
+                      onTestModelConnection: _testModelConnection,
+                      onModelSettingsSaved: _refresh,
                     ),
                 ],
               ),
@@ -3487,18 +4380,18 @@ String? _formatContextLength(double? maxContextLength) {
   if (maxContextLength == null || maxContextLength <= 0) {
     return null;
   }
-  if (maxContextLength >= 1000) {
-    return '${(maxContextLength / 1000).round()}K';
+  final k = maxContextLength >= 10000
+      ? maxContextLength / 1000.0
+      : maxContextLength;
+  if (k >= 950) {
+    final millions = k / 1000.0;
+    final millionsRounded = millions.round();
+    if ((millions - millionsRounded).abs() < 0.08) {
+      return '${millionsRounded}M';
+    }
+    return '${millions.toStringAsFixed(1)}M';
   }
-  return '${maxContextLength.round()}';
-}
-
-String _providerTypeDisplayName(AppLocalizations l10n, String providerTypeId) {
-  try {
-    return _providerTypeLocalName(l10n, providerTypeId);
-  } on UnsupportedError {
-    return providerTypeId;
-  }
+  return '${k.round()}K';
 }
 
 class _ProviderModelList extends StatelessWidget {
@@ -3508,7 +4401,12 @@ class _ProviderModelList extends StatelessWidget {
     required this.chatBinding,
     required this.onSelectModel,
     required this.testingModelKey,
-    required this.onEditModelSettings,
+    required this.expandedModelId,
+    required this.onToggleSettings,
+    required this.clients,
+    required this.onDeleteModel,
+    required this.onTestModelConnection,
+    required this.onModelSettingsSaved,
   });
 
   final core_proxy.ProviderProfile provider;
@@ -3516,19 +4414,30 @@ class _ProviderModelList extends StatelessWidget {
   final core_proxy.FunctionModelBinding chatBinding;
   final void Function(String providerId, String modelId) onSelectModel;
   final String? testingModelKey;
-  final void Function(
+  final String? expandedModelId;
+  final void Function(String modelId) onToggleSettings;
+  final GeneratedCoreProxyClients clients;
+  final Future<void> Function(
     core_proxy.ProviderProfile provider,
     core_proxy.ModelProfile model,
   )
-  onEditModelSettings;
+  onDeleteModel;
+  final Future<core_proxy.ModelConnectionTestReport?> Function(
+    core_proxy.ProviderProfile provider,
+    core_proxy.ModelProfile model,
+    core_proxy.ModelCapabilities capabilities,
+  )
+  onTestModelConnection;
+  final VoidCallback onModelSettingsSaved;
 
   @override
   Widget build(BuildContext context) {
-    final tiles = <Widget>[
+    final items = <Widget>[
       for (final model in provider.models)
         if (_summaryForModelOrNull(summaries, provider.id, model.id)
             case final summary?)
-          _ProviderModelTile(
+          _ProviderModelItem(
+            key: ValueKey('${provider.id}_${model.id}'),
             provider: provider,
             model: model,
             summary: summary,
@@ -3537,20 +4446,145 @@ class _ProviderModelList extends StatelessWidget {
                 model.id == chatBinding.modelId,
             onSelect: onSelectModel,
             testing: testingModelKey == _modelTestKey(provider.id, model.id),
-            onEditSettings: () => onEditModelSettings(provider, model),
+            isExpanded: expandedModelId == model.id,
+            onToggleSettings: () => onToggleSettings(model.id),
+            clients: clients,
+            onDeleteModel: onDeleteModel,
+            onTestModelConnection: onTestModelConnection,
+            onModelSettingsSaved: onModelSettingsSaved,
           ),
     ];
-    if (tiles.isEmpty) {
+    if (items.isEmpty) {
       return const SizedBox.shrink();
     }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        for (var index = 0; index < tiles.length; index++) ...<Widget>[
-          if (index > 0) const SizedBox(height: 4),
-          tiles[index],
+        for (var index = 0; index < items.length; index++) ...<Widget>[
+          if (index > 0) const SizedBox(height: 8),
+          items[index],
         ],
       ],
+    );
+  }
+}
+
+class _ProviderModelItem extends StatelessWidget {
+  const _ProviderModelItem({
+    super.key,
+    required this.provider,
+    required this.model,
+    required this.summary,
+    required this.selected,
+    required this.onSelect,
+    required this.testing,
+    required this.isExpanded,
+    required this.onToggleSettings,
+    required this.clients,
+    required this.onDeleteModel,
+    required this.onTestModelConnection,
+    required this.onModelSettingsSaved,
+  });
+
+  final core_proxy.ProviderProfile provider;
+  final core_proxy.ModelProfile model;
+  final core_proxy.ProviderModelSummary summary;
+  final bool selected;
+  final void Function(String providerId, String modelId) onSelect;
+  final bool testing;
+  final bool isExpanded;
+  final VoidCallback onToggleSettings;
+  final GeneratedCoreProxyClients clients;
+  final Future<void> Function(
+    core_proxy.ProviderProfile provider,
+    core_proxy.ModelProfile model,
+  )
+  onDeleteModel;
+  final Future<core_proxy.ModelConnectionTestReport?> Function(
+    core_proxy.ProviderProfile provider,
+    core_proxy.ModelProfile model,
+    core_proxy.ModelCapabilities capabilities,
+  )
+  onTestModelConnection;
+  final VoidCallback onModelSettingsSaved;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final cardBgColor = selected
+        ? (isDark
+              ? Color.alphaBlend(
+                  colorScheme.primary.withValues(alpha: 0.10),
+                  colorScheme.surfaceContainerLow,
+                )
+              : Color.alphaBlend(
+                  colorScheme.primary.withValues(alpha: 0.06),
+                  colorScheme.surfaceContainerLow,
+                ))
+        : colorScheme.surfaceContainerLow;
+
+    final borderColor = selected
+        ? colorScheme.primary.withValues(alpha: isDark ? 0.58 : 0.48)
+        : colorScheme.outlineVariant.withValues(alpha: isDark ? 0.35 : 0.55);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOutCubic,
+      decoration: BoxDecoration(
+        color: cardBgColor,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      foregroundDecoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: borderColor, width: selected ? 1.0 : 0.8),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _ProviderModelTile(
+            provider: provider,
+            model: model,
+            summary: summary,
+            selected: selected,
+            onSelect: onSelect,
+            testing: testing,
+            isExpanded: isExpanded,
+            onToggleSettings: onToggleSettings,
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 240),
+            curve: Curves.easeInOutCubic,
+            alignment: Alignment.topCenter,
+            child: isExpanded
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Divider(
+                        height: 1,
+                        thickness: 0.8,
+                        color: colorScheme.outlineVariant.withValues(
+                          alpha: isDark ? 0.18 : 0.25,
+                        ),
+                      ),
+                      _ModelInlineSettingsView(
+                        provider: provider,
+                        model: model,
+                        clients: clients,
+                        onTest: (caps) =>
+                            onTestModelConnection(provider, model, caps),
+                        onDeleted: () => onDeleteModel(provider, model),
+                        onSaved: onModelSettingsSaved,
+                      ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -3563,7 +4597,8 @@ class _ProviderModelTile extends StatelessWidget {
     required this.selected,
     required this.onSelect,
     required this.testing,
-    required this.onEditSettings,
+    required this.isExpanded,
+    required this.onToggleSettings,
   });
 
   final core_proxy.ProviderProfile provider;
@@ -3572,36 +4607,29 @@ class _ProviderModelTile extends StatelessWidget {
   final bool selected;
   final void Function(String providerId, String modelId) onSelect;
   final bool testing;
-  final VoidCallback onEditSettings;
+  final bool isExpanded;
+  final VoidCallback onToggleSettings;
 
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    final colorScheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+    final contextLabel = _formatContextLength(
+      model.contextOverride?.maxContextLength,
+    );
+
     return Material(
       color: selected
-          ? colorScheme.primaryContainer.withValues(alpha: 0.24)
+          ? colorScheme.primary.withValues(alpha: isDark ? 0.08 : 0.05)
           : Colors.transparent,
-      borderRadius: BorderRadius.circular(8),
       child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        onTap: onEditSettings,
+        onTap: onToggleSettings,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
           child: Row(
             children: <Widget>[
-              SizedBox(
-                width: 16,
-                height: 16,
-                child: Icon(
-                  Icons.memory_outlined,
-                  size: 16,
-                  color: selected
-                      ? colorScheme.primary
-                      : colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3610,12 +4638,21 @@ class _ProviderModelTile extends StatelessWidget {
                       model.id,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      style: theme.textTheme.bodyMedium?.copyWith(
                         fontWeight: FontWeight.w600,
+                        color: colorScheme.onSurface,
                       ),
                     ),
-                    const SizedBox(height: 3),
-                    _ModelCapabilityIcons(capabilities: summary.capabilities),
+                    if (_hasModelCapabilities(
+                      summary.capabilities,
+                      contextLabel,
+                    )) ...<Widget>[
+                      const SizedBox(height: 4),
+                      _ModelCapabilityCapsules(
+                        capabilities: summary.capabilities,
+                        contextLengthLabel: contextLabel,
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -3628,13 +4665,32 @@ class _ProviderModelTile extends StatelessWidget {
                   onPressed: () => onSelect(provider.id, model.id),
                 ),
               const SizedBox(width: 6),
-              Tooltip(
-                message: '模型设置',
-                child: Icon(
-                  Icons.tune_outlined,
-                  size: 18,
-                  color: colorScheme.onSurfaceVariant,
+              IconButton(
+                tooltip: isExpanded ? l10n.commonCollapse : l10n.commonExpand,
+                style: IconButton.styleFrom(
+                  hoverColor: colorScheme.surfaceContainerHighest.withValues(
+                    alpha: isDark ? 0.35 : 0.5,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(6),
+                  ),
                 ),
+                icon: AnimatedRotation(
+                  turns: isExpanded ? 0.5 : 0.0,
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeInOut,
+                  child: _LucideIcon(
+                    _kSvgChevronDown,
+                    size: 16,
+                    color: isExpanded
+                        ? colorScheme.primary
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                onPressed: onToggleSettings,
               ),
               if (testing) ...<Widget>[
                 const SizedBox(width: 8),
@@ -3651,72 +4707,1117 @@ class _ProviderModelTile extends StatelessWidget {
   }
 }
 
-class _ModelCapabilityIcons extends StatelessWidget {
-  const _ModelCapabilityIcons({required this.capabilities});
+class _ModelInlineSettingsView extends StatefulWidget {
+  const _ModelInlineSettingsView({
+    required this.provider,
+    required this.model,
+    required this.clients,
+    required this.onTest,
+    required this.onDeleted,
+    required this.onSaved,
+  });
 
-  final core_proxy.ModelCapabilities capabilities;
+  final core_proxy.ProviderProfile provider;
+  final core_proxy.ModelProfile model;
+  final GeneratedCoreProxyClients clients;
+  final Future<core_proxy.ModelConnectionTestReport?> Function(
+    core_proxy.ModelCapabilities capabilities,
+  )
+  onTest;
+  final VoidCallback onDeleted;
+  final VoidCallback onSaved;
+
+  @override
+  State<_ModelInlineSettingsView> createState() =>
+      _ModelInlineSettingsViewState();
+}
+
+class _ModelInlineSettingsViewState extends State<_ModelInlineSettingsView> {
+  Future<core_proxy.ResolvedModelConfig>? _configFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _load() {
+    _configFuture = widget.clients.preferencesModelConfigManager
+        .getResolvedModelConfig(
+          providerId: widget.provider.id,
+          modelId: widget.model.id,
+        );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+    final l10n = AppLocalizations.of(context)!;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: BoxDecoration(
+        color: isDark
+            ? Colors.black.withValues(alpha: 0.15)
+            : colorScheme.surfaceContainerLow,
+      ),
+      child: FutureBuilder<core_proxy.ResolvedModelConfig>(
+        future: _configFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: M3LoadingIndicator(size: 20),
+              ),
+            );
+          }
+          if (snapshot.hasError) {
+            return Center(
+              child: Text(
+                '${l10n.failed}: ${snapshot.error}',
+                style: TextStyle(color: colorScheme.error),
+              ),
+            );
+          }
+          final config = snapshot.data!;
+          return _ModelInlineSettingsForm(
+            provider: widget.provider,
+            model: widget.model,
+            clients: widget.clients,
+            initialConfig: config,
+            onTest: widget.onTest,
+            onDeleted: widget.onDeleted,
+            onSaved: widget.onSaved,
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ModelInlineSettingsForm extends StatefulWidget {
+  const _ModelInlineSettingsForm({
+    required this.provider,
+    required this.model,
+    required this.clients,
+    required this.initialConfig,
+    required this.onTest,
+    required this.onDeleted,
+    required this.onSaved,
+  });
+
+  final core_proxy.ProviderProfile provider;
+  final core_proxy.ModelProfile model;
+  final GeneratedCoreProxyClients clients;
+  final core_proxy.ResolvedModelConfig initialConfig;
+  final Future<core_proxy.ModelConnectionTestReport?> Function(
+    core_proxy.ModelCapabilities capabilities,
+  )
+  onTest;
+  final VoidCallback onDeleted;
+  final VoidCallback onSaved;
+
+  @override
+  State<_ModelInlineSettingsForm> createState() =>
+      _ModelInlineSettingsFormState();
+}
+
+class _ModelInlineSettingsFormState extends State<_ModelInlineSettingsForm> {
+  late bool _toolCall;
+  late bool _directImage;
+  late bool _directAudio;
+  late bool _directVideo;
+  late bool _claude1hPromptCache;
+  late List<core_proxy.ModelBuiltinTool> _builtinTools;
+  late bool _enableSummary;
+  late final TextEditingController _maxContextLengthController;
+  late final TextEditingController _summaryThresholdController;
+  String? _maxContextLengthError;
+  bool _testingConnection = false;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final caps = widget.initialConfig.capabilities;
+    _toolCall = caps.toolCall;
+    _directImage = caps.directImage;
+    _directAudio = caps.directAudio;
+    _directVideo = caps.directVideo;
+    _claude1hPromptCache =
+        widget.initialConfig.request.enableClaude1HPromptCache;
+    _builtinTools = widget.initialConfig.builtinTools;
+    final summary = widget.initialConfig.summary;
+    _enableSummary = summary.enableSummary;
+    final rawContext = widget.initialConfig.context.maxContextLength;
+    final normalizedContext = rawContext >= 10000
+        ? (rawContext / 1024).roundToDouble()
+        : rawContext;
+    _maxContextLengthController = TextEditingController(
+      text: normalizedContext > 0
+          ? normalizedContext.toStringAsFixed(0)
+          : '200',
+    );
+    final rawThresh = summary.summaryTokenThreshold;
+    final threshPercent = rawThresh <= 0
+        ? '70'
+        : (rawThresh <= 1.0
+              ? (rawThresh * 100).round().toString()
+              : rawThresh.clamp(1, 100).round().toString());
+    _summaryThresholdController = TextEditingController(text: threshPercent);
+  }
+
+  @override
+  void dispose() {
+    _maxContextLengthController.dispose();
+    _summaryThresholdController.dispose();
+    super.dispose();
+  }
+
+  bool get _supportsClaudePromptCache => <String>{
+    'ANTHROPIC',
+    'ANTHROPIC_GENERIC',
+  }.contains(widget.provider.providerTypeId.trim().toUpperCase());
+
+  core_proxy.ModelCapabilities _currentCapabilities() {
+    return core_proxy.ModelCapabilities(
+      directImage: _directImage,
+      directAudio: _directAudio,
+      directVideo: _directVideo,
+      toolCall: _toolCall,
+    );
+  }
+
+  Future<void> _runConnectionTest() async {
+    setState(() => _testingConnection = true);
+    try {
+      final report = await widget.onTest(_currentCapabilities());
+      if (!mounted || report == null) {
+        return;
+      }
+      await _ConnectionTestReportDialog.show(context: context, report: report);
+    } finally {
+      if (mounted) {
+        setState(() => _testingConnection = false);
+      }
+    }
+  }
+
+  void _setBuiltinToolEnabled(int index, bool enabled) {
+    setState(() {
+      final item = _builtinTools[index];
+      _builtinTools = [
+        for (var i = 0; i < _builtinTools.length; i++)
+          if (i == index)
+            core_proxy.ModelBuiltinTool(
+              toolType: item.toolType,
+              displayName: item.displayName,
+              enabled: enabled,
+              requestFormat: item.requestFormat,
+              exclusivity: item.exclusivity,
+              config: item.config,
+            )
+          else
+            _builtinTools[i],
+      ];
+    });
+  }
+
+  Future<void> _save() async {
+    final maxContextLength = double.tryParse(
+      _maxContextLengthController.text.trim(),
+    );
+    if (maxContextLength == null || maxContextLength <= 0) {
+      setState(() {
+        _maxContextLengthError = AppLocalizations.of(
+          context,
+        )!.settingsModelMaxContextLengthInvalid;
+      });
+      return;
+    }
+    setState(() => _saving = true);
+    try {
+      if (_supportsClaudePromptCache &&
+          _claude1hPromptCache !=
+              widget.initialConfig.request.enableClaude1HPromptCache) {
+        await widget.clients.preferencesModelConfigManager
+            .updateRequestForModel(
+              providerId: widget.provider.id,
+              modelId: widget.model.id,
+              request: core_proxy.ModelRequestSpec(
+                supportsStructuredTools:
+                    widget.initialConfig.request.supportsStructuredTools,
+                enableClaude1HPromptCache: _claude1hPromptCache,
+              ),
+            );
+      }
+      final newCaps = _currentCapabilities();
+      await widget.clients.preferencesModelConfigManager
+          .updateCapabilitiesForModel(
+            providerId: widget.provider.id,
+            modelId: widget.model.id,
+            capabilities: newCaps,
+          );
+      await widget.clients.preferencesModelConfigManager.updateContextForModel(
+        providerId: widget.provider.id,
+        modelId: widget.model.id,
+        context: core_proxy.ModelContextSpec(
+          maxContextLength: maxContextLength,
+        ),
+      );
+      await widget.clients.preferencesModelConfigManager.updateSummaryForModel(
+        providerId: widget.provider.id,
+        modelId: widget.model.id,
+        summary: () {
+          final rawThresh =
+              double.tryParse(_summaryThresholdController.text.trim()) ?? 70.0;
+          final ratioThreshold = rawThresh > 1.0
+              ? (rawThresh / 100.0).clamp(0.01, 1.0)
+              : rawThresh.clamp(0.01, 1.0);
+          return core_proxy.ModelSummarySettings(
+            enableSummary: _enableSummary,
+            summaryTokenThreshold: ratioThreshold,
+            enableSummaryByMessageCount: false,
+            summaryMessageCountThreshold: 0,
+          );
+        }(),
+      );
+      await widget.clients.preferencesModelConfigManager
+          .updateBuiltinToolsForModel(
+            providerId: widget.provider.id,
+            modelId: widget.model.id,
+            builtinTools: _builtinTools,
+          );
+      widget.onSaved();
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    final color = Theme.of(context).colorScheme.onSurfaceVariant;
-    final icons = <Widget>[
-      if (capabilities.toolCall)
-        _CapabilityIcon(
-          icon: Icons.build_outlined,
-          tooltip: l10n.settingsModelToolCall,
-          color: color,
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+    final isZh =
+        Localizations.localeOf(context).languageCode.toLowerCase() == 'zh';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        // Top Header Row with Test Model Button
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            children: <Widget>[
+              Text(
+                isZh ? '模型配置' : 'Model Configuration',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: colorScheme.onSurface,
+                  fontSize: 13,
+                ),
+              ),
+              const Spacer(),
+              _TestModelPillButton(
+                testing: _testingConnection,
+                onPressed: _testingConnection ? null : _runConnectionTest,
+                label: l10n.settingsModelTestModel,
+              ),
+            ],
+          ),
         ),
-      if (capabilities.directImage)
-        _CapabilityIcon(
-          icon: Icons.image_outlined,
-          tooltip: l10n.settingsModelDirectImage,
-          color: color,
+
+        // Group 1: 核心能力 (Checkable Chips in Wrap)
+        _SettingsGroupCard(
+          title: l10n.settingsModelCapabilities,
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: <Widget>[
+                  _CheckableCapabilityChip(
+                    title: l10n.settingsModelToolCall,
+                    tooltip: l10n.settingsModelToolCallDescription,
+                    checked: _toolCall,
+                    icon: Icons.build_outlined,
+                    iconTint: _CapsuleTint.primary,
+                    onChanged: (v) => setState(() => _toolCall = v),
+                  ),
+                  _CheckableCapabilityChip(
+                    title: l10n.settingsModelDirectImage,
+                    tooltip: l10n.settingsModelDirectImageDescription,
+                    checked: _directImage,
+                    icon: Icons.image_outlined,
+                    iconTint: _CapsuleTint.primary,
+                    onChanged: (v) => setState(() => _directImage = v),
+                  ),
+                  _CheckableCapabilityChip(
+                    title: l10n.settingsModelDirectAudio,
+                    tooltip: l10n.settingsModelDirectAudioDescription,
+                    checked: _directAudio,
+                    icon: Icons.graphic_eq,
+                    iconTint: _CapsuleTint.primary,
+                    onChanged: (v) => setState(() => _directAudio = v),
+                  ),
+                  _CheckableCapabilityChip(
+                    title: l10n.settingsModelDirectVideo,
+                    tooltip: l10n.settingsModelDirectVideoDescription,
+                    checked: _directVideo,
+                    icon: Icons.videocam_outlined,
+                    iconTint: _CapsuleTint.primary,
+                    onChanged: (v) => setState(() => _directVideo = v),
+                  ),
+                  if (_supportsClaudePromptCache)
+                    _CheckableCapabilityChip(
+                      title: isZh ? 'Claude 1小时缓存' : 'Claude 1h cache',
+                      tooltip: isZh
+                          ? '为显式缓存断点设置 1h TTL；关闭时使用默认 TTL。'
+                          : 'Set a 1h TTL on explicit cache breakpoints; otherwise use the default TTL.',
+                      checked: _claude1hPromptCache,
+                      icon: Icons.cached_outlined,
+                      iconTint: _CapsuleTint.neutral,
+                      onChanged: (value) =>
+                          setState(() => _claude1hPromptCache = value),
+                    ),
+                ],
+              ),
+            ),
+            if (_builtinTools.isNotEmpty) ...<Widget>[
+              const _GroupDivider(),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: <Widget>[
+                    for (var index = 0; index < _builtinTools.length; index++)
+                      _CheckableCapabilityChip(
+                        title: _builtinTools[index].displayName,
+                        tooltip: _builtinToolSubtitle(
+                          l10n,
+                          _builtinTools[index],
+                        ),
+                        checked: _builtinTools[index].enabled,
+                        icon: Icons.extension_outlined,
+                        iconTint: _CapsuleTint.neutral,
+                        onChanged: (value) =>
+                            _setBuiltinToolEnabled(index, value),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ],
         ),
-      if (capabilities.directAudio)
-        _CapabilityIcon(
-          icon: Icons.graphic_eq,
-          tooltip: l10n.settingsModelDirectAudio,
-          color: color,
+
+        const SizedBox(height: 8),
+
+        // Group 2: 上下文与总结 (Single Symmetrical Row)
+        _SettingsGroupCard(
+          title: isZh ? '上下文与总结' : 'Context & Summary',
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Row(
+                children: <Widget>[
+                  // Item 1: 上下文
+                  Expanded(
+                    child: Row(
+                      children: <Widget>[
+                        Text(
+                          isZh ? '上下文:' : 'Context:',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            fontWeight: FontWeight.w600,
+                            color: colorScheme.onSurface,
+                            fontSize: 12,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: _ModernNumberField(
+                            controller: _maxContextLengthController,
+                            suffix: 'K',
+                            hintText: '200',
+                            errorText: _maxContextLengthError,
+                            onChanged: (_) {
+                              if (_maxContextLengthError != null) {
+                                setState(() => _maxContextLengthError = null);
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  // Item 2: 总结阈值
+                  Expanded(
+                    child: Tooltip(
+                      message: isZh
+                          ? '当上下文占用达到设定百分比时触发总结（0% 为关闭，默认 70%）'
+                          : 'Trigger summary when context exceeds ratio (0% to disable, default 70%)',
+                      child: Row(
+                        children: <Widget>[
+                          Text(
+                            isZh ? '总结阈值:' : 'Summary:',
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              fontWeight: FontWeight.w600,
+                              color: colorScheme.onSurface,
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: _ModernNumberField(
+                              controller: _summaryThresholdController,
+                              suffix: '%',
+                              hintText: '70',
+                              onChanged: (val) {
+                                final numVal = double.tryParse(val.trim()) ?? 0;
+                                setState(() {
+                                  _enableSummary = numVal > 0;
+                                });
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
-      if (capabilities.directVideo)
-        _CapabilityIcon(
-          icon: Icons.videocam_outlined,
-          tooltip: l10n.settingsModelDirectVideo,
-          color: color,
+
+        // Bottom Action Bar
+        Padding(
+          padding: const EdgeInsets.only(top: 10, bottom: 2),
+          child: Row(
+            children: <Widget>[
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: colorScheme.error,
+                  side: BorderSide(
+                    color: colorScheme.error.withValues(
+                      alpha: isDark ? 0.35 : 0.5,
+                    ),
+                    width: 0.8,
+                  ),
+                  shape: const StadiumBorder(),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  visualDensity: VisualDensity.compact,
+                ),
+                onPressed: widget.onDeleted,
+                icon: const Icon(Icons.delete_outline_rounded, size: 15),
+                label: Text(
+                  l10n.delete,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 11.5,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  shape: const StadiumBorder(),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 6,
+                  ),
+                  visualDensity: VisualDensity.compact,
+                ),
+                onPressed: _saving ? null : _save,
+                icon: _saving
+                    ? const SizedBox.square(
+                        dimension: 13,
+                        child: Center(child: M3LoadingIndicator(size: 13)),
+                      )
+                    : _LucideIcon(
+                        _kSvgCheck,
+                        size: 14,
+                        color: colorScheme.onPrimary,
+                      ),
+                label: Text(
+                  l10n.save,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12.5,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
-    ];
-    if (icons.isEmpty) {
-      return const SizedBox.shrink();
-    }
-    return Padding(
-      padding: const EdgeInsets.only(top: 2),
-      child: Wrap(spacing: 6, runSpacing: 3, children: icons),
+      ],
     );
   }
 }
 
-class _CapabilityIcon extends StatelessWidget {
-  const _CapabilityIcon({
-    required this.icon,
-    required this.tooltip,
-    required this.color,
-  });
+class _SettingsGroupCard extends StatelessWidget {
+  const _SettingsGroupCard({required this.title, required this.children});
 
-  final IconData icon;
-  final String tooltip;
-  final Color color;
+  final String title;
+  final List<Widget> children;
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Icon(icon, size: 14, color: color),
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 4),
+          child: Row(
+            children: <Widget>[
+              Text(
+                title,
+                style: theme.textTheme.labelMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: isDark
+                      ? colorScheme.onSurface.withValues(alpha: 0.8)
+                      : colorScheme.onSurfaceVariant,
+                  fontSize: 11.5,
+                  letterSpacing: 0.2,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          decoration: BoxDecoration(
+            color: colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(
+              color: colorScheme.outlineVariant.withValues(
+                alpha: isDark ? 0.45 : 0.70,
+              ),
+              width: 1.0,
+            ),
+            boxShadow: isDark
+                ? null
+                : <BoxShadow>[
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.03),
+                      blurRadius: 3,
+                      offset: const Offset(0, 1),
+                    ),
+                  ],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: children,
+          ),
+        ),
+      ],
     );
   }
 }
 
-class _FunctionMappingGroups extends StatelessWidget {
+class _CheckableCapabilityChip extends StatelessWidget {
+  const _CheckableCapabilityChip({
+    required this.title,
+    required this.tooltip,
+    required this.checked,
+    required this.onChanged,
+    required this.icon,
+    required this.iconTint,
+  });
+
+  final String title;
+  final String tooltip;
+  final bool checked;
+  final ValueChanged<bool> onChanged;
+  final IconData icon;
+  final _CapsuleTint iconTint;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    final (
+      Color activeBg,
+      Color activeText,
+      Color activeBorder,
+    ) = switch (iconTint) {
+      _CapsuleTint.primary => (
+        Color.alphaBlend(
+          colorScheme.primary.withValues(alpha: isDark ? 0.10 : 0.04),
+          colorScheme.surface,
+        ),
+        colorScheme.onSurface,
+        colorScheme.primary.withValues(alpha: isDark ? 0.34 : 0.24),
+      ),
+      _CapsuleTint.neutral => (
+        isDark
+            ? colorScheme.surfaceContainerHigh.withValues(alpha: 0.7)
+            : colorScheme.surfaceContainerHighest,
+        colorScheme.onSurface,
+        colorScheme.outlineVariant.withValues(alpha: isDark ? 0.6 : 0.8),
+      ),
+    };
+
+    final bgColor = checked
+        ? activeBg
+        : (isDark
+              ? colorScheme.surfaceContainer.withValues(alpha: 0.25)
+              : colorScheme.surfaceContainerLow);
+
+    final borderColor = checked
+        ? activeBorder
+        : colorScheme.outlineVariant.withValues(alpha: isDark ? 0.35 : 0.5);
+
+    final textColor = checked ? activeText : colorScheme.onSurfaceVariant;
+
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: bgColor,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: BorderSide(color: borderColor, width: checked ? 0.9 : 0.6),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => onChanged(!checked),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4.5),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                _CustomCheckbox(
+                  checked: checked,
+                  activeColor: colorScheme.primary.withValues(
+                    alpha: isDark ? 0.78 : 0.68,
+                  ),
+                  onTap: () => onChanged(!checked),
+                ),
+                const SizedBox(width: 5),
+                _TileIconBox(
+                  icon: icon,
+                  tint: checked ? iconTint : _CapsuleTint.neutral,
+                  size: 18,
+                  iconSize: 10.5,
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  title,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: checked ? FontWeight.w600 : FontWeight.w500,
+                    color: textColor,
+                    fontSize: 11.0,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CustomCheckbox extends StatelessWidget {
+  const _CustomCheckbox({required this.checked, this.activeColor, this.onTap});
+
+  final bool checked;
+  final Color? activeColor;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final effectiveActiveColor = activeColor ?? colorScheme.primary;
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(3.5),
+      child: Container(
+        width: 13,
+        height: 13,
+        decoration: BoxDecoration(
+          color: checked ? effectiveActiveColor : Colors.transparent,
+          borderRadius: BorderRadius.circular(3.5),
+          border: Border.all(
+            color: checked
+                ? effectiveActiveColor
+                : colorScheme.outlineVariant.withValues(
+                    alpha: isDark ? 0.55 : 0.65,
+                  ),
+            width: 1.0,
+          ),
+        ),
+        child: checked
+            ? Center(
+                child: _LucideIcon(
+                  _kSvgCheck,
+                  size: 8.5,
+                  color: colorScheme.onPrimary,
+                ),
+              )
+            : null,
+      ),
+    );
+  }
+}
+
+class _TileIconBox extends StatelessWidget {
+  const _TileIconBox({
+    required this.icon,
+    required this.tint,
+    this.size = 28,
+    this.iconSize = 15,
+  });
+
+  final IconData icon;
+  final _CapsuleTint tint;
+  final double size;
+  final double iconSize;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    final (Color bgColor, Color iconColor) = switch (tint) {
+      _CapsuleTint.primary => (
+        Color.alphaBlend(
+          colorScheme.primary.withValues(alpha: isDark ? 0.10 : 0.04),
+          colorScheme.surface,
+        ),
+        colorScheme.primary.withValues(alpha: isDark ? 0.76 : 0.64),
+      ),
+      _CapsuleTint.neutral => (
+        colorScheme.surfaceContainerHigh.withValues(alpha: isDark ? 0.7 : 0.85),
+        colorScheme.onSurfaceVariant,
+      ),
+    };
+
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      alignment: Alignment.center,
+      child: Icon(icon, size: iconSize, color: iconColor),
+    );
+  }
+}
+
+class _ModernNumberField extends StatelessWidget {
+  const _ModernNumberField({
+    required this.controller,
+    required this.suffix,
+    this.hintText,
+    this.errorText,
+    this.onChanged,
+  });
+
+  final TextEditingController controller;
+  final String suffix;
+  final String? hintText;
+  final String? errorText;
+  final ValueChanged<String>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    return TextField(
+      controller: controller,
+      style: theme.textTheme.bodyMedium?.copyWith(
+        fontWeight: FontWeight.w600,
+        fontSize: 12.5,
+        color: colorScheme.onSurface,
+      ),
+      keyboardType: TextInputType.number,
+      onChanged: onChanged,
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: hintText,
+        errorText: errorText,
+        filled: true,
+        fillColor: isDark
+            ? colorScheme.surfaceContainer
+            : colorScheme.surfaceContainerLow,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        suffixText: suffix,
+        suffixStyle: theme.textTheme.labelSmall?.copyWith(
+          color: colorScheme.onSurfaceVariant,
+          fontWeight: FontWeight.w600,
+          fontSize: 10.5,
+        ),
+        disabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(
+            color: colorScheme.outlineVariant.withValues(
+              alpha: isDark ? 0.2 : 0.35,
+            ),
+            width: 0.8,
+          ),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(
+            color: colorScheme.outline.withValues(alpha: isDark ? 0.4 : 0.55),
+            width: 1.0,
+          ),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: colorScheme.primary, width: 1.3),
+        ),
+        errorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: colorScheme.error, width: 1.0),
+        ),
+        focusedErrorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide(color: colorScheme.error, width: 1.3),
+        ),
+      ),
+    );
+  }
+}
+
+class _GroupDivider extends StatelessWidget {
+  const _GroupDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Divider(
+      height: 1.0,
+      thickness: 1.0,
+      color: Theme.of(
+        context,
+      ).colorScheme.outlineVariant.withValues(alpha: isDark ? 0.35 : 0.55),
+    );
+  }
+}
+
+class _TestModelPillButton extends StatelessWidget {
+  const _TestModelPillButton({
+    required this.testing,
+    required this.onPressed,
+    required this.label,
+  });
+
+  final bool testing;
+  final VoidCallback? onPressed;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Material(
+      color: colorScheme.primary.withValues(alpha: isDark ? 0.12 : 0.06),
+      shape: StadiumBorder(
+        side: BorderSide(
+          color: colorScheme.primary.withValues(alpha: isDark ? 0.28 : 0.32),
+          width: 0.8,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onPressed,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              if (testing)
+                const SizedBox.square(
+                  dimension: 12,
+                  child: Center(child: M3LoadingIndicator(size: 12)),
+                )
+              else
+                Icon(
+                  Icons.speed_rounded,
+                  size: 13.5,
+                  color: colorScheme.primary,
+                ),
+              const SizedBox(width: 4.5),
+              Text(
+                label,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  fontWeight: FontWeight.w600,
+                  color: colorScheme.primary,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+bool _hasModelCapabilities(
+  core_proxy.ModelCapabilities? capabilities, [
+  String? contextLengthLabel,
+]) =>
+    contextLengthLabel != null ||
+    (capabilities != null &&
+        (capabilities.toolCall ||
+            capabilities.directImage ||
+            capabilities.directAudio ||
+            capabilities.directVideo));
+
+enum _CapsuleTint { neutral, primary }
+
+class _ModelCapabilityCapsules extends StatelessWidget {
+  const _ModelCapabilityCapsules({
+    required this.capabilities,
+    this.contextLengthLabel,
+  });
+
+  final core_proxy.ModelCapabilities capabilities;
+  final String? contextLengthLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final isZh =
+        Localizations.localeOf(context).languageCode.toLowerCase() == 'zh';
+
+    final capsules = <Widget>[
+      if (contextLengthLabel != null)
+        _CapabilityCapsule(
+          label: contextLengthLabel!,
+          tooltip: isZh
+              ? '上下文长度: $contextLengthLabel'
+              : 'Context length: $contextLengthLabel',
+          tint: _CapsuleTint.neutral,
+        ),
+      if (capabilities.toolCall)
+        _CapabilityCapsule(
+          label: isZh ? '工具调用' : 'Tools',
+          tooltip: l10n.settingsModelToolCall,
+          tint: _CapsuleTint.primary,
+        ),
+      if (capabilities.directImage)
+        _CapabilityCapsule(
+          label: isZh ? '图片' : 'Image',
+          tooltip: l10n.settingsModelDirectImage,
+          tint: _CapsuleTint.primary,
+        ),
+      if (capabilities.directAudio)
+        _CapabilityCapsule(
+          label: isZh ? '音频' : 'Audio',
+          tooltip: l10n.settingsModelDirectAudio,
+          tint: _CapsuleTint.primary,
+        ),
+      if (capabilities.directVideo)
+        _CapabilityCapsule(
+          label: isZh ? '视频' : 'Video',
+          tooltip: l10n.settingsModelDirectVideo,
+          tint: _CapsuleTint.primary,
+        ),
+    ];
+
+    if (capsules.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: Wrap(spacing: 5, runSpacing: 3, children: capsules),
+    );
+  }
+}
+
+class _CapabilityCapsule extends StatelessWidget {
+  const _CapabilityCapsule({
+    required this.label,
+    required this.tooltip,
+    this.tint = _CapsuleTint.neutral,
+  });
+
+  final String label;
+  final String tooltip;
+  final _CapsuleTint tint;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    final (Color bgColor, Color textColor, Color borderColor) = switch (tint) {
+      _CapsuleTint.primary => (
+        Color.alphaBlend(
+          colorScheme.primary.withValues(alpha: isDark ? 0.20 : 0.10),
+          colorScheme.surfaceContainerHigh,
+        ),
+        colorScheme.onSurfaceVariant,
+        colorScheme.primary.withValues(alpha: isDark ? 0.48 : 0.38),
+      ),
+      _CapsuleTint.neutral => (
+        isDark
+            ? colorScheme.surfaceContainerHigh
+            : colorScheme.surfaceContainerHighest,
+        colorScheme.onSurfaceVariant,
+        colorScheme.outlineVariant.withValues(alpha: isDark ? 0.6 : 0.8),
+      ),
+    };
+
+    return Tooltip(
+      message: tooltip,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+        decoration: ShapeDecoration(
+          color: bgColor,
+          shape: StadiumBorder(
+            side: BorderSide(color: borderColor, width: 0.6),
+          ),
+        ),
+        child: Text(
+          label,
+          style: theme.textTheme.labelSmall?.copyWith(
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+            color: textColor,
+            height: 1.2,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FunctionMappingGroups extends StatefulWidget {
   const _FunctionMappingGroups({
     required this.data,
     required this.onSelectFunction,
@@ -3727,22 +5828,31 @@ class _FunctionMappingGroups extends StatelessWidget {
   final Future<void> Function(
     core_proxy.FunctionType functionType,
     ModelSettingsData data,
-  ) onSelectFunction;
+  )
+  onSelectFunction;
   final Future<void> Function() onFollowAll;
 
-  static const List<core_proxy.FunctionType> _backgroundTypes =
+  @override
+  State<_FunctionMappingGroups> createState() => _FunctionMappingGroupsState();
+}
+
+class _FunctionMappingGroupsState extends State<_FunctionMappingGroups> {
+  bool _showAdvanced = false;
+
+  static const List<core_proxy.FunctionType> _coreTypes =
       <core_proxy.FunctionType>[
-        core_proxy.FunctionType.summary,
+        core_proxy.FunctionType.chat,
         core_proxy.FunctionType.titleGeneration,
+        core_proxy.FunctionType.summary,
         core_proxy.FunctionType.memory,
-        core_proxy.FunctionType.uiController,
-        core_proxy.FunctionType.translation,
-        core_proxy.FunctionType.grep,
         core_proxy.FunctionType.roleResponsePlanner,
       ];
 
-  static const List<core_proxy.FunctionType> _multimodalTypes =
+  static const List<core_proxy.FunctionType> _advancedTypes =
       <core_proxy.FunctionType>[
+        core_proxy.FunctionType.uiController,
+        core_proxy.FunctionType.translation,
+        core_proxy.FunctionType.grep,
         core_proxy.FunctionType.imageRecognition,
         core_proxy.FunctionType.audioRecognition,
         core_proxy.FunctionType.videoRecognition,
@@ -3752,89 +5862,139 @@ class _FunctionMappingGroups extends StatelessWidget {
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
     final colorScheme = Theme.of(context).colorScheme;
+    final followingCount = widget.data.functionBindings.entries
+        .where(
+          (entry) =>
+              entry.key != core_proxy.FunctionType.chat &&
+              entry.value.followsChat,
+        )
+        .length;
+    final totalNonChat = _coreTypes.length - 1 + _advancedTypes.length;
+    final customAdvancedCount = _advancedTypes
+        .where((t) => !(widget.data.functionBindings[t]?.followsChat ?? true))
+        .length;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Row(
-          children: <Widget>[
-            Expanded(
-              child: Text(
-                l10n.settingsModelFunctionMappingsDescription,
-                style: TextStyle(color: colorScheme.onSurfaceVariant),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Row(
+            children: <Widget>[
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: ShapeDecoration(
+                  color: colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.5,
+                  ),
+                  shape: const StadiumBorder(),
+                ),
+                child: Text(
+                  '$followingCount/$totalNonChat 跟随主模型',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: widget.onFollowAll,
+                style: SettingsControlStyles.sectionTextButton(),
+                icon: const Icon(Icons.link, size: 16),
+                label: Text(l10n.settingsModelFunctionFollowChatAll),
+              ),
+            ],
+          ),
+        ),
+        for (final functionType in _coreTypes)
+          _FunctionMappingRow(
+            functionType: functionType,
+            displayBinding: _resolveFunctionBinding(widget.data, functionType),
+            followsChat:
+                functionType != core_proxy.FunctionType.chat &&
+                (widget.data.functionBindings[functionType]?.followsChat ??
+                    false),
+            summary: widget.data.summaryForBinding(
+              _resolveFunctionBinding(widget.data, functionType),
+            ),
+            onSelect: () => widget.onSelectFunction(functionType, widget.data),
+          ),
+        const SizedBox(height: 4),
+        Material(
+          color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.22),
+          borderRadius: BorderRadius.circular(8),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => setState(() => _showAdvanced = !_showAdvanced),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Row(
+                children: <Widget>[
+                  Icon(
+                    _showAdvanced
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 18,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '更多高级与多模态配置 (${_advancedTypes.length})',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (customAdvancedCount > 0) ...<Widget>[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1,
+                      ),
+                      decoration: ShapeDecoration(
+                        color: colorScheme.primaryContainer.withValues(
+                          alpha: 0.6,
+                        ),
+                        shape: const StadiumBorder(),
+                      ),
+                      child: Text(
+                        '$customAdvancedCount 个独立配置',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: colorScheme.primary,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                  const Spacer(),
+                ],
               ),
             ),
-            const SizedBox(width: 12),
-            TextButton.icon(
-              onPressed: onFollowAll,
-              style: SettingsControlStyles.sectionTextButton(),
-              icon: const Icon(Icons.link, size: 18),
-              label: Text(l10n.settingsModelFunctionFollowChatAll),
-            ),
-          ],
-        ),
-        const SizedBox(height: 2),
-        _FunctionGroupHeader(
-          label: l10n.settingsModelFunctionGroupMain,
-        ),
-        _FunctionMappingRow(
-          functionType: core_proxy.FunctionType.chat,
-          displayBinding: data.chatBinding,
-          followsChat: false,
-          summary: data.summaryForBinding(data.chatBinding),
-          onSelect: () =>
-              onSelectFunction(core_proxy.FunctionType.chat, data),
-        ),
-        const SizedBox(height: 10),
-        _FunctionGroupHeader(
-          label: l10n.settingsModelFunctionGroupBackground,
-        ),
-        for (final functionType in _backgroundTypes)
-          _FunctionMappingRow(
-            functionType: functionType,
-            displayBinding: _resolveFunctionBinding(data, functionType),
-            followsChat: data.functionBindings[functionType]!.followsChat,
-            summary: data.summaryForBinding(
-              _resolveFunctionBinding(data, functionType),
-            ),
-            onSelect: () => onSelectFunction(functionType, data),
           ),
-        const SizedBox(height: 10),
-        _FunctionGroupHeader(
-          label: l10n.settingsModelFunctionGroupMultimodal,
         ),
-        for (final functionType in _multimodalTypes)
-          _FunctionMappingRow(
-            functionType: functionType,
-            displayBinding: _resolveFunctionBinding(data, functionType),
-            followsChat: data.functionBindings[functionType]!.followsChat,
-            summary: data.summaryForBinding(
-              _resolveFunctionBinding(data, functionType),
+        if (_showAdvanced) ...<Widget>[
+          const SizedBox(height: 2),
+          for (final functionType in _advancedTypes)
+            _FunctionMappingRow(
+              functionType: functionType,
+              displayBinding: _resolveFunctionBinding(
+                widget.data,
+                functionType,
+              ),
+              followsChat:
+                  widget.data.functionBindings[functionType]?.followsChat ??
+                  false,
+              summary: widget.data.summaryForBinding(
+                _resolveFunctionBinding(widget.data, functionType),
+              ),
+              onSelect: () =>
+                  widget.onSelectFunction(functionType, widget.data),
             ),
-            onSelect: () => onSelectFunction(functionType, data),
-          ),
+        ],
       ],
-    );
-  }
-}
-
-class _FunctionGroupHeader extends StatelessWidget {
-  const _FunctionGroupHeader({required this.label});
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(6, 4, 6, 2),
-      child: Text(
-        label.toUpperCase(),
-        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: colorScheme.onSurfaceVariant,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.4,
-        ),
-      ),
     );
   }
 }
@@ -3868,101 +6028,98 @@ class _FunctionMappingRow extends StatelessWidget {
       summary?.providerName ?? displayBinding.providerId,
       displayBinding.modelId,
     );
-    return Material(
-      type: MaterialType.transparency,
-      child: InkWell(
-        onTap: onSelect,
-        borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-          child: Row(
-            children: <Widget>[
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Row(
-                      children: <Widget>[
-                        Flexible(
-                          child: Text(
-                            _functionTypeTitle(l10n, functionType),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall
-                                ?.copyWith(fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                        if (followsChat) ...<Widget>[
-                          const SizedBox(width: 6),
-                          const _FollowChatBadge(),
-                        ],
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: <Widget>[
-                        ProviderLogo(
-                          providerTypeId: summary?.providerTypeId ?? '',
-                          fallbackName:
-                              summary?.providerName ??
-                              displayBinding.providerId,
-                          size: 20,
-                          contentScale: 0.72,
-                        ),
-                        const SizedBox(width: 7),
-                        Flexible(
-                          child: Text(
-                            bindingText,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall
-                                ?.copyWith(
-                                  color: summary == null
-                                      ? colorScheme.error
-                                      : colorScheme.primary,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                          ),
-                        ),
-                        if (warning != null) ...<Widget>[
-                          const SizedBox(width: 6),
-                          Icon(
-                            Icons.warning_amber_outlined,
-                            size: 14,
-                            color: colorScheme.error,
-                          ),
-                          const SizedBox(width: 4),
+    final description = _functionTypeDescription(l10n, functionType);
+
+    return Tooltip(
+      message: description,
+      waitDuration: const Duration(milliseconds: 500),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: onSelect,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Row(
+                        children: <Widget>[
                           Flexible(
                             child: Text(
-                              warning,
+                              _functionTypeTitle(l10n, functionType),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.labelSmall
-                                  ?.copyWith(color: colorScheme.error),
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
+                          if (followsChat) ...<Widget>[
+                            const SizedBox(width: 6),
+                            const _FollowChatBadge(),
+                          ],
                         ],
-                      ],
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      _functionTypeDescription(l10n, functionType),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: colorScheme.onSurfaceVariant,
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 2),
+                      Row(
+                        children: <Widget>[
+                          ProviderLogo(
+                            providerTypeId: summary?.providerTypeId ?? '',
+                            fallbackName:
+                                summary?.providerName ??
+                                displayBinding.providerId,
+                            size: 16,
+                            contentScale: 0.72,
+                          ),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              bindingText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(
+                                    color: summary == null
+                                        ? colorScheme.error
+                                        : colorScheme.onSurfaceVariant,
+                                  ),
+                            ),
+                          ),
+                          if (warning != null) ...<Widget>[
+                            const SizedBox(width: 6),
+                            Icon(
+                              Icons.warning_amber_outlined,
+                              size: 13,
+                              color: colorScheme.error,
+                            ),
+                            const SizedBox(width: 3),
+                            Flexible(
+                              child: Text(
+                                warning,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.labelSmall
+                                    ?.copyWith(color: colorScheme.error),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(width: 6),
-              Icon(
-                Icons.chevron_right,
-                size: 20,
-                color: colorScheme.onSurfaceVariant,
-              ),
-            ],
+                const SizedBox(width: 6),
+                Icon(
+                  Icons.chevron_right,
+                  size: 18,
+                  color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -3978,7 +6135,7 @@ class _FollowChatBadge extends StatelessWidget {
     final l10n = AppLocalizations.of(context)!;
     final colorScheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: ShapeDecoration(
         color: colorScheme.primaryContainer.withValues(alpha: 0.45),
         shape: const StadiumBorder(),
@@ -3986,12 +6143,13 @@ class _FollowChatBadge extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Icon(Icons.link, size: 11, color: colorScheme.primary),
+          Icon(Icons.link, size: 10, color: colorScheme.primary),
           const SizedBox(width: 3),
           Text(
             l10n.settingsModelFunctionFollowChat,
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
               color: colorScheme.primary,
+              fontSize: 10,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -4305,16 +6463,16 @@ class _FunctionModelGroupHeader extends StatelessWidget {
               providerName,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                fontWeight: FontWeight.w700,
-              ),
+              style: Theme.of(
+                context,
+              ).textTheme.labelMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
           ),
           Text(
             '$count',
-            style: Theme.of(
-              context,
-            ).textTheme.labelSmall?.copyWith(color: colorScheme.onSurfaceVariant),
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
           ),
         ],
       ),
@@ -4374,10 +6532,11 @@ class _FunctionModelOptionTile extends StatelessWidget {
                       const SizedBox(height: 2),
                       Row(
                         children: <Widget>[
-                          _ModelCapabilityIcons(
+                          _ModelCapabilityCapsules(
                             capabilities: summary.capabilities,
                           ),
-                          if (!enabled && unsupportedReason != null) ...<Widget>[
+                          if (!enabled &&
+                              unsupportedReason != null) ...<Widget>[
                             const SizedBox(width: 6),
                             Icon(
                               Icons.warning_amber_outlined,
@@ -4405,419 +6564,6 @@ class _FunctionModelOptionTile extends StatelessWidget {
           ),
         ),
       ),
-    );
-  }
-}
-
-class _ModelSettingsChange {
-  const _ModelSettingsChange({
-    required this.capabilities,
-    required this.builtinTools,
-    required this.context,
-    required this.summary,
-  });
-
-  final core_proxy.ModelCapabilities capabilities;
-  final List<core_proxy.ModelBuiltinTool> builtinTools;
-  final core_proxy.ModelContextSpec context;
-  final core_proxy.ModelSummarySettings summary;
-}
-
-sealed class _ModelSettingsEditorResult {
-  const _ModelSettingsEditorResult();
-}
-
-class _ModelSettingsSaved extends _ModelSettingsEditorResult {
-  const _ModelSettingsSaved(this.change);
-
-  final _ModelSettingsChange change;
-}
-
-class _ModelSettingsDeleteRequested extends _ModelSettingsEditorResult {
-  const _ModelSettingsDeleteRequested();
-}
-
-class _ModelSettingsEditorDialog extends StatefulWidget {
-  const _ModelSettingsEditorDialog({
-    required this.providerName,
-    required this.modelId,
-    required this.initialCapabilities,
-    required this.initialBuiltinTools,
-    required this.initialContext,
-    required this.initialSummary,
-    required this.onTest,
-  });
-
-  final String providerName;
-  final String modelId;
-  final core_proxy.ModelCapabilities initialCapabilities;
-  final List<core_proxy.ModelBuiltinTool> initialBuiltinTools;
-  final core_proxy.ModelContextSpec initialContext;
-  final core_proxy.ModelSummarySettings initialSummary;
-  final Future<core_proxy.ModelConnectionTestReport?> Function() onTest;
-
-  static Future<_ModelSettingsEditorResult?> show({
-    required BuildContext context,
-    required String providerName,
-    required String modelId,
-    required core_proxy.ModelCapabilities initialCapabilities,
-    required List<core_proxy.ModelBuiltinTool> initialBuiltinTools,
-    required core_proxy.ModelContextSpec initialContext,
-    required core_proxy.ModelSummarySettings initialSummary,
-    required Future<core_proxy.ModelConnectionTestReport?> Function() onTest,
-  }) {
-    return showDialog<_ModelSettingsEditorResult>(
-      context: context,
-      builder: (context) => _ModelSettingsEditorDialog(
-        providerName: providerName,
-        modelId: modelId,
-        initialCapabilities: initialCapabilities,
-        initialBuiltinTools: initialBuiltinTools,
-        initialContext: initialContext,
-        initialSummary: initialSummary,
-        onTest: onTest,
-      ),
-    );
-  }
-
-  @override
-  State<_ModelSettingsEditorDialog> createState() =>
-      _ModelSettingsEditorDialogState();
-}
-
-class _ModelSettingsEditorDialogState
-    extends State<_ModelSettingsEditorDialog> {
-  late bool _toolCall;
-  late bool _directImage;
-  late bool _directAudio;
-  late bool _directVideo;
-  late List<core_proxy.ModelBuiltinTool> _builtinTools;
-  late bool _enableSummary;
-  late bool _enableSummaryByMessageCount;
-  late final TextEditingController _maxContextLengthController;
-  late final TextEditingController _summaryThresholdController;
-  late final TextEditingController _summaryMessageCountController;
-  String? _maxContextLengthError;
-  bool _testingConnection = false;
-
-  @override
-  void initState() {
-    super.initState();
-    final caps = widget.initialCapabilities;
-    _toolCall = caps.toolCall;
-    _directImage = caps.directImage;
-    _directAudio = caps.directAudio;
-    _directVideo = caps.directVideo;
-    _builtinTools = widget.initialBuiltinTools;
-    _enableSummary = widget.initialSummary.enableSummary;
-    _enableSummaryByMessageCount =
-        widget.initialSummary.enableSummaryByMessageCount;
-    _maxContextLengthController = TextEditingController(
-      text: widget.initialContext.maxContextLength.toStringAsFixed(0),
-    );
-    _summaryThresholdController = TextEditingController(
-      text: widget.initialSummary.summaryTokenThreshold.toString(),
-    );
-    _summaryMessageCountController = TextEditingController(
-      text: widget.initialSummary.summaryMessageCountThreshold.toString(),
-    );
-  }
-
-  @override
-  void dispose() {
-    _maxContextLengthController.dispose();
-    _summaryThresholdController.dispose();
-    _summaryMessageCountController.dispose();
-    super.dispose();
-  }
-
-  void _setBuiltinToolEnabled(int index, bool enabled) {
-    final current = _builtinTools[index];
-    final updated = core_proxy.ModelBuiltinTool(
-      toolType: current.toolType,
-      displayName: current.displayName,
-      enabled: enabled,
-      requestFormat: current.requestFormat,
-      exclusivity: current.exclusivity,
-      config: current.config,
-    );
-    setState(() {
-      _builtinTools = <core_proxy.ModelBuiltinTool>[
-        for (var i = 0; i < _builtinTools.length; i++)
-          i == index ? updated : _builtinTools[i],
-      ];
-      if (enabled &&
-          current.exclusivity ==
-              core_proxy.BuiltinToolExclusivity.exclusiveWithExternalTools) {
-        _toolCall = false;
-      }
-    });
-  }
-
-  Future<void> _runConnectionTest() async {
-    setState(() {
-      _testingConnection = true;
-    });
-    try {
-      final report = await widget.onTest();
-      if (mounted &&
-          report != null &&
-          _connectionTestSucceeded(
-            report,
-            core_proxy.ModelConnectionTestType.chat,
-          )) {
-        setState(() {
-          _directImage = _connectionTestSucceeded(
-            report,
-            core_proxy.ModelConnectionTestType.image,
-          );
-          _directAudio = _connectionTestSucceeded(
-            report,
-            core_proxy.ModelConnectionTestType.audio,
-          );
-          _directVideo = _connectionTestSucceeded(
-            report,
-            core_proxy.ModelConnectionTestType.video,
-          );
-          _toolCall = _connectionTestSucceeded(
-            report,
-            core_proxy.ModelConnectionTestType.toolCall,
-          );
-        });
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _testingConnection = false;
-        });
-      }
-    }
-  }
-
-  void _save() {
-    final maxContextLength = double.tryParse(
-      _maxContextLengthController.text.trim(),
-    );
-    if (maxContextLength == null || maxContextLength <= 0) {
-      setState(() {
-        _maxContextLengthError = AppLocalizations.of(
-          context,
-        )!.settingsModelMaxContextLengthInvalid;
-      });
-      return;
-    }
-    Navigator.of(context).pop(
-      _ModelSettingsSaved(
-        _ModelSettingsChange(
-          capabilities: core_proxy.ModelCapabilities(
-            directImage: _directImage,
-            directAudio: _directAudio,
-            directVideo: _directVideo,
-            toolCall: _toolCall,
-          ),
-          builtinTools: _builtinTools,
-          context: core_proxy.ModelContextSpec(
-            maxContextLength: maxContextLength,
-          ),
-          summary: core_proxy.ModelSummarySettings(
-            enableSummary: _enableSummary,
-            summaryTokenThreshold:
-                double.tryParse(_summaryThresholdController.text) ?? 0,
-            enableSummaryByMessageCount: _enableSummaryByMessageCount,
-            summaryMessageCountThreshold:
-                int.tryParse(_summaryMessageCountController.text) ?? 0,
-          ),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
-    final textStyle = Theme.of(context).textTheme.bodyMedium;
-    return AlertDialog(
-      title: Text(l10n.settingsModelEditModelSettings),
-      contentPadding: EdgeInsets.zero,
-      content: SizedBox(
-        width: 520,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 12),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              Text(
-                '${widget.providerName} \u00b7 ${widget.modelId}',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: OutlinedButton.icon(
-                  onPressed: _testingConnection ? null : _runConnectionTest,
-                  icon: _testingConnection
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: Center(child: M3LoadingIndicator(size: 18)),
-                        )
-                      : const Icon(Icons.wifi_find_outlined, size: 18),
-                  label: Text(l10n.settingsModelTestModel),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                l10n.settingsModelCapabilities,
-                style: const TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 4),
-              _ModelSettingsSwitch(
-                title: l10n.settingsModelToolCall,
-                subtitle: l10n.settingsModelToolCallDescription,
-                value: _toolCall,
-                onChanged: (v) => setState(() => _toolCall = v),
-              ),
-              _ModelSettingsSwitch(
-                title: l10n.settingsModelDirectImage,
-                subtitle: l10n.settingsModelDirectImageDescription,
-                value: _directImage,
-                onChanged: (v) => setState(() => _directImage = v),
-              ),
-              _ModelSettingsSwitch(
-                title: l10n.settingsModelDirectAudio,
-                subtitle: l10n.settingsModelDirectAudioDescription,
-                value: _directAudio,
-                onChanged: (v) => setState(() => _directAudio = v),
-              ),
-              _ModelSettingsSwitch(
-                title: l10n.settingsModelDirectVideo,
-                subtitle: l10n.settingsModelDirectVideoDescription,
-                value: _directVideo,
-                onChanged: (v) => setState(() => _directVideo = v),
-              ),
-              if (_builtinTools.isNotEmpty) ...<Widget>[
-                const SizedBox(height: 12),
-                Text(
-                  l10n.settingsModelBuiltinTools,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 4),
-                for (var index = 0; index < _builtinTools.length; index++)
-                  _ModelSettingsSwitch(
-                    title: _builtinTools[index].displayName,
-                    subtitle: _builtinToolSubtitle(l10n, _builtinTools[index]),
-                    value: _builtinTools[index].enabled,
-                    onChanged: (value) => _setBuiltinToolEnabled(index, value),
-                  ),
-              ],
-              const SizedBox(height: 12),
-              Text(
-                l10n.settingsModelContext,
-                style: const TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _maxContextLengthController,
-                style: textStyle,
-                decoration: InputDecoration(
-                  labelText: l10n.settingsModelMaxContextLength,
-                  errorText: _maxContextLengthError,
-                ),
-                keyboardType: TextInputType.number,
-                onChanged: (_) {
-                  setState(() => _maxContextLengthError = null);
-                },
-              ),
-              const SizedBox(height: 12),
-              Text(
-                l10n.settingsModelSummary,
-                style: const TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 10),
-              _ModelSettingsSwitch(
-                title: l10n.enable,
-                subtitle: '',
-                value: _enableSummary,
-                onChanged: (v) => setState(() => _enableSummary = v),
-              ),
-              if (_enableSummary) ...<Widget>[
-                TextField(
-                  controller: _summaryThresholdController,
-                  style: textStyle,
-                  decoration: InputDecoration(
-                    labelText: l10n.settingsModelSummaryThreshold,
-                  ),
-                  keyboardType: TextInputType.number,
-                ),
-                const SizedBox(height: 8),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  dense: true,
-                  visualDensity: VisualDensity.compact,
-                  title: Text(l10n.settingsModelSummaryByMessageCount),
-                  value: _enableSummaryByMessageCount,
-                  onChanged: (v) =>
-                      setState(() => _enableSummaryByMessageCount = v),
-                ),
-                if (_enableSummaryByMessageCount)
-                  TextField(
-                    controller: _summaryMessageCountController,
-                    style: textStyle,
-                    decoration: InputDecoration(
-                      labelText: l10n.settingsModelSummaryMessageCount,
-                    ),
-                    keyboardType: TextInputType.number,
-                  ),
-              ],
-            ],
-          ),
-        ),
-      ),
-      actions: <Widget>[
-        TextButton.icon(
-          style: TextButton.styleFrom(
-            foregroundColor: Theme.of(context).colorScheme.error,
-          ),
-          onPressed: () =>
-              Navigator.of(context).pop(const _ModelSettingsDeleteRequested()),
-          icon: const Icon(Icons.delete_outline),
-          label: Text(l10n.delete),
-        ),
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: Text(l10n.cancel),
-        ),
-        FilledButton(onPressed: _save, child: Text(l10n.save)),
-      ],
-    );
-  }
-}
-
-class _ModelSettingsSwitch extends StatelessWidget {
-  const _ModelSettingsSwitch({
-    required this.title,
-    required this.subtitle,
-    required this.value,
-    required this.onChanged,
-  });
-
-  final String title;
-  final String subtitle;
-  final bool value;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return SwitchListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      visualDensity: VisualDensity.compact,
-      title: Text(title),
-      subtitle: subtitle.isNotEmpty ? Text(subtitle) : null,
-      value: value,
-      onChanged: onChanged,
     );
   }
 }
@@ -4870,7 +6616,10 @@ class _ConnectionTestReportDialog extends StatelessWidget {
 }
 
 class _ProviderConfigErrorDialog extends StatelessWidget {
-  const _ProviderConfigErrorDialog({required this.title, required this.message});
+  const _ProviderConfigErrorDialog({
+    required this.title,
+    required this.message,
+  });
 
   final String title;
   final String message;
@@ -5164,11 +6913,15 @@ class _SectionCard extends StatelessWidget {
   const _SectionCard({
     required this.title,
     required this.children,
+    this.icon,
+    this.action,
     this.initiallyExpanded = true,
   });
 
   final String title;
   final List<Widget> children;
+  final IconData? icon;
+  final Widget? action;
   final bool initiallyExpanded;
 
   @override
@@ -5197,13 +6950,68 @@ class _SectionCard extends StatelessWidget {
             childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
             shape: RoundedRectangleBorder(borderRadius: radius),
             collapsedShape: RoundedRectangleBorder(borderRadius: radius),
-            title: Text(
-              title,
-              style: SettingsControlStyles.sectionTitleTextStyle(context),
+            title: Row(
+              children: <Widget>[
+                if (icon != null) ...<Widget>[
+                  Icon(icon, size: 18, color: colorScheme.onSurfaceVariant),
+                  const SizedBox(width: 8),
+                ],
+                Expanded(
+                  child: Text(
+                    title,
+                    style: SettingsControlStyles.sectionTitleTextStyle(context),
+                  ),
+                ),
+                if (action != null) ...<Widget>[
+                  action!,
+                  const SizedBox(width: 4),
+                ],
+              ],
             ),
             children: children,
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _CodexLoginField extends StatelessWidget {
+  const _CodexLoginField({required this.status, required this.onLogin});
+
+  final core_proxy.CodexSessionStatus? status;
+  final VoidCallback onLogin;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final signedIn = status?.signedIn == true;
+    final account = status == null
+        ? ''
+        : (status!.email.trim().isEmpty ? status!.accountId : status!.email);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text(l10n.settingsModelCodexLoginDescription),
+          const SizedBox(height: 8),
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  signedIn
+                      ? l10n.settingsModelCodexSignedIn(account)
+                      : l10n.settingsModelCodexSignedOut,
+                ),
+              ),
+              FilledButton.tonal(
+                onPressed: onLogin,
+                child: Text(l10n.settingsModelCodexLogin),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -5216,6 +7024,7 @@ class _DialogTextField extends StatelessWidget {
     this.requiredField = false,
     this.obscureText = false,
     this.numberOnly = false,
+    this.readOnly = false,
     this.maxLines = 1,
     this.keyboardType,
     this.inputFormatters,
@@ -5228,6 +7037,7 @@ class _DialogTextField extends StatelessWidget {
   final bool requiredField;
   final bool obscureText;
   final bool numberOnly;
+  final bool readOnly;
   final int maxLines;
   final TextInputType? keyboardType;
   final List<TextInputFormatter>? inputFormatters;
@@ -5243,6 +7053,7 @@ class _DialogTextField extends StatelessWidget {
       child: TextFormField(
         controller: controller,
         style: textStyle,
+        readOnly: readOnly,
         obscureText: obscureText,
         maxLines: obscureText ? 1 : maxLines,
         keyboardType:
@@ -5477,7 +7288,10 @@ String _availableModelSubtitle(
   }
   final context = model.context;
   if (context != null) {
-    labels.add('${context.maxContextLength.toStringAsFixed(0)}k');
+    final formatted = _formatContextLength(context.maxContextLength);
+    if (formatted != null) {
+      labels.add(formatted);
+    }
   }
   return labels.isEmpty ? '-' : labels.join(' · ');
 }
@@ -5524,11 +7338,4 @@ String _connectionTestTypeLabel(
 
 String _modelTestKey(String providerId, String modelId) {
   return '$providerId:$modelId';
-}
-
-bool _connectionTestSucceeded(
-  core_proxy.ModelConnectionTestReport report,
-  core_proxy.ModelConnectionTestType type,
-) {
-  return report.items.any((item) => item.type == type && item.success);
 }

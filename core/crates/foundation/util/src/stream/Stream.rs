@@ -306,6 +306,13 @@ mod tests {
     struct TestHostRuntimeTaskScheduler;
 
     impl HostRuntimeTaskSchedulerHost for TestHostRuntimeTaskScheduler {
+        /// Reads the test Host's process-local monotonic timer clock.
+        fn monotonicTimeMillis(&self) -> HostResult<u64> {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            Ok(START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64)
+        }
+
+
         /// Starts a synchronous test task on an isolated thread.
         fn scheduleHostRuntimeTask(
             &self,
@@ -318,6 +325,22 @@ mod tests {
 
         /// Starts an asynchronous test task on an isolated current-thread runtime.
         fn scheduleHostRuntimeAsyncTask(
+            &self,
+            _task_name: &str,
+            task: HostRuntimeAsyncTask,
+        ) -> HostResult<()> {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create test stream task runtime failed");
+                runtime.block_on(task());
+            });
+            Ok(())
+        }
+
+        /// Executes cooperative work on the host-owned asynchronous executor.
+        fn scheduleHostRuntimeCooperativeAsyncTask(
             &self,
             _task_name: &str,
             task: HostRuntimeAsyncTask,

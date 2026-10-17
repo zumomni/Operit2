@@ -1,8 +1,19 @@
 #![allow(non_snake_case)]
 
+pub mod AtomicCounter;
+pub mod FileSystemResource;
 pub mod HostManager;
+pub mod PluginStorage;
+pub mod HttpServer;
 pub mod PluginSdkIpc;
+pub mod Tcp;
+pub mod TerminalWorkingDirectory;
 pub mod TimeUtils;
+pub mod JavaScriptBootstrap;
+pub use JavaScriptBootstrap::HostJavaScriptBootstrap;
+pub use Tcp::{TcpConnection, TcpHost, TcpListener};
+pub mod SerialPort;
+pub use SerialPort::{SerialPortConnection, SerialPortHost};
 
 pub use PluginSdkIpc::{
     pluginSdkIpcError, PluginSdkIpcEndpoint, PluginSdkIpcHost, PluginSdkIpcSessionCallbacks,
@@ -111,6 +122,8 @@ impl HostEnvironmentDescriptor {
             environmentParameterDescriptionEn: "optional, execution environment. Values: \"android\" (Android file system) | \"linux\" (local terminal environment) | \"repo:<repositoryName>\" (attached local storage repository)".to_string(),
             environmentParameterDescriptionCn: "可选，执行环境。取值：\"android\"（Android 文件系统）| \"linux\"（本地终端环境）| \"repo:<仓库名>\"（附加本地储存仓库）".to_string(),
             capabilities: vec![
+                "screen.capture".to_string(),
+                "ocr.recognition".to_string(),
                 "fs.read".to_string(),
                 "fs.write".to_string(),
                 "fs.search".to_string(),
@@ -135,6 +148,8 @@ impl HostEnvironmentDescriptor {
                 "runtime.sqlite".to_string(),
             ],
             structuredCapabilities: hostCapabilities(&[
+                "screen.capture",
+                "ocr.recognition",
                 "fs.read",
                 "fs.write",
                 "fs.search",
@@ -179,6 +194,7 @@ impl HostEnvironmentDescriptor {
             environmentParameterDescriptionEn: String::new(),
             environmentParameterDescriptionCn: String::new(),
             capabilities: vec![
+                "screen.capture".to_string(),
                 "fs.read".to_string(),
                 "fs.write".to_string(),
                 "fs.search".to_string(),
@@ -206,6 +222,7 @@ impl HostEnvironmentDescriptor {
                 "runtime.sqlite".to_string(),
             ],
             structuredCapabilities: hostCapabilities(&[
+                "screen.capture",
                 "fs.read",
                 "fs.write",
                 "fs.search",
@@ -259,6 +276,8 @@ impl HostEnvironmentDescriptor {
             environmentParameterDescriptionEn: String::new(),
             environmentParameterDescriptionCn: String::new(),
             capabilities: vec![
+                "screen.capture".to_string(),
+                "ocr.recognition".to_string(),
                 "fs.read".to_string(),
                 "fs.write".to_string(),
                 "fs.search".to_string(),
@@ -280,6 +299,8 @@ impl HostEnvironmentDescriptor {
                 "system.settings".to_string(),
             ],
             structuredCapabilities: hostCapabilities(&[
+                "screen.capture",
+                "ocr.recognition",
                 "fs.read",
                 "fs.write",
                 "fs.search",
@@ -357,6 +378,8 @@ impl HostEnvironmentDescriptor {
             environmentParameterDescriptionEn: String::new(),
             environmentParameterDescriptionCn: String::new(),
             capabilities: vec![
+                "screen.capture".to_string(),
+                "ocr.recognition".to_string(),
                 "fs.read".to_string(),
                 "fs.write".to_string(),
                 "fs.search".to_string(),
@@ -373,7 +396,6 @@ impl HostEnvironmentDescriptor {
                 "os.open".to_string(),
                 "os.share".to_string(),
                 "system.location".to_string(),
-                "system.notifications.read".to_string(),
                 "system.notifications.send".to_string(),
                 "system.app_usage".to_string(),
                 "system.app.install".to_string(),
@@ -381,6 +403,8 @@ impl HostEnvironmentDescriptor {
                 "system.settings".to_string(),
             ],
             structuredCapabilities: hostCapabilities(&[
+                "screen.capture",
+                "ocr.recognition",
                 "fs.read",
                 "fs.write",
                 "fs.search",
@@ -397,7 +421,6 @@ impl HostEnvironmentDescriptor {
                 "os.open",
                 "os.share",
                 "system.location",
-                "system.notifications.read",
                 "system.notifications.send",
                 "system.app_usage",
                 "system.app.install",
@@ -633,6 +656,18 @@ fn defaultHostCapabilities() -> Vec<HostCapability> {
             operations: vec![CapabilityOperation::Read, CapabilityOperation::Execute],
         },
         HostCapability {
+            id: "screen.capture".to_string(),
+            displayName: "屏幕采集".to_string(),
+            scope: CapabilityScope::System,
+            operations: vec![CapabilityOperation::Read],
+        },
+        HostCapability {
+            id: "ocr.recognition".to_string(),
+            displayName: "图片文字识别".to_string(),
+            scope: CapabilityScope::Media,
+            operations: vec![CapabilityOperation::Read],
+        },
+        HostCapability {
             id: "system.location".to_string(),
             displayName: "定位".to_string(),
             scope: CapabilityScope::System,
@@ -699,6 +734,8 @@ fn defaultHostCapabilities() -> Vec<HostCapability> {
 #[allow(non_snake_case)]
 fn linuxHostCapabilityIds() -> Vec<&'static str> {
     vec![
+        "screen.capture",
+        "ocr.recognition",
         "fs.read",
         "fs.write",
         "fs.search",
@@ -940,7 +977,7 @@ impl From<std::io::Error> for HostError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
     pub isDirectory: bool,
@@ -949,14 +986,14 @@ pub struct FileEntry {
     pub lastModified: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileExistence {
     pub exists: bool,
     pub isDirectory: bool,
     pub size: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
     pub exists: bool,
@@ -969,7 +1006,7 @@ pub struct FileInfo {
     pub rawStatOutput: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindFilesRequest {
     pub path: String,
     pub pattern: String,
@@ -978,7 +1015,7 @@ pub struct FindFilesRequest {
     pub caseInsensitive: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepCodeRequest {
     pub path: String,
     pub pattern: String,
@@ -988,20 +1025,20 @@ pub struct GrepCodeRequest {
     pub maxResults: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepLineMatch {
     pub lineNumber: usize,
     pub lineContent: String,
     pub matchContext: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepFileMatch {
     pub filePath: String,
     pub lineMatches: Vec<GrepLineMatch>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepCodeResult {
     pub matches: Vec<GrepFileMatch>,
     pub totalMatches: usize,
@@ -1054,6 +1091,10 @@ pub trait BrowserAutomationHost: Send + Sync {
         request: BrowserAutomationRequest,
     ) -> HostResult<BrowserAutomationResponse>;
 }
+
+/// Constructs a browser host with the file-system capability selected by its runtime.
+pub type BrowserAutomationHostFactory =
+    Arc<dyn Fn(Arc<dyn FileSystemHost>) -> Arc<dyn BrowserAutomationHost> + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionInfo {
@@ -1162,8 +1203,18 @@ pub struct ComposeDslFilePickerRequest {
 }
 
 impl ComposeDslFilePickerRequest {
-    /// Decodes and validates the JSON payload supplied by the Compose DSL JavaScript bridge.
+    /// Decodes the explicit external JSON file-picker protocol.
     pub fn parse(payloadJson: &str) -> HostResult<Self> {
+        let payload = serde_json::from_str(payloadJson).map_err(|error| {
+            HostError::new(format!(
+                "Compose DSL file picker request decode failed: {error}"
+            ))
+        })?;
+        Self::fromValue(payload)
+    }
+
+    /// Validates a structured request from the JavaScript host bridge.
+    pub fn fromValue(payload: Value) -> HostResult<Self> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct RawRequest {
@@ -1174,7 +1225,7 @@ impl ComposeDslFilePickerRequest {
             options: ComposeDslFilePickerOptions,
         }
 
-        let raw: RawRequest = serde_json::from_str(payloadJson).map_err(|error| {
+        let raw: RawRequest = serde_json::from_value(payload).map_err(|error| {
             HostError::new(format!(
                 "Compose DSL file picker request decode failed: {error}"
             ))
@@ -1199,12 +1250,56 @@ impl ComposeDslFilePickerRequest {
     }
 }
 
+/// A UTF-8 export saved to a destination selected by the host user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComposeDslFileSaveOptions {
+    pub suggestedName: String,
+    pub content: String,
+    pub mimeType: String,
+    pub extensions: Vec<String>,
+}
+
+/// A file-save request scoped to the originating Compose execution context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComposeDslFileSaveRequest {
+    pub routeInstanceId: String,
+    pub executionContextKey: String,
+    pub options: ComposeDslFileSaveOptions,
+}
+
+impl ComposeDslFileSaveRequest {
+    /// Validates the structured export without accepting a caller-supplied output path.
+    pub fn fromValue(payload: Value) -> HostResult<Self> {
+        let request: Self = serde_json::from_value(payload)
+            .map_err(|error| HostError::new(format!("Compose DSL file save request decode failed: {error}")))?;
+        if request.executionContextKey.trim().is_empty() {
+            return Err(HostError::new("Compose DSL file save executionContextKey is required"));
+        }
+        let name = &request.options.suggestedName;
+        if name.trim().is_empty() || name.chars().any(|value| matches!(value, '/' | '\\' | '\0')) {
+            return Err(HostError::new("Compose DSL file save requires a file name without a path"));
+        }
+        if request.options.mimeType.trim().is_empty() {
+            return Err(HostError::new("Compose DSL file save mimeType is required"));
+        }
+        if request.options.extensions.iter().any(|extension| extension.is_empty() || !extension.chars().all(|value| value.is_ascii_alphanumeric())) {
+            return Err(HostError::new("Compose DSL file save extensions must be nonempty alphanumeric tokens"));
+        }
+        Ok(request)
+    }
+}
+
 pub trait ComposeDslWebViewHost: Send + Sync {
     /// Executes one imperative WebView controller command for a Compose DSL screen.
-    fn handleControllerCommand(&self, payloadJson: &str) -> HostResult<String>;
+    fn handleControllerCommand(&self, payload: &Value) -> HostResult<Value>;
 
     /// Opens one validated Compose DSL file picker through the platform owner.
-    fn openFilePicker(&self, request: ComposeDslFilePickerRequest) -> HostResult<String>;
+    fn openFilePicker(&self, request: ComposeDslFilePickerRequest) -> HostResult<Value>;
+
+    /// Saves an export using a destination selected by the platform owner.
+    fn saveFile(&self, request: ComposeDslFileSaveRequest) -> HostResult<Value>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1238,6 +1333,14 @@ pub struct HttpResponseData {
     pub statusMessage: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Describes one HTTP response streamed into a destination file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpFileDownloadResult {
+    pub finalUrl: String,
+    pub targetPath: String,
+    pub downloadedBytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1326,6 +1429,17 @@ impl HttpDownloadControl {
 
 pub type HttpDownloadProgressCallback = Arc<dyn Fn(HttpDownloadProgress) + Send + Sync + 'static>;
 
+/// HTTP response metadata delivered before the first streamed body chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpResponseHead {
+    pub finalUrl: String,
+    pub statusCode: i32,
+    pub statusMessage: String,
+    pub headers: Vec<(String, String)>,
+}
+
+pub type HttpStreamResponseCallback = Arc<dyn Fn(HttpResponseHead) + Send + Sync + 'static>;
+
 pub type HttpStreamOpenedCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub type HttpStreamChunkCallback = Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>;
@@ -1372,9 +1486,32 @@ pub trait WebSocketHost: Send + Sync {
     fn closeWebSocket(&self, streamId: &str) -> HostResult<()>;
 }
 
+/// Declares how the host delivers remote images to its presentation surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpImageDelivery {
+    Bytes,
+    DisplayUrl,
+}
+
 pub trait HttpHost: HttpStreamHost + Send + Sync {
+    /// Selects image delivery before any request is started.
+    fn imageDelivery(&self) -> HttpImageDelivery;
+
     /// Executes one buffered HTTP request.
     fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData>;
+
+    /// Streams one successful HTTP response to a file without a declared byte count.
+    /// Implementations must not publish an incomplete response as the destination file.
+    #[allow(non_snake_case)]
+    fn downloadToFile(
+        &self,
+        _request: HttpRequestData,
+        _targetPath: String,
+    ) -> HostResult<HttpFileDownloadResult> {
+        Err(HostError::new(
+            "HTTP download to file is not supported by this host",
+        ))
+    }
 
     /// Downloads files with bounded worker concurrency and progress reporting.
     fn downloadFiles(
@@ -1397,6 +1534,23 @@ pub trait HttpStreamHost: Send + Sync {
         onChunk: HttpStreamChunkCallback,
         onClosed: HttpStreamClosedCallback,
     ) -> HostResult<()>;
+
+    /// Opens an HTTP response stream, including non-success statuses. Metadata must
+    /// precede ordered body chunks; close must cancel header and body reads alike.
+    /// This must not buffer the response or silently fall back to a blocking request.
+    #[allow(non_snake_case)]
+    fn openHttpResponseStream(
+        &self,
+        _streamId: String,
+        _request: HttpRequestData,
+        _onResponse: HttpStreamResponseCallback,
+        _onChunk: HttpStreamChunkCallback,
+        _onClosed: HttpStreamClosedCallback,
+    ) -> HostResult<()> {
+        Err(HostError::new(
+            "HTTP response streaming is not supported by this host",
+        ))
+    }
 
     /// Closes one previously opened HTTP byte stream.
     #[allow(non_snake_case)]
@@ -1545,6 +1699,14 @@ pub struct TerminalInfo {
 }
 
 pub trait TerminalHost: Send + Sync {
+    /// Resolves a working directory in the exact selected terminal filesystem.
+    fn resolveWorkingDirectory(
+        &self,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        resolveHostDirectory: &dyn Fn(&str) -> HostResult<String>,
+    ) -> HostResult<String>;
     fn terminalInfo(&self) -> HostResult<TerminalInfo>;
     fn startPtySession(
         &self,
@@ -1561,7 +1723,14 @@ pub trait TerminalHost: Send + Sync {
     fn pollPtyExitCode(&self, sessionId: &str) -> HostResult<Option<i32>>;
     fn closePtySession(&self, sessionId: &str) -> HostResult<()>;
     fn listSessions(&self) -> HostResult<Vec<TerminalSessionListEntry>>;
+    /// Creates or reuses a named session in the host's configured default terminal.
     fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo>;
+    /// Creates or reuses a named session of exactly the requested interpreter type.
+    fn createOrGetTypedSession(
+        &self,
+        sessionName: &str,
+        terminalType: &str,
+    ) -> HostResult<TerminalSessionInfo>;
     fn executeInSession(
         &self,
         sessionId: &str,
@@ -1607,6 +1776,12 @@ pub trait RuntimeStorageHost: Send + Sync {
     }
     /// Writes bytes to a virtual runtime storage path.
     fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()>;
+    /// Publishes a complete private catalog without exposing a partially written file.
+    /// Persistent hosts must flush data before publishing; unsupported hosts fail explicitly.
+    fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        let _ = (path, content);
+        Err(HostError::new("Runtime storage host does not expose atomic catalog writes"))
+    }
     /// Appends bytes to a virtual runtime storage path.
     fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()>;
     /// Deletes a virtual runtime storage entry.
@@ -1644,6 +1819,15 @@ pub trait RuntimeStorageWriteHost: Send + Sync {
 pub trait ArchiveStagingHost: Send + Sync {
     /// Creates an empty staged archive with its final byte length reserved by the owner host.
     fn createArchive(&self, archiveId: &str, expectedByteLength: u64) -> HostResult<()>;
+
+    /// Creates a growable archive for a host-backed snapshot export.
+    fn createExportArchive(&self, archiveId: &str) -> HostResult<()>;
+
+    /// Writes a bounded export range, including ZIP header updates.
+    fn writeExportArchive(&self, archiveId: &str, offset: u64, chunk: &[u8]) -> HostResult<()>;
+
+    /// Returns a file-backed reference without reading archive bytes into application memory.
+    fn archiveFileReference(&self, archiveId: &str) -> HostResult<String>;
 
     /// Appends one ordered byte chunk to an existing staged archive.
     fn appendArchive(&self, archiveId: &str, chunk: &[u8]) -> HostResult<()>;
@@ -1743,6 +1927,8 @@ pub trait RuntimeSqliteTransaction {
     fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>>;
     fn lastInsertRowId(&self) -> HostResult<i64>;
     fn commit(self: Box<Self>) -> HostResult<()>;
+    /// Aborts this transaction explicitly and reports any rollback failure.
+    fn rollback(self: Box<Self>) -> HostResult<()>;
 }
 
 pub trait RuntimeSqliteHost: Send + Sync {
@@ -1805,19 +1991,23 @@ pub type HostRuntimeAsyncTask =
 /// Represents one host-owned asynchronous runtime turn boundary that may cross runtime schedulers.
 pub type HostRuntimeTurnFuture = Pin<Box<dyn Future<Output = HostResult<()>> + Send + 'static>>;
 
-/// Handles one host JavaScript function that returns a string value.
-pub type HostJavaScriptStringCallback =
-    Arc<dyn Fn(Vec<String>) -> HostResult<String> + Send + Sync + 'static>;
+/// Submits an owned JSON-compatible request. The request id refers to a Promise
+/// whose JS resolve/reject functions remain on the runtime's owning executor.
+pub type HostJavaScriptAsyncJsonCallback =
+    Arc<dyn Fn(u64, Vec<Value>) -> HostResult<()> + Send + Sync + 'static>;
 
-/// Handles one host JavaScript function that returns `undefined`.
-pub type HostJavaScriptVoidCallback =
-    Arc<dyn Fn(Vec<String>) -> HostResult<()> + Send + Sync + 'static>;
+/// Handles a synchronous host operation using owned JSON-compatible arguments and results.
+pub type HostJavaScriptJsonCallback =
+    Arc<dyn Fn(Vec<Value>) -> HostResult<Value> + Send + Sync + 'static>;
 
 /// Supplies one interrupt predicate to a host-owned JavaScript runtime.
 pub type HostJavaScriptInterruptHandler = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
 
 /// Owns one concrete JavaScript runtime created by the active platform host.
 pub trait HostJavaScriptRuntime {
+    /// Executes shared trusted bootstrap bytecode in this runtime's independent global scope.
+    fn evaluateHostJavaScriptBootstrap(&mut self, source: &'static str) -> HostResult<()>;
+
     /// Evaluates one script without reading its return value.
     fn evaluateHostJavaScriptVoid(&mut self, scriptName: &str, script: &str) -> HostResult<()>;
 
@@ -1837,18 +2027,33 @@ pub trait HostJavaScriptRuntime {
         handler: Option<HostJavaScriptInterruptHandler>,
     ) -> HostResult<()>;
 
-    /// Registers one global JavaScript function that returns a string.
-    fn registerHostJavaScriptStringFunction(
+    /// Calls a lifecycle function with structured arguments and returns its structured result.
+    fn callHostJavaScriptFunction(&mut self, name: &str, arguments: &[Value]) -> HostResult<Value>;
+
+    /// Registers a required structured asynchronous binding with an owning execution scope.
+    /// Hosts convert arguments to owned JSON-compatible values without producing JSON text.
+    fn registerHostJavaScriptAsyncJsonFunction(
         &mut self,
         name: &str,
-        callback: HostJavaScriptStringCallback,
+        callback: HostJavaScriptAsyncJsonCallback,
     ) -> HostResult<()>;
 
-    /// Registers one global JavaScript function that returns `undefined`.
-    fn registerHostJavaScriptVoidFunction(
+    /// Settles a Promise on its owning executor exactly once; cancelled ids are ignored.
+    fn settleHostJavaScriptPromise(
+        &mut self,
+        id: u64,
+        value: &Value,
+        reject: bool,
+    ) -> HostResult<()>;
+
+    /// Releases the Promise handles owned by the cancelled execution scope.
+    fn cancelHostJavaScriptPromises(&mut self, scope: &str) -> HostResult<()>;
+
+    /// Registers a required synchronous structured binding without JSON text transport.
+    fn registerHostJavaScriptJsonFunction(
         &mut self,
         name: &str,
-        callback: HostJavaScriptVoidCallback,
+        callback: HostJavaScriptJsonCallback,
     ) -> HostResult<()>;
 }
 
@@ -1989,11 +2194,23 @@ pub trait HostJavaScriptRuntimeHost: Send + Sync {
 }
 
 pub trait HostRuntimeTaskSchedulerHost: Send + Sync {
+    /// Reads monotonic milliseconds from this Host's timer clock, independent of wall-clock changes.
+    /// Readings must remain comparable across tasks using the same scheduler instance.
+    fn monotonicTimeMillis(&self) -> HostResult<u64>;
+
     /// Schedules a named one-shot runtime task through the platform execution mechanism.
     fn scheduleHostRuntimeTask(&self, taskName: &str, task: HostRuntimeTask) -> HostResult<()>;
 
     /// Schedules a named asynchronous runtime task through the platform executor.
     fn scheduleHostRuntimeAsyncTask(
+        &self,
+        taskName: &str,
+        task: HostRuntimeAsyncTask,
+    ) -> HostResult<()>;
+
+    /// Schedules a nonblocking task on the host's reusable affine executor.
+    /// Callers must not block the executor or rely on exclusive thread-local state.
+    fn scheduleHostRuntimeCooperativeAsyncTask(
         &self,
         taskName: &str,
         task: HostRuntimeAsyncTask,
@@ -2035,14 +2252,14 @@ pub struct AppListData {
     pub packages: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationEntry {
     pub packageName: String,
     pub text: String,
     pub timestamp: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationData {
     pub notifications: Vec<NotificationEntry>,
     pub timestamp: i64,
@@ -2068,7 +2285,7 @@ pub struct AppUsageTimeResultData {
     pub entries: Vec<AppUsageTimeEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocationData {
     pub latitude: f64,
     pub longitude: f64,
@@ -2082,7 +2299,7 @@ pub struct LocationData {
     pub country: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfoData {
     pub deviceId: String,
     pub model: String,
@@ -2352,6 +2569,8 @@ pub struct BluetoothBleNotificationData {
 }
 
 pub trait BluetoothHost: Send + Sync {
+    /// Declares inbound RFCOMM support independently of BLE operations and permissions.
+    fn supportsClassicListening(&self) -> bool;
     fn requestBluetoothPermission(&self) -> HostResult<String>;
     fn bluetoothState(&self) -> HostResult<BluetoothStateData>;
     fn requestEnableBluetooth(&self) -> HostResult<String>;
@@ -2597,9 +2816,23 @@ pub struct SystemNotificationRequest {
     pub activation: SystemNotificationActivation,
 }
 
+pub trait ToastHost: Send + Sync {
+    /// Presents one transient message inside the active frontend.
+    fn toast(&self, message: &str) -> HostResult<()>;
+}
+
+impl<F> ToastHost for F
+where
+    F: Fn(&str) -> HostResult<()> + Send + Sync,
+{
+    /// Invokes the frontend-owned toast presenter.
+    fn toast(&self, message: &str) -> HostResult<()> {
+        self(message)
+    }
+}
+
 pub trait SystemOperationHost: Send + Sync {
     fn getSystemLanguageCode(&self) -> HostResult<String>;
-    fn toast(&self, message: &str) -> HostResult<()>;
     fn sendNotification(&self, request: &SystemNotificationRequest) -> HostResult<()>;
     fn modifySystemSetting(
         &self,
@@ -2834,3 +3067,5 @@ mod tests {
         assert!(request.allowMultiple);
     }
 }
+
+pub mod ServiceDiscovery;

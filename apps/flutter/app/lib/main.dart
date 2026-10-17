@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:desktop_widgets/desktop_widgets.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import 'core/application/CoreApplicationService.dart';
+import 'core/bridge/PlatformCoreProxy.dart';
+import 'ui/rescue/DataRescueApp.dart';
 import 'core/errors/UnhandledErrorReporter.dart';
 import 'core/logging/ClientLogger.dart';
 import 'core/notifications/NotificationActivationService.dart';
@@ -22,12 +25,32 @@ const String _appStartupLogTag = 'AppStartup';
 /// Runs the application startup sequence with structured diagnostics.
 void main(List<String> arguments) async {
   late Zone startupZone;
+  var applicationStarted = false;
   await runZonedGuarded(
     () async {
       startupZone = Zone.current;
       final startupStopwatch = Stopwatch()..start();
       final bindingStopwatch = Stopwatch()..start();
       WidgetsFlutterBinding.ensureInitialized();
+      final launch =
+          await platformCoreProxy.dataRescue({'operation': 'launchMode'})
+              as Map;
+      if (isDataRescueLaunch(
+        arguments: arguments,
+        route: PlatformDispatcher.instance.defaultRouteName,
+        uri: Uri.base,
+        hostRequested: launch['rescue'] == true,
+      )) {
+        runApp(
+          DataRescueApp(
+            canStopNormalProcess: launch['canStopNormalProcess'] == true,
+          ),
+        );
+        applicationStarted = true;
+        return;
+      }
+      await platformCoreProxy.dataRescue({'operation': 'runtimeLease'});
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       consumeGitHubOAuthWebCallbackAtStartup();
       final bindingElapsedMs = bindingStopwatch.elapsedMilliseconds;
       final loggerStopwatch = Stopwatch()..start();
@@ -46,14 +69,26 @@ void main(List<String> arguments) async {
         'client log hooks installed elapsedMs=${hooksStopwatch.elapsedMilliseconds}',
         tag: _appStartupLogTag,
       );
-      NotificationActivationService.instance.initialize(arguments);
-      final runtimeStopwatch = Stopwatch()..start();
-      await RuntimeBootstrapManager.instance.initialize();
-      ClientLogger.attachPersistentStorage();
-      ClientLogger.i(
-        'runtime bootstrap initialized elapsedMs=${runtimeStopwatch.elapsedMilliseconds}',
-        tag: _appStartupLogTag,
-      );
+      final startsDetachedChatWindow = _startsDetachedChatWindow(arguments);
+      if (startsDetachedChatWindow) {
+        ClientLogger.i(
+          'skip process-owned startup for detached chat window',
+          tag: _appStartupLogTag,
+        );
+        await RuntimeBootstrapManager.instance.initializeForDetachedWindow();
+        ClientLogger.i(
+          'detached runtime bootstrap state loaded',
+          tag: _appStartupLogTag,
+        );
+      } else {
+        NotificationActivationService.instance.initialize(arguments);
+        final runtimeStopwatch = Stopwatch()..start();
+        await RuntimeBootstrapManager.instance.initialize();
+        ClientLogger.i(
+          'runtime bootstrap initialized elapsedMs=${runtimeStopwatch.elapsedMilliseconds}',
+          tag: _appStartupLogTag,
+        );
+      }
       final glassStopwatch = Stopwatch()..start();
       await LiquidGlassWidgets.initialize();
       ClientLogger.i(
@@ -62,7 +97,10 @@ void main(List<String> arguments) async {
       );
       await DesktopWidgets.run(
         arguments: arguments,
-        widgetBuilder: (launch) => DesktopWidgetWindowApp(launch: launch),
+        widgetBuilder: (launch) {
+          applicationStarted = true;
+          return DesktopWidgetWindowApp(launch: launch);
+        },
         application: () async {
           final windowStopwatch = Stopwatch()..start();
           final windowArguments = await readOperitWindowArguments();
@@ -79,8 +117,10 @@ void main(List<String> arguments) async {
                 tag: _appStartupLogTag,
               );
               _runMainWindow();
+              applicationStarted = true;
             case final DetachedChatWindowArguments detachedArguments:
               _runDetachedChatWindow(detachedArguments);
+              applicationStarted = true;
           }
         },
       );
@@ -104,10 +144,25 @@ void main(List<String> arguments) async {
           error: error,
           stackTrace: stackTrace,
         );
-        runApp(const FatalErrorApplication());
+        if (!applicationStarted) {
+          runApp(const StartupErrorApplication());
+        }
       });
     },
   );
+}
+
+/// Identifies a detached chat engine from the launch contract before startup services run.
+bool _startsDetachedChatWindow(List<String> arguments) {
+  if (arguments.length < 3 || arguments[0] != 'multi_window') {
+    return false;
+  }
+  try {
+    return OperitWindowArguments.parse(arguments[2])
+        is DetachedChatWindowArguments;
+  } catch (_) {
+    return false;
+  }
 }
 
 /// Starts the main application window without touching runtime services.
@@ -121,7 +176,7 @@ void _runMainWindow() {
         thickness: 36,
         quality: GlassQuality.standard,
       ),
-      child: const FatalErrorHost(child: OperitApp()),
+      child: const OperitApp(),
     ),
   );
 }
@@ -137,7 +192,7 @@ void _runDetachedChatWindow(DetachedChatWindowArguments arguments) {
         thickness: 36,
         quality: GlassQuality.standard,
       ),
-      child: FatalErrorHost(child: DetachedChatWindowApp(arguments: arguments)),
+      child: DetachedChatWindowApp(arguments: arguments),
     ),
   );
 }

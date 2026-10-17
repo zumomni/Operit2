@@ -44,7 +44,7 @@ const ILI9341_NEGGAMMA: u8 = 0xE1;
 pub struct Esp32ScreenMirror {
     width: u16,
     height: u16,
-    lvgl_active: AtomicBool,
+    ui_active: AtomicBool,
     state: Mutex<Esp32ScreenMirrorState>,
 }
 
@@ -72,7 +72,7 @@ impl Esp32ScreenMirror {
         Ok(Self {
             width,
             height,
-            lvgl_active: AtomicBool::new(false),
+            ui_active: AtomicBool::new(false),
             state: Mutex::new(Esp32ScreenMirrorState {
                 background: 0,
                 rects: Vec::new(),
@@ -86,13 +86,21 @@ impl Esp32ScreenMirror {
         (self.width, self.height)
     }
 
-    /// Makes LVGL the sole owner of physical display updates.
-    pub fn activateLvgl(&self) {
-        self.lvgl_active.store(true, Ordering::Release);
+    /// Releases the optional 320x240 pixel copy when no preview server uses it.
+    /// Physical TFT writes continue independently of this diagnostic mirror.
+    pub fn disablePixelMirror(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pixels = Vec::new();
+        }
     }
 
-    fn isLvglActive(&self) -> bool {
-        self.lvgl_active.load(Ordering::Acquire)
+    /// Makes self-drawn UI the sole owner of physical display updates.
+    pub fn activateUi(&self) {
+        self.ui_active.store(true, Ordering::Release);
+    }
+
+    fn isUiActive(&self) -> bool {
+        self.ui_active.load(Ordering::Acquire)
     }
 
     /// Reads the compact drawing state while holding its lock for the duration of the read.
@@ -122,6 +130,7 @@ impl Esp32ScreenMirror {
         output.fill(0);
         if y >= self.height { return; }
         if let Ok(state) = self.state.lock() {
+            if state.pixels.is_empty() { return; }
             let width = usize::from(self.width);
             let count = output.len().min(width);
             let start = usize::from(y) * width;
@@ -140,6 +149,7 @@ impl Esp32ScreenMirror {
     fn fillRect(&self, rect: FaceRect, color: u16) {
         if let Ok(mut state) = self.state.lock() {
             state.rects.push(Esp32ScreenMirrorRect { rect, color });
+            if state.pixels.is_empty() { return; }
             let right = rect.x.saturating_add(rect.width).min(self.width);
             let bottom = rect.y.saturating_add(rect.height).min(self.height);
             for y in rect.y.min(self.height)..bottom {
@@ -151,9 +161,10 @@ impl Esp32ScreenMirror {
         }
     }
 
-    /// Copies one little-endian RGB565 LVGL region into the framebuffer mirror.
+    /// Copies one little-endian RGB565 self-drawn UI region into the framebuffer mirror.
     fn writeRgb565(&self, rect: FaceRect, bytes: &[u8]) {
         if let Ok(mut state) = self.state.lock() {
+            if state.pixels.is_empty() { return; }
             let right = rect.x.saturating_add(rect.width).min(self.width);
             let bottom = rect.y.saturating_add(rect.height).min(self.height);
             for y in rect.y.min(self.height)..bottom {
@@ -362,7 +373,7 @@ impl FaceCanvas for Esp32Ili9341 {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
-        if self.mirror.isLvglActive() {
+        if self.mirror.isUiActive() {
             return Ok(());
         }
         self.fillWindow(0, 0, self.width - 1, self.height - 1, color)?;
@@ -374,7 +385,7 @@ impl FaceCanvas for Esp32Ili9341 {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
-        if self.mirror.isLvglActive() {
+        if self.mirror.isUiActive() {
             return Ok(());
         }
         let x1 = rect
@@ -429,28 +440,5 @@ impl FaceCanvas for Esp32Ili9341 {
         }
         self.mirror.writeRgb565(rect, pixels);
         Ok(())
-    }
-}
-
-impl operit_ui::Canvas for Esp32Ili9341 {
-    fn size(&self) -> (u16, u16) {
-        (self.width, self.height)
-    }
-
-    fn fill(&mut self, color: operit_ui::Color) {
-        FaceCanvas::fill(self, color.0).unwrap_or(());
-    }
-
-    fn fill_rect(&mut self, rect: operit_ui::Rect, color: operit_ui::Color) {
-        let _ = FaceCanvas::fillRect(
-            self,
-            FaceRect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-            },
-            color.0,
-        );
     }
 }

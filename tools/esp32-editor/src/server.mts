@@ -2,6 +2,7 @@ import http from 'node:http';
 import type {IncomingMessage, ServerResponse} from 'node:http';
 import {aiRoute} from './api/ai-api.mts';
 import {deployRoute} from './api/deploy-api.mts';
+import {simulatorRoute, stopSimulator} from './api/simulator-api.mts';
 import {layoutRoute} from './api/layout-api.mts';
 import {readFile, readdir} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
@@ -13,8 +14,7 @@ import {errorMessage, errorCode} from './layout/project-model.mts';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const editorRoot = path.resolve(root, 'tools/esp32-editor');
-const uiRoot = path.resolve(root, 'apps/esp32/lvgl_port');
-const source = path.join(uiRoot, 'operit_lvgl.c');
+const uiRoot = path.resolve(root, 'apps/esp32/ui_port');
 const argument = process.argv.indexOf('--port');
 const port = Number(argument >= 0 ? process.argv[argument + 1] : process.env.PORT || 8766);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -24,6 +24,12 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 const files = new Map<string, string>([
   ['/', 'web/index.html'],
   ['/app.js', 'web/app.ts'],
+  ['/device-actions.js', 'web/device-actions.ts'],
+  ['/device-state.js', 'web/device-state.ts'],
+  ['/device-view.js', 'web/device-view.ts'],
+  ['/scene-renderer.js', 'web/scene-renderer.ts'],
+  ['/simulator.js', 'web/simulator.ts'],
+  ['/core-access.js', 'web/core-access.ts'],
   ['/src/layout/project-model.mjs', 'src/layout/project-model.mts'],
   ['/src/layout/geometry.mjs', 'src/layout/geometry.mts'],
   ['/src/layout/routes.mjs', 'src/layout/routes.mts'],
@@ -48,6 +54,7 @@ const files = new Map<string, string>([
 const mime: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.ts': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.wasm': 'application/wasm',
   '.json': 'application/json',
@@ -79,7 +86,9 @@ async function hash(): Promise<string> {
   const names = await readdir(uiRoot);
   const hashed = [
     ...names.filter((n: string) => n.endsWith('.c')).sort(),
-    ...names.filter((n: string) => n.endsWith('.h') && n !== 'layout.generated.h').sort(),
+    ...names.filter((n: string) => n.endsWith('.h')).sort(),
+    ...names.filter((n: string) => n.endsWith('.inc')).sort(),
+    ...names.filter((n: string) => n.endsWith('.svg')).sort(),
   ];
   const digest = createHash('sha256');
   for (const n of hashed) {
@@ -110,7 +119,7 @@ async function status(): Promise<{
     running,
     error,
     manifest,
-    stale: manifest?.runtimeHash !== await hash(),
+    stale: !manifest || manifest.runtimeHash !== await hash(),
     output: output.slice(-3000),
   };
 }
@@ -164,6 +173,7 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
         return;
       }
     }
+    if (await simulatorRoute(req, res, url)) return;
     if (await aiRoute(req, res, url)) return;
     if (await deployRoute(req, res, url)) return;
     if (await layoutRoute(req, res, url)) return;
@@ -193,16 +203,9 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
     }
 
     if (url.pathname === '/api/board') {
-      const text = await readFile(source, 'utf8');
-      const themes = [...text.matchAll(/\{0x([\da-f]+),\s*0x([\da-f]+),\s*0x([\da-f]+),\s*0x([\da-f]+),\s*"([^"]+)"\}/gi)].map(
-        (match) => ({
-          name: match[5],
-          bg: '#' + match[1],
-          surface: '#' + match[2],
-          accent: '#' + match[3],
-          muted: '#' + match[4],
-        }),
-      );
+      // Fixed renderer palette; no retired widget-theme parser or runtime dependency.
+      const themes = [{name: 'Mini', bg: '#101820', surface: '#263849',
+        accent: '#e6edf3', muted: '#73818d'}];
       res.writeHead(200, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'});
       res.end(
         JSON.stringify({
@@ -211,7 +214,8 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
           height: 240,
           controller: 'ST7789',
           themes,
-          mode: 'shared-lvgl-wasm',
+          mode: 'shared-mini-wasm',
+          capabilities: {layoutEditing: false, images: false, keyboard: false, themes: false},
         }),
       );
       return;
@@ -245,4 +249,8 @@ server.on('error', (e: Error) => {
   console.error(e);
   process.exit(1);
 });
+process.on('exit', stopSimulator);
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => { stopSimulator(); server.close(); process.exit(0); });
+}
 server.listen(port, '127.0.0.1', () => console.log(`ESP32 editor running at http://127.0.0.1:${port}`));

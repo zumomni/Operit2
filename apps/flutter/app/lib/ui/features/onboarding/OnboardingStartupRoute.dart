@@ -4,17 +4,19 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' show lerpDouble;
 
-import 'package:file_selector/file_selector.dart';
+import 'package:operit_folder_access/operit_folder_access.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../core/host/SelectedFileInput.dart';
 import '../../../core/logging/ClientLogger.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../core/runtime/RuntimeBootstrapManager.dart';
 import '../../../core/snapshot/SnapshotImportUploader.dart';
 import '../../../l10n/generated/app_localizations.dart';
+import '../../common/StorageDirectorySelectionError.dart';
 import '../../common/DeviceSpaceDiscoveryPanel.dart';
 import '../../common/OperitLogoMark.dart';
 import '../../common/RuntimeBootstrapScreen.dart';
@@ -87,8 +89,8 @@ class OnboardingStartupRouteStrategy extends StartupRouteStrategy {
       return false;
     }
     return switch (value) {
-      'true' => true,
-      'false' => false,
+      true => true,
+      false => false,
       _ => throw FormatException('invalid ai setup guide flag: $value'),
     };
   }
@@ -97,7 +99,7 @@ class OnboardingStartupRouteStrategy extends StartupRouteStrategy {
     return _clients.preferencesPreferenceStorageManager.setPreference(
       fileName: _preferencesFileName,
       key: _guideSeenKey,
-      value: 'true',
+      value: true,
     );
   }
 
@@ -502,7 +504,9 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         .operit1SnapshotImportProgressFlow()
         .listen(
           (progress) {
-            if (!mounted) {
+            if (!mounted ||
+                !_importingOperit1Snapshot ||
+                progress.stage == 'idle') {
               return;
             }
             setState(() {
@@ -681,28 +685,36 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
     );
   }
 
-  /// Lets the user select the runtime data directory.
-  Future<void> _selectRuntimeRoot() async {
-    final path = await getDirectoryPath();
-    if (path == null || path.trim().isEmpty) {
-      return;
-    }
-    _runtimeRootController.text = path.trim();
-    setState(() {
-      _setupError = null;
-    });
-  }
+  /// Selects a new runtime root directory.
+  Future<void> _selectRuntimeRoot() =>
+      _selectStorageRoot(_runtimeRootController);
 
-  /// Lets the user select the workspace data directory.
-  Future<void> _selectWorkspaceRoot() async {
-    final path = await getDirectoryPath();
-    if (path == null || path.trim().isEmpty) {
-      return;
+  /// Selects a new workspace root directory.
+  Future<void> _selectWorkspaceRoot() =>
+      _selectStorageRoot(_workspaceRootController);
+
+  /// Keeps picker failures in the storage UI instead of the unhandled zone.
+  Future<void> _selectStorageRoot(TextEditingController controller) async {
+    try {
+      final path = await OperitFolderAccess.pickDirectory();
+      if (!mounted || path == null || path.trim().isEmpty) {
+        return;
+      }
+      setState(() {
+        controller.text = path.trim();
+        _setupError = null;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _setupError = storageDirectorySelectionErrorMessage(
+          AppLocalizations.of(context)!,
+          error,
+        );
+      });
     }
-    _workspaceRootController.text = path.trim();
-    setState(() {
-      _setupError = null;
-    });
   }
 
   /// Clears storage errors after either editable path changes.
@@ -983,7 +995,13 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       _readingOperit1Snapshot = true;
       _setupError = null;
       _operit1Snapshot = null;
-      _operit1ImportProgress = null;
+      _operit1ImportProgress = const core_proxy.Operit1SnapshotImportProgress(
+        stage: 'select',
+        title: '选择快照',
+        detail: '请在文件选择器中选择 Operit1 快照。',
+        progress: 0,
+        active: true,
+      );
       _operit1SnapshotSession = null;
       _operit1SnapshotFileName = null;
     });
@@ -991,7 +1009,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       if (previousSession != null) {
         await previousSession.discard();
       }
-      final file = await SnapshotImportFile.pick();
+      final file = await SelectedFileInput.pickSnapshot();
       if (file == null) {
         return;
       }
@@ -999,8 +1017,48 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         'snapshot selected name=${file.name} bytes=${file.byteLength}',
         tag: _operit1SnapshotImportLogTag,
       );
-      final session = await SnapshotImportUploader(widget.clients).stage(file);
+      if (!mounted) {
+        await file.close();
+        return;
+      }
+      setState(() {
+        _operit1SnapshotFileName = file.name;
+      });
+      var lastUploadPercent = -1;
+      final session = await SnapshotImportUploader(widget.clients).stage(
+        file,
+        onProgress: (uploadedBytes, totalBytes) {
+          final uploadPercent = totalBytes <= 0
+              ? 0
+              : (uploadedBytes * 100 / totalBytes).floor().clamp(0, 100);
+          if (!mounted || uploadPercent == lastUploadPercent) {
+            return;
+          }
+          lastUploadPercent = uploadPercent;
+          setState(() {
+            _operit1ImportProgress = core_proxy.Operit1SnapshotImportProgress(
+              stage: 'upload',
+              title: '上传快照',
+              detail: '正在读取并上传快照文件（$uploadPercent%）。',
+              progress: uploadPercent / 100,
+              active: true,
+            );
+          });
+        },
+      );
       stagedSession = session;
+      if (mounted) {
+        setState(() {
+          _operit1ImportProgress =
+              const core_proxy.Operit1SnapshotImportProgress(
+                stage: 'inspect',
+                title: '检查快照',
+                detail: '正在检查 Operit1 快照内容，请稍候。',
+                progress: 0,
+                active: true,
+              );
+        });
+      }
       ClientLogger.i(
         'snapshot upload completed bytes=${session.byteLength}; inspection started',
         tag: _operit1SnapshotImportLogTag,
@@ -1040,6 +1098,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       if (mounted) {
         setState(() {
           _readingOperit1Snapshot = false;
+          _operit1ImportProgress = null;
         });
       }
     }
@@ -1056,6 +1115,13 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
 
     setState(() {
       _importingOperit1Snapshot = true;
+      _operit1ImportProgress = const core_proxy.Operit1SnapshotImportProgress(
+        stage: 'prepare',
+        title: '准备导入',
+        detail: '正在准备迁移 Operit1 快照内容，请稍候。',
+        progress: 0,
+        active: true,
+      );
       _setupError = null;
     });
     try {
@@ -1293,7 +1359,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
                                     errorText: _setupError,
                                   );
                                 case _AiSetupPage.import:
-                                  return _AiSetupImportPage(
+                                  return OnboardingSnapshotImportPage(
                                     snapshot: _operit1Snapshot,
                                     fileName: _operit1SnapshotFileName,
                                     reading: _readingOperit1Snapshot,
@@ -2074,7 +2140,7 @@ class _AiSetupDeviceSpacePage extends StatelessWidget {
                 icon: Icons.cloud_sync_rounded,
                 eyebrow: '设备空间',
                 title: '加入设备空间',
-                description: '扫描附近设备空间并选择一台设备。完成配对后会先同步模型、配置和数据，再结束引导。',
+                description: '点击添加设备，选择附近的设备并完成配对。管理员批准加入后，才会同步配置和数据。',
               ),
               const SizedBox(height: 22),
               DeviceSpaceDiscoveryPanel(
@@ -2181,7 +2247,7 @@ class _AiSetupAgreementPage extends StatelessWidget {
                       Text('严谨版法律协议', style: headingStyle),
                       const SizedBox(height: 12),
                       Text(
-                        '1. 适用范围与协议版本\n本协议适用于 Operit 官方发布的客户端及其可选在线功能。使用本应用即表示您已阅读并同意当前版本。应用会记录您确认的版本；协议发生实质更新时，将要求重新确认。开源代码许可由仓库根目录 LICENSE 所载 LGPLv3 规定，本协议不排除或缩减适用法律及开源许可证赋予您的权利。',
+                        '1. 适用范围与协议版本\n本协议适用于 Operit 官方发布的客户端及其可选在线功能。使用本应用即表示您已阅读并同意当前版本。应用会记录您确认的版本；协议发生实质更新时，将要求重新确认。开源代码许可由仓库根目录 LICENSE 所载 GNU AGPL-3.0 规定，本协议不排除或缩减适用法律及开源许可证赋予您的权利。',
                         style: bodyStyle,
                       ),
                       const SizedBox(height: 14),
@@ -2323,7 +2389,15 @@ class _AiSetupStoragePage extends StatelessWidget {
               ],
               if (errorText != null) ...<Widget>[
                 const SizedBox(height: 12),
-                CommonNetworkErrorView(errorText: errorText!),
+                Semantics(
+                  liveRegion: true,
+                  child: Text(
+                    errorText!,
+                    style: textTheme.bodySmall?.copyWith(
+                      color: colorScheme.error,
+                    ),
+                  ),
+                ),
               ],
             ],
           ),
@@ -2380,8 +2454,10 @@ class _StoragePathField extends StatelessWidget {
   }
 }
 
-class _AiSetupImportPage extends StatelessWidget {
-  const _AiSetupImportPage({
+/// Displays snapshot staging and migration progress in the onboarding flow.
+class OnboardingSnapshotImportPage extends StatelessWidget {
+  const OnboardingSnapshotImportPage({
+    super.key,
     required this.snapshot,
     required this.fileName,
     required this.reading,
@@ -2400,11 +2476,21 @@ class _AiSetupImportPage extends StatelessWidget {
   final String? errorText;
 
   @override
+  /// Builds the current-format snapshot preview and import error details.
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final preview = snapshot;
-    final importProgress = importing ? progress : null;
+    final importProgress = reading || importing
+        ? progress ??
+              const core_proxy.Operit1SnapshotImportProgress(
+                stage: 'prepare',
+                title: '准备导入',
+                detail: '正在准备 Operit1 快照，请稍候。',
+                progress: 0,
+                active: true,
+              )
+        : null;
     return Align(
       alignment: Alignment.topCenter,
       child: SingleChildScrollView(
@@ -2418,7 +2504,8 @@ class _AiSetupImportPage extends StatelessWidget {
                 icon: Icons.move_to_inbox_rounded,
                 eyebrow: '导入配置',
                 title: '从 Operit1 导入',
-                description: '选择旧版快照，将配置、聊天、角色卡、资源等数据迁移到 Operit2。',
+                description:
+                    '请使用最新版 Operit1 导出的快照，将配置、聊天、角色卡、资源等数据迁移到 Operit2。',
               ),
               const SizedBox(height: 22),
               Align(
@@ -2443,6 +2530,13 @@ class _AiSetupImportPage extends StatelessWidget {
                   style: textTheme.bodyMedium?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                   ),
+                ),
+              ],
+              if (importProgress != null) ...<Widget>[
+                const SizedBox(height: 18),
+                Semantics(
+                  liveRegion: true,
+                  child: _Operit1ImportProgressPanel(progress: importProgress),
                 ),
               ],
               if (preview != null) ...<Widget>[
@@ -2517,14 +2611,27 @@ class _AiSetupImportPage extends StatelessWidget {
                     height: 1.36,
                   ),
                 ),
-                if (importProgress != null) ...<Widget>[
-                  const SizedBox(height: 14),
-                  _Operit1ImportProgressPanel(progress: importProgress),
-                ],
               ],
               if (errorText != null) ...<Widget>[
                 const SizedBox(height: 12),
-                CommonNetworkErrorView(errorText: errorText!),
+                Semantics(
+                  liveRegion: true,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: colorScheme.errorContainer,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Text(
+                        '快照导入失败\n$errorText',
+                        style: textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onErrorContainer,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ],
           ),
@@ -2544,6 +2651,11 @@ class _Operit1ImportProgressPanel extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final value = progress.progress.clamp(0.0, 1.0).toDouble();
+    final indeterminate = const <String>{
+      'select',
+      'prepare',
+      'inspect',
+    }.contains(progress.stage);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2566,22 +2678,24 @@ class _Operit1ImportProgressPanel extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 12),
-            Text(
-              '${(value * 100).round()}%',
-              style: textTheme.labelMedium?.copyWith(
-                color: colorScheme.primary,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0,
+            if (!indeterminate) ...<Widget>[
+              const SizedBox(width: 12),
+              Text(
+                '${(value * 100).round()}%',
+                style: textTheme.labelMedium?.copyWith(
+                  color: colorScheme.primary,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0,
+                ),
               ),
-            ),
+            ],
           ],
         ),
         const SizedBox(height: 8),
         ClipRRect(
           borderRadius: BorderRadius.circular(999),
           child: LinearProgressIndicator(
-            value: value,
+            value: indeterminate ? null : value,
             minHeight: 6,
             backgroundColor: colorScheme.surfaceContainerHighest.withValues(
               alpha: 0.72,

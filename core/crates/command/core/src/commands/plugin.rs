@@ -4,9 +4,12 @@ use operit_tools::tools::packTool::RuntimePackageManager::BundledExternalPackage
 use operit_tools::tools::AIToolHandler::AIToolHandler;
 use std::collections::BTreeSet;
 
-/// Runs ToolPkg plugin management commands.
-pub fn run_plugin_command(
+use super::delegated::ReadyCommandRegistry;
+
+/// Runs plugin management while reusing the invocation's ready command registry for command operations.
+pub async fn run_plugin_command(
     application: &OperitApplication,
+    registry: &ReadyCommandRegistry,
     args: &[String],
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
@@ -22,6 +25,8 @@ pub fn run_plugin_command(
             Ok(())
         }
         "list" => list_plugins(tool_handler, output),
+        "commands" => list_plugin_commands(registry, output),
+        "exec" => execute_plugin_command(registry, &args[1..], output).await,
         "more" => list_more_plugins(tool_handler, output),
         "show" => {
             let name = args
@@ -63,6 +68,35 @@ pub fn run_plugin_command(
             Ok(())
         }
     }
+}
+
+/// Lists enabled registered commands from the same ready catalog used for root ownership.
+fn list_plugin_commands(
+    registry: &ReadyCommandRegistry,
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let commands = registry.plugin_commands()?;
+    output.push_stdout_line(format!("Plugin commands: {}", commands.len()));
+    for command in &commands {
+        output.push_stdout_line(format!(
+            "- {} — {} ({})",
+            command.usage, command.description, command.containerPackageName
+        ));
+    }
+    output.setJsonStdout(serde_json::to_value(commands).expect("plugin commands must serialize"));
+    Ok(())
+}
+
+/// Resolves an explicitly addressed plugin command on the invocation's existing ready snapshot.
+async fn execute_plugin_command(
+    registry: &ReadyCommandRegistry,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let command_name = args
+        .first()
+        .ok_or_else(|| "usage: operit2 plugin exec <command> [args...]".to_string())?;
+    super::delegated::run_delegated_command(registry, command_name, &args[1..], output).await
 }
 
 /// Lists loaded ToolPkg plugins.
@@ -355,6 +389,8 @@ fn print_plugin_usage(output: &mut CoreCommandOutput) {
     let lines = vec![
         "operit2 plugin help",
         "operit2 plugin list                         List loaded ToolPkg plugins.",
+        "operit2 plugin commands                     List slash commands from enabled ToolPkg plugins.",
+        "operit2 plugin exec <command> [args...]     Execute a ToolPkg slash command.",
         "operit2 plugin more                         List app-bundled official extras not loaded yet; type=toolpkg/script.",
         "operit2 plugin load <name>                  Load one item from 'plugin more' into the user package directory.",
         "operit2 plugin show <name>                  Show a loaded ToolPkg plugin.",

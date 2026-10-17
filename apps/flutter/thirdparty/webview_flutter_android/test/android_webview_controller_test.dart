@@ -36,6 +36,7 @@ import 'android_webview_controller_test.mocks.dart';
   MockSpec<android_webview.WebViewClient>(),
   MockSpec<android_webview.WebStorage>(),
 ])
+/// Verifies Android WebView behavior and native composition selection.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -1618,7 +1619,7 @@ void main() {
       ]);
     });
 
-    test('runJavaScriptReturningResult rejects a native null result', () async {
+    test('runJavaScriptReturningResult returns a native null result', () async {
       final mockWebView = MockWebView();
       final AndroidWebViewController controller = createControllerWithMocks(
         mockWebView: mockWebView,
@@ -1628,13 +1629,15 @@ void main() {
         mockWebView.evaluateJavascript('alert("This is a test.");'),
       ).thenAnswer((_) => Future<String?>.value());
 
-      await expectLater(
-        controller.runJavaScriptReturningResult('alert("This is a test.");'),
-        throwsArgumentError,
+      expect(
+        await controller.runJavaScriptReturningResult(
+          'alert("This is a test.");',
+        ),
+        isNull,
       );
     });
 
-    test('runJavaScriptReturningResult rejects a JSON null result', () async {
+    test('runJavaScriptReturningResult returns a JSON null result', () async {
       final mockWebView = MockWebView();
       final AndroidWebViewController controller = createControllerWithMocks(
         mockWebView: mockWebView,
@@ -1644,10 +1647,7 @@ void main() {
         mockWebView.evaluateJavascript('null'),
       ).thenAnswer((_) => Future<String>.value('null'));
 
-      await expectLater(
-        controller.runJavaScriptReturningResult('null'),
-        throwsArgumentError,
-      );
+      expect(await controller.runJavaScriptReturningResult('null'), isNull);
     });
 
     test('runJavaScriptReturningResult parses num', () async {
@@ -2130,6 +2130,73 @@ void main() {
   });
 
   group('AndroidWebViewWidget', () {
+    testWidgets('generic widget parameters create a native platform layer', (
+      WidgetTester tester,
+    ) async {
+      final android_webview.WebView mockWebView = MockWebView();
+      final AndroidWebViewController controller = createControllerWithMocks(
+        mockWebView: mockWebView,
+      );
+      android_webview.PigeonInstanceManager.instance.addDartCreatedInstance(
+        mockWebView,
+      );
+      final List<MethodCall> calls = <MethodCall>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform_views,
+        (MethodCall call) async {
+          calls.add(call);
+          return null;
+        },
+      );
+      addTearDown(() {
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform_views,
+          null,
+        );
+      });
+      final AndroidWebViewWidget webViewWidget = AndroidWebViewWidget(
+        PlatformWebViewWidgetCreationParams(controller: controller),
+      );
+      expect(
+        (webViewWidget.params as AndroidWebViewWidgetCreationParams)
+            .displayWithHybridComposition,
+        isTrue,
+      );
+      expect(
+        AndroidWebViewWidgetCreationParams(
+          controller: controller,
+        ).displayWithHybridComposition,
+        isTrue,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SizedBox(
+            width: 320,
+            height: 240,
+            child: Builder(builder: webViewWidget.build),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final MethodCall create = calls.singleWhere(
+        (MethodCall call) => call.method == 'create',
+      );
+      final arguments = create.arguments as Map<Object?, Object?>;
+      expect(arguments['hybrid'], isTrue);
+      expect(arguments.containsKey('hybridFallback'), isFalse);
+      expect(find.byType(Texture), findsNothing);
+      final AndroidViewSurface surface = tester.widget<AndroidViewSurface>(
+        find.byType(AndroidViewSurface),
+      );
+      expect(surface.controller, isA<ExpensiveAndroidViewController>());
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      expect(
+        calls.where((MethodCall call) => call.method == 'dispose'),
+        hasLength(1),
+      );
+    });
+
     testWidgets('Builds Android view using supplied parameters', (
       WidgetTester tester,
     ) async {
@@ -2189,6 +2256,7 @@ void main() {
           key: const Key('test_web_view'),
           controller: controller,
           platformViewsServiceProxy: mockPlatformViewsService,
+          displayWithHybridComposition: false,
         ),
       );
 
@@ -2310,7 +2378,7 @@ void main() {
       final mockPlatformViewsService = MockPlatformViewsServiceProxy();
 
       when(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),
@@ -2318,7 +2386,7 @@ void main() {
           creationParamsCodec: anyNamed('creationParamsCodec'),
           onFocus: anyNamed('onFocus'),
         ),
-      ).thenReturn(MockSurfaceAndroidViewController());
+      ).thenReturn(MockExpensiveAndroidViewController());
 
       final webViewWidget = AndroidWebViewWidget(
         AndroidWebViewWidgetCreationParams(
@@ -2358,7 +2426,7 @@ void main() {
       final mockPlatformViewsService = MockPlatformViewsServiceProxy();
 
       when(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),
@@ -2366,7 +2434,7 @@ void main() {
           creationParamsCodec: anyNamed('creationParamsCodec'),
           onFocus: anyNamed('onFocus'),
         ),
-      ).thenReturn(MockSurfaceAndroidViewController());
+      ).thenReturn(MockExpensiveAndroidViewController());
 
       await tester.pumpWidget(
         Builder(
@@ -2383,7 +2451,7 @@ void main() {
       await tester.pumpAndSettle();
 
       verify(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),
@@ -2408,7 +2476,7 @@ void main() {
       await tester.pumpAndSettle();
 
       verify(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),
@@ -2434,7 +2502,7 @@ void main() {
         );
 
         when(
-          mockPlatformViewsService.initSurfaceAndroidView(
+          mockPlatformViewsService.initExpensiveAndroidView(
             id: anyNamed('id'),
             viewType: anyNamed('viewType'),
             layoutDirection: anyNamed('layoutDirection'),
@@ -2442,7 +2510,7 @@ void main() {
             creationParamsCodec: anyNamed('creationParamsCodec'),
             onFocus: anyNamed('onFocus'),
           ),
-        ).thenReturn(MockSurfaceAndroidViewController());
+        ).thenReturn(MockExpensiveAndroidViewController());
 
         await tester.pumpWidget(
           Builder(
@@ -2459,7 +2527,7 @@ void main() {
         await tester.pumpAndSettle();
 
         verify(
-          mockPlatformViewsService.initSurfaceAndroidView(
+          mockPlatformViewsService.initExpensiveAndroidView(
             id: anyNamed('id'),
             viewType: anyNamed('viewType'),
             layoutDirection: anyNamed('layoutDirection'),
@@ -2484,7 +2552,7 @@ void main() {
         await tester.pumpAndSettle();
 
         verifyNever(
-          mockPlatformViewsService.initSurfaceAndroidView(
+          mockPlatformViewsService.initExpensiveAndroidView(
             id: anyNamed('id'),
             viewType: anyNamed('viewType'),
             layoutDirection: anyNamed('layoutDirection'),
@@ -2526,7 +2594,7 @@ void main() {
       expect(find.byKey(const Key('test_custom_view')), findsOneWidget);
     });
 
-    testWidgets('displayWithHybridComposition should be false', (
+    testWidgets('fullscreen custom views use native Hybrid Composition', (
       WidgetTester tester,
     ) async {
       final android_webview.WebView mockWebView = MockWebView();
@@ -2541,7 +2609,7 @@ void main() {
       final mockPlatformViewsService = MockPlatformViewsServiceProxy();
 
       when(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),
@@ -2549,7 +2617,7 @@ void main() {
           creationParamsCodec: anyNamed('creationParamsCodec'),
           onFocus: anyNamed('onFocus'),
         ),
-      ).thenReturn(MockSurfaceAndroidViewController());
+      ).thenReturn(MockExpensiveAndroidViewController());
 
       final customViewWidget = AndroidCustomViewWidget.private(
         controller: controller,
@@ -2565,7 +2633,7 @@ void main() {
       await tester.pumpAndSettle();
 
       verify(
-        mockPlatformViewsService.initSurfaceAndroidView(
+        mockPlatformViewsService.initExpensiveAndroidView(
           id: anyNamed('id'),
           viewType: anyNamed('viewType'),
           layoutDirection: anyNamed('layoutDirection'),

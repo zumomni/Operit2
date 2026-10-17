@@ -13,48 +13,8 @@ enum ConversationAction {
   moveDown,
   togglePinned,
   toggleLocked,
+  unbindWorkspace,
   delete,
-}
-
-class CreateGroupDialog extends StatefulWidget {
-  const CreateGroupDialog({super.key});
-
-  @override
-  State<CreateGroupDialog> createState() => _CreateGroupDialogState();
-}
-
-class _CreateGroupDialogState extends State<CreateGroupDialog> {
-  final TextEditingController _controller = TextEditingController();
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
-    return AlertDialog(
-      title: Text(l10n.createGroupTitle),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        decoration: InputDecoration(labelText: l10n.groupNameLabel),
-        onSubmitted: (value) => Navigator.of(context).pop(value),
-      ),
-      actions: <Widget>[
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: Text(l10n.cancel),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.of(context).pop(_controller.text),
-          child: Text(l10n.create),
-        ),
-      ],
-    );
-  }
 }
 
 class RenameConversationDialog extends StatefulWidget {
@@ -146,6 +106,7 @@ class ConversationActionDialog extends StatelessWidget {
   final bool canMoveUp;
   final bool canMoveDown;
 
+  /// Offers chat actions and explicit detachment for existing workspace bindings.
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
@@ -212,6 +173,13 @@ class ConversationActionDialog extends StatelessWidget {
             onTap: () =>
                 Navigator.of(context).pop(ConversationAction.toggleLocked),
           ),
+          if (history.workspaceId?.trim().isNotEmpty == true)
+            _ConversationActionTile(
+              icon: Icons.link_off,
+              label: l10n.workspaceUnbindTitle,
+              onTap: () =>
+                  Navigator.of(context).pop(ConversationAction.unbindWorkspace),
+            ),
           _ConversationActionTile(
             icon: Icons.delete_outline,
             label: l10n.delete,

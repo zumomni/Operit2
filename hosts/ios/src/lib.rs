@@ -12,6 +12,8 @@ use operit_host_api::RuntimeStorageHost;
 
 pub mod bridge;
 mod managed_runtime;
+mod serial;
+pub use serial::IosSerialPortHost;
 pub mod terminal;
 
 pub use managed_runtime::IosManagedRuntimeHost;
@@ -30,7 +32,9 @@ pub use operit_host_apple_native::{
 };
 pub use terminal::IosTerminalHost;
 
-pub use operit_host_apple_native::ApplePluginSdkIpcHost as IosPluginSdkIpcHost;
+// iOS plugins execute within the application sandbox and share its process.
+// A filesystem socket under the container's long temporary path exceeds SUN_LEN.
+pub use operit_host_native_plugin_sdk_ipc::MemoryPluginSdkIpcHost as IosPluginSdkIpcHost;
 
 /// Creates the iOS-owned runtime host manager for explicit storage roots.
 #[cfg(target_os = "ios")]
@@ -40,6 +44,7 @@ pub fn createRuntimeHostManager(
     webVisitHost: Arc<dyn operit_host_api::WebVisitHost>,
     managedRuntimeHost: Arc<dyn operit_host_api::ManagedRuntimeHost>,
 ) -> HostManager {
+    operit_host_apple_native::installAppleLogSink();
     let runtimeStorageWriteHost =
         Arc::new(operit_host_native_common::NativeRuntimeStorageHost::new(
             runtimeRoot.clone(),
@@ -59,6 +64,9 @@ pub fn createRuntimeHostManager(
         Arc::new(IosSystemOperationHost::new()),
     );
     hostManager.httpHost = Some(Arc::new(IosHttpHost::new()));
+    hostManager.httpServerHost = Some(Arc::new(operit_host_native_common::NativeHttpServerHost));
+    hostManager.tcpHost = Some(Arc::new(operit_host_native_common::NativeTcpHost));
+    hostManager.serialPortHost = Some(Arc::new(IosSerialPortHost));
     hostManager.webSocketHost = Some(Arc::new(IosHttpHost::new()));
     hostManager.managedRuntimeHost = Some(managedRuntimeHost);
     hostManager.runtimeStorageHost = Some(runtimeStorageHost);
@@ -70,6 +78,7 @@ pub fn createRuntimeHostManager(
         .withHostRuntimeEventSchedulerHost(Arc::new(IosHostRuntimeEventSchedulerHost::new()));
     hostManager =
         hostManager.withHostJavaScriptRuntimeHost(Arc::new(IosHostJavaScriptRuntimeHost::new()));
-    hostManager.withHostRuntimeTaskSchedulerHost(Arc::new(IosHostRuntimeTaskSchedulerHost::new()))
+    hostManager.withServiceDiscoveryHost(Arc::new(operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::default()))
+    .withHostRuntimeTaskSchedulerHost(Arc::new(IosHostRuntimeTaskSchedulerHost::new()))
         .withPluginSdkIpcHost(Arc::new(IosPluginSdkIpcHost::new()))
 }
