@@ -189,6 +189,16 @@ jobs:
         shell: pwsh
         run: python tools/build_scripts/check_build_environment.py --products app --github-runner
 
+      # 上游新增 hook/build.dart，会调用仓库根的 .venv\Scripts\python.exe 同步插件包；
+      # 官方 CI 未创建该 venv → 这里补一个（脚本仅用标准库，空 venv 即可）。
+      - name: Prepare Python venv for native asset hook
+        shell: pwsh
+        run: |
+          if (-not (Test-Path .venv\Scripts\python.exe)) {
+            python -m venv .venv
+          }
+          .\.venv\Scripts\python.exe -V
+
       - name: Build and package Android app
         shell: pwsh
         run: |
