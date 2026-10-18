@@ -207,6 +207,22 @@ jobs:
           npm install --prefix .ci-tools/typescript --no-audit --no-fund --silent typescript@5.9.3 terser@5.44.0
           .\.ci-tools\typescript\node_modules\.bin\tsc.cmd --version
 
+      # 内建工具包（plugins/packages/buildin/*）打包时需要自己的 node_modules
+      # （scripts/build.mjs 依赖 typescript）。官方 CI 未安装 → 这里补齐。
+      - name: Prepare toolpkg node dependencies
+        shell: pwsh
+        run: |
+          $pkgs = Get-ChildItem -Path plugins/packages -Recurse -Filter package.json |
+                  Where-Object { $_.FullName -notmatch 'node_modules' } |
+                  ForEach-Object { $_.DirectoryName } | Sort-Object -Unique
+          foreach ($d in $pkgs) {
+            Push-Location $d
+            Write-Host "::group::pnpm install $d"
+            corepack pnpm install --silent --no-frozen-lockfile
+            Write-Host "::endgroup::"
+            Pop-Location
+          }
+
       - name: Build and package Android app
         shell: pwsh
         run: |
