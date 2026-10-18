@@ -199,6 +199,14 @@ jobs:
           }
           .\.venv\Scripts\python.exe -V
 
+      # 上游新增 hook/build.dart，需要仓库托管的 TypeScript 编译器：
+      #   .ci-tools/typescript/node_modules/.bin/tsc.cmd
+      - name: Prepare TypeScript toolchain for native asset hook
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund --silent typescript@5.9.3 terser@5.44.0
+          .\.ci-tools\typescript\node_modules\.bin\tsc.cmd --version
+
       - name: Build and package Android app
         shell: pwsh
         run: |
